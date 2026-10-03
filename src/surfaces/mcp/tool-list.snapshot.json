@@ -1,0 +1,1035 @@
+[
+  {
+    "name": "project_create",
+    "description": "Create a project with repo validation.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "repos": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "harness": {
+          "default": "omp",
+          "type": "string"
+        },
+        "validate_repos": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "required": ["name", "repos"],
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "track_create",
+    "description": "Create a track under a project.",
+    "inputSchema": {
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "epic": {
+          "type": "string"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "repo": {
+          "default": "",
+          "type": "string"
+        },
+        "branch": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": ["project_id", "epic", "goal"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "track_close",
+    "description": "Close a track. DELIVERY GATE (d-21): closing as DONE requires a PR",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "type": "string"
+        },
+        "outcome": {
+          "default": "",
+          "type": "string"
+        },
+        "archive": {
+          "default": false,
+          "type": "boolean"
+        },
+        "pr": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": ["track_id"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "track_override",
+    "description": "Owner-gated track override (d-25, references/fleet-evaluation-rubric.md).",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "override": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "owner_approved": {
+          "default": false,
+          "type": "boolean"
+        },
+        "evidence": {
+          "default": "",
+          "type": "string"
+        },
+        "author": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": ["track_id", "override"],
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "task_add",
+    "description": "Add a task to the track queue (d-23). Returns the task with its id —",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "detail": {
+          "default": "",
+          "type": "string"
+        },
+        "gate": {
+          "default": "ready",
+          "type": "string"
+        },
+        "assignee": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": ["track_id", "title"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "task_update",
+    "description": "Update a task's status/progress/note, or AMEND its body (d-23). Workers",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "status": {
+          "default": "",
+          "type": "string"
+        },
+        "progress": {
+          "default": -1,
+          "type": "integer"
+        },
+        "assignee": {
+          "default": "",
+          "type": "string"
+        },
+        "note": {
+          "default": "",
+          "type": "string"
+        },
+        "detail": {
+          "default": "",
+          "type": "string"
+        },
+        "amend_reason": {
+          "default": "",
+          "type": "string"
+        },
+        "author": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": ["track_id", "task_id"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "turn_report",
+    "description": "One report tool for all roles (d-40).",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "status": {
+          "default": "running",
+          "type": "string"
+        },
+        "done": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "next": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "blockers": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "decisions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "knowledge_lesson_topic": {
+          "default": "",
+          "type": "string"
+        },
+        "knowledge_docs_updated": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "author_agent": {
+          "default": "",
+          "type": "string"
+        },
+        "author_model": {
+          "default": "",
+          "type": "string"
+        },
+        "task": {
+          "default": "",
+          "type": "string"
+        },
+        "role": {
+          "default": "",
+          "type": "string"
+        },
+        "decision": {
+          "default": "",
+          "type": "string"
+        },
+        "decision_rationale": {
+          "default": "",
+          "type": "string"
+        },
+        "decision_source": {
+          "default": "leader",
+          "type": "string"
+        },
+        "irreversible": {
+          "default": false,
+          "type": "boolean"
+        },
+        "evaluation": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "pr": {
+          "default": "",
+          "type": "string"
+        },
+        "artifacts": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": ["track_id", "summary"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "history",
+    "description": "Single query over the three ledgers (d-40): type=all|event|turn|decision.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "default": "",
+          "type": "string"
+        },
+        "project_id": {
+          "default": "",
+          "type": "string"
+        },
+        "type": {
+          "default": "all",
+          "type": "string"
+        },
+        "event_type": {
+          "default": "",
+          "type": "string"
+        },
+        "since": {
+          "default": "",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "type": "integer"
+        },
+        "since_minutes": {
+          "default": 0,
+          "type": "integer"
+        },
+        "decision_limit": {
+          "default": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "fleet",
+    "description": "One fleet entry point (d-40): mode=catalog | recommend | spawn.",
+    "inputSchema": {
+      "properties": {
+        "mode": {
+          "default": "catalog",
+          "type": "string"
+        },
+        "harness": {
+          "default": "omp",
+          "type": "string"
+        },
+        "position": {
+          "default": "",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "quota": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "live": {
+          "default": false,
+          "type": "boolean"
+        },
+        "count": {
+          "default": 1,
+          "type": "integer"
+        },
+        "title": {
+          "default": "",
+          "type": "string"
+        },
+        "track_id": {
+          "default": "",
+          "type": "string"
+        },
+        "purpose": {
+          "default": "",
+          "type": "string"
+        },
+        "task_id": {
+          "default": "",
+          "type": "string"
+        },
+        "model": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "fleet_usage",
+    "description": "Usage snapshot io (d-40): action=get reads, action=report records (d-18).",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "default": "get",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source": {
+          "default": "",
+          "type": "string"
+        },
+        "note": {
+          "default": "",
+          "type": "string"
+        },
+        "include_stale": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "heartbeat",
+    "description": "Role-neutral heartbeat surface (d-40): leader timers | orchestrator schedule.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "default": "",
+          "type": "string"
+        },
+        "action": {
+          "default": "spec",
+          "type": "string"
+        },
+        "role": {
+          "default": "leader",
+          "type": "string"
+        },
+        "harness": {
+          "default": "omp",
+          "type": "string"
+        },
+        "checkup_id": {
+          "default": "",
+          "type": "string"
+        },
+        "deep_id": {
+          "default": "",
+          "type": "string"
+        },
+        "schedule_id": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "leader_handoff",
+    "description": "Handoff surface (d-40): action=start state machine | action=pack init context.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "action": {
+          "default": "start",
+          "type": "string"
+        },
+        "to_agent_id": {
+          "default": "",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "type": "string"
+        },
+        "target_role": {
+          "default": "dev",
+          "type": "string"
+        },
+        "max_tokens": {
+          "default": 6000,
+          "type": "integer"
+        }
+      },
+      "required": ["track_id"],
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "summary_read",
+    "description": "Read API of the summary pipeline (d-40): action=spec | diff.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "action": {
+          "default": "spec",
+          "type": "string"
+        },
+        "content": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": ["track_id"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "summary_write",
+    "description": "Write API of the summary pipeline (d-40): validate + commit orchestration.md.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "generated_by": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": ["track_id", "content"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "leader_register",
+    "description": "Register a leader on a track with contract + model governance.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "agent_model": {
+          "type": "string"
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "override_reason": {
+          "default": "",
+          "type": "string"
+        },
+        "harness": {
+          "default": "omp",
+          "type": "string"
+        }
+      },
+      "required": ["track_id", "agent_id", "agent_model", "contract_version"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "leader_runbook",
+    "description": "Serve the canonical leader operating procedure (d-19).",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "track_status",
+    "description": "Track status: goal, leader, workers, queue, heartbeats, clock — plus, only",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "since_minutes": {
+          "default": 0,
+          "type": "integer"
+        },
+        "task_status": {
+          "default": "",
+          "type": "string"
+        },
+        "task_gate": {
+          "default": "",
+          "type": "string"
+        },
+        "task_assignee": {
+          "default": "",
+          "type": "string"
+        },
+        "task_since_minutes": {
+          "default": 0,
+          "type": "integer"
+        },
+        "task_limit": {
+          "default": 0,
+          "type": "integer"
+        },
+        "task_offset": {
+          "default": 0,
+          "type": "integer"
+        }
+      },
+      "required": ["track_id"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "track_list",
+    "description": "All tracks, compact. Each row carries `system` (true for the collector's",
+    "inputSchema": {
+      "properties": {
+        "project_id": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "lesson_add",
+    "description": "Add a verified lesson per OKF v0.2.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "tags": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": ["track_id", "title", "body"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "lesson_list",
+    "description": "List lessons from lessons/ with parsed frontmatter.",
+    "inputSchema": {
+      "properties": {
+        "tag": {
+          "default": "",
+          "type": "string"
+        },
+        "search": {
+          "default": "",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "suggestion_add",
+    "description": "Propose a suggestion (fleet->leader). Stored PENDING.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "tags": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": ["track_id", "agent_id", "kind", "title", "body"],
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "suggestion_review",
+    "description": "Leader reviews a pending suggestion: approve or reject.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "suggestion_id": {
+          "type": "string"
+        },
+        "approve": {
+          "type": "boolean"
+        },
+        "reviewer": {
+          "type": "string"
+        },
+        "note": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": ["track_id", "suggestion_id", "approve", "reviewer"],
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "suggestion_list",
+    "description": "List suggestions with filters.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "default": "",
+          "type": "string"
+        },
+        "status": {
+          "default": "",
+          "type": "string"
+        },
+        "kind": {
+          "default": "",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "model_evaluate",
+    "description": "Leader-only evaluation of a worker's model/session (d-32 Leader section).",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "scores": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "notes": {
+          "default": "",
+          "type": "string"
+        },
+        "reviewer": {
+          "default": "",
+          "type": "string"
+        },
+        "task_complexity": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "task_size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "telemetry": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": ["track_id", "agent_id", "model", "scores"],
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "model_evaluations",
+    "description": "List model evaluations for a track, optionally filtered by agent_id.",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "agent_id": {
+          "default": "",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "type": "integer"
+        }
+      },
+      "required": ["track_id"],
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  },
+  {
+    "name": "worker_evaluate",
+    "description": "Standalone mid-track evaluation (P2-8, d-32).",
+    "inputSchema": {
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "integer"
+        },
+        "effectiveness": {
+          "type": "integer"
+        },
+        "guideline_adherence": {
+          "type": "integer"
+        },
+        "notes": {
+          "default": "",
+          "type": "string"
+        },
+        "task_complexity": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "task_size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "telemetry": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": ["track_id", "agent_id", "confidence", "effectiveness", "guideline_adherence"],
+      "type": "object"
+    },
+    "_meta": {
+      "deferred": true
+    }
+  }
+]

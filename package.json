@@ -1,0 +1,41 @@
+{
+  "name": "@getpaseo/fleet-backend",
+  "version": "0.9.2",
+  "description": "Paseo fleet backend: single TypeScript orchestration backend on embedded Turso (M1: MCP stdio over fleet.db)",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "source": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "source": "./src/mcp.ts",
+      "default": "./dist/mcp.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "node ../../scripts/clean-package-dist.mjs",
+    "build": "tsc -p tsconfig.json --incremental false",
+    "build:clean": "npm run clean && npm run build",
+    "prepack": "npm run build:clean",
+    "typecheck": "tsgo --noEmit",
+    "test": "vitest run",
+    "parity": "vitest run tests/parity/parity.test.ts",
+    "snapshot:schemas": "node scripts/capture-tool-list.mjs",
+    "fixture:regen": "node scripts/regenerate-fixture.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@tursodatabase/database": "0.7.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.9.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.6"
+  }
+}
