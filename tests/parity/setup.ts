@@ -6,7 +6,8 @@
  * (reverse of the store/schema.ts rename mapping), so both engines start
  * from identical rows without ever touching the live ledger.
  */
-import { mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { RpcClient } from "./rpc.js";
@@ -15,12 +16,120 @@ import { TursoRepository } from "../../src/store/turso-repository.js";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const PKG_DIR = path.dirname(path.dirname(HERE));
 export const SEED_SQL = path.join(PKG_DIR, "tests", "fixtures", "seed.sql");
-export const LIVE_DB =
-  "/mnt/WorkDisk/Workplace/LLM-Agents-Orchestration/orchestration/state/mcp/orchestration.sqlite";
-const PY_SRC = "/mnt/WorkDisk/Workplace/LLM-Agents-Orchestration/mcp-orchestration/src";
-const VENV_PY =
-  "/mnt/WorkDisk/Workplace/LLM-Agents-Orchestration/mcp-orchestration/.venv-cd/bin/python";
-const LAO_ROOT = "/mnt/WorkDisk/Workplace/LLM-Agents-Orchestration";
+
+/**
+ * Pinned Python baseline (owner should-fix #1, round 3).
+ *
+ * origin/hydra/orchestration at this SHA contains LAO #68 (runbook 1.11.0:
+ * dev reuse at 200K, <=3 compactions, wrong-direction kill, orchestrator
+ * flags) + #69 (holder-reconfirm/history ordering, _agent_cwd fallback,
+ * _detect_repo_root fail-open). The TS domain ports exactly this tree; the
+ * harness VERIFIES the files under PY_SRC match the pin byte-for-byte and
+ * FAILS LOUDLY on mismatch — hydra progress must never silently move the
+ * baseline. To move the pin: port the new deltas, update LAO_PIN_SHA, re-run
+ * parity, and record the new SHA + case count in HARNESS.md and the PR body.
+ */
+export const LAO_PIN_SHA = "13fc0cb0f789965e64e34b541fa5e14fb7b37cf2";
+const PINNED_FILES = [
+  "mcp-orchestration/src/mcp_orchestration/runbook.py",
+  "mcp-orchestration/src/mcp_orchestration/config.py",
+  "mcp-orchestration/src/mcp_orchestration/state/timings.py",
+  "mcp-orchestration/src/mcp_orchestration/tools/leader.py",
+];
+
+function requiredEnv(name: string): string {
+  const value = (process.env[name] || "").trim();
+  if (!value) {
+    throw new Error(
+      `PARITY SETUP: env var ${name} is not set. ` +
+        `Parity needs the live LAO checkout for the Python baseline only — ` +
+        `export ${name} explicitly (no machine-local defaults are baked in). ` +
+        `See tests/parity/HARNESS.md for the exact export block.`,
+    );
+  }
+  return value;
+}
+
+export const LAO_ROOT = requiredEnv("FLEET_PARITY_LAO_ROOT");
+export const PY_SRC =
+  (process.env["FLEET_PARITY_PY_SRC"] || "").trim() ||
+  path.join(LAO_ROOT, "mcp-orchestration", "src");
+export const VENV_PY = requiredEnv("FLEET_PARITY_VENV_PY");
+// Optional: an extra forbidden path for the live-DB guard (the LAO-derived
+// ledger path below is always forbidden). Fixtures/tests never need it.
+const LIVE_DB_ENV = (process.env["FLEET_PARITY_LIVE_DB"] || "").trim();
+export const LIVE_DB = LIVE_DB_ENV;
+const LIVE_LEDGER_RELPATH = path.join("orchestration", "state", "mcp", "orchestration.sqlite");
+
+/** Fail loudly unless every ported Python file matches the pinned SHA. */
+export function verifyPin(): void {
+  // LAO_ROOT is usually the live checkout (a git repo carrying the pin
+  // object). When it is a plain read-only extract (e.g. the .parity-pin/
+  // tree, used because the live working tree has already drifted past the
+  // pin), FLEET_PARITY_LAO_GIT points at a checkout that has the object.
+  let gitDir = "";
+  try {
+    execFileSync("git", ["-C", LAO_ROOT, "cat-file", "-e", `${LAO_PIN_SHA}^{commit}`], {
+      stdio: "pipe",
+    });
+    gitDir = LAO_ROOT;
+  } catch {
+    gitDir = "";
+  }
+  if (!gitDir) {
+    const fallback = (process.env["FLEET_PARITY_LAO_GIT"] || "").trim();
+    if (fallback) {
+      try {
+        execFileSync("git", ["-C", fallback, "cat-file", "-e", `${LAO_PIN_SHA}^{commit}`], {
+          stdio: "pipe",
+        });
+        gitDir = fallback;
+      } catch {
+        gitDir = "";
+      }
+    }
+  }
+  if (!gitDir) {
+    throw new Error(
+      `PARITY PIN: commit ${LAO_PIN_SHA} is not present in the LAO checkout at ${LAO_ROOT}. ` +
+        `Run: git -C <lao-checkout> fetch origin hydra/orchestration (or the ref carrying the pin), ` +
+        `then re-run parity. If FLEET_PARITY_LAO_ROOT points at a plain (non-git) extract, ` +
+        `set FLEET_PARITY_LAO_GIT to a checkout carrying the pin object. ` +
+        `Do NOT point the env vars at a different tree to make this pass.`,
+    );
+  }
+  for (const rel of PINNED_FILES) {
+    let pinned: string;
+    try {
+      pinned = execFileSync("git", ["-C", gitDir, "show", `${LAO_PIN_SHA}:${rel}`], {
+        encoding: "utf-8",
+        maxBuffer: 4 * 1024 * 1024,
+      });
+    } catch (exc) {
+      throw new Error(
+        `PARITY PIN: cannot read ${rel} at ${LAO_PIN_SHA} from ${gitDir}: ${(exc as Error).message}`,
+      );
+    }
+    const livePath = path.join(PY_SRC, rel.replace("mcp-orchestration/src/", ""));
+    let live: string;
+    try {
+      live = readFileSync(livePath, "utf-8");
+    } catch (exc) {
+      throw new Error(
+        `PARITY PIN: cannot read baseline file ${livePath}: ${(exc as Error).message}. ` +
+          `Check FLEET_PARITY_PY_SRC (defaults to $FLEET_PARITY_LAO_ROOT/mcp-orchestration/src).`,
+      );
+    }
+    if (live !== pinned) {
+      throw new Error(
+        `PARITY PIN MISMATCH: ${livePath} differs from ${LAO_PIN_SHA}:${rel}. ` +
+          `The baseline moved (or PY_SRC points at the wrong tree) — parity against a drifted ` +
+          `baseline proves nothing. Either check out the pinned tree, or port the new deltas, ` +
+          `update LAO_PIN_SHA in tests/parity/setup.ts, and re-run. Refusing to run.`,
+      );
+    }
+  }
+}
 
 const TABLE_UNMAP: [string, string][] = [
   ["orch_model_evaluations", "model_evaluations"],
@@ -155,7 +264,25 @@ export async function setupParity(
   tier: string | null,
   opts?: { seed: boolean },
 ): Promise<ParityWorld> {
-  const liveReal = realpathSync(LIVE_DB);
+  // Pin first: fail before building anything when the baseline drifted.
+  verifyPin();
+  // Forbidden ledger paths: the LAO-derived ledger inside LAO_ROOT (always)
+  // plus FLEET_PARITY_LIVE_DB when the operator sets it. Fixtures/tests never
+  // need the live DB — both engines' DBs are built from the checked-in seed.
+  const forbidden: string[] = [];
+  const derivedLedger = path.join(LAO_ROOT, LIVE_LEDGER_RELPATH);
+  for (const candidate of [derivedLedger, LIVE_DB_ENV]) {
+    if (!candidate) continue;
+    try {
+      forbidden.push(realpathSync(candidate));
+    } catch {
+      forbidden.push(path.resolve(candidate));
+    }
+  }
+  if (!forbidden.length) {
+    throw new Error("PARITY GUARD: no forbidden ledger path resolved; refusing to run.");
+  }
+  const liveReal = forbidden[0];
   const runDir = path.join(
     PKG_DIR,
     ".tmp",
@@ -215,7 +342,7 @@ export async function setupParity(
     MCP_ORCH_LESSONS_DIR: path.join(tsDir, "lessons"),
     MCP_ORCH_REFERENCES_DIR: path.join(tsDir, "references"),
     FLEET_REPO_ROOT: LAO_ROOT,
-    FLEET_FORBIDDEN_DB_PATHS: liveReal,
+    FLEET_FORBIDDEN_DB_PATHS: forbidden.join(","),
   };
   if (tier === "all") {
     pyEnv["MCP_ORCH_TIER"] = "all";

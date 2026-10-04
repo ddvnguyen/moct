@@ -31,6 +31,7 @@ import {
   orchestratorRenewCron,
   orchestratorSeedPrompt,
   orchestratorWakesPerLife,
+  orchestratorWorkspaceId,
   ORCHESTRATOR_SEED_PROVIDER as SEED_PROVIDER,
 } from "../config.js";
 import { heartbeatSpecDump, queueItemDump, workerDump } from "../dump.js";
@@ -842,7 +843,7 @@ async function orchestratorScheduleSpec(
     };
   }
   const prompt = orchestratorSeedPrompt();
-  const schedule = {
+  const schedule: Record<string, unknown> = {
     name: "mcp-orchestrator",
     cron: orchestratorRenewCron(),
     max_runs: orchestratorMaxRuns(),
@@ -851,6 +852,10 @@ async function orchestratorScheduleSpec(
     cwd: orchestratorCwd(),
     archive_on_finish: false,
   };
+  // Emitted only when configured: paseo's schedule-target schema does not know
+  // `workspaceId` yet, and emitting a key the running daemon would strip is noise.
+  const reuse = orchestratorWorkspaceId();
+  if (reuse) schedule["workspaceId"] = reuse;
   const cadence = {
     renew_cron: orchestratorRenewCron(),
     checkup_cron: orchestratorCheckupCron(),
@@ -944,19 +949,45 @@ async function orchestratorScheduleConfirm(
     const locked = await store.lock(`track-${trackId}`, async () => {
       const inner = await store.getTrack(trackId);
       if (schedule) inner.heartbeats.schedule_id = schedule;
+      // The three cases are ORDER-SENSITIVE and must stay in this order:
+      // `current` is by construction present in `checkup_history`, so a
+      // history test placed first matches the holder's own id and reports
+      // the live generation as a dead predecessor (shipped 2026-10-01: a
+      // 45-wake generation dead after wake 2). The question is not "have I
+      // seen this id" but "am I the id currently holding the generation".
+      const current = inner.heartbeats.orchestrator_checkup_id;
       const history = [...(inner.heartbeats.checkup_history || [])];
       let stale: boolean;
-      if (checkup && history.includes(checkup)) {
+      let outcome: string;
+      if (!checkup) {
+        // schedule-only confirm: records the id, touches no generation
+        stale = false;
+        outcome = "schedule_recorded";
+      } else if (checkup === current) {
+        // THE HOLDER, re-confirming its own id. Idempotent by definition:
+        // the track is already on this generation, so the existing stamp
+        // stands and the existing cadence is returned. An audit event is
+        // still appended — that is what makes consecutive confirms visible
+        // afterwards — but no generation field is written.
+        stale = false;
+        outcome = "holder_reconfirm_no_op";
+      } else if (history.includes(checkup)) {
+        // A PREDECESSOR: a different id confirmed earlier, so a successor
+        // took over and this wake belongs to the old generation. Record
+        // nothing; the successor owns the clock.
         stale = true;
-      } else if (checkup && inner.heartbeats.orchestrator_checkup_id !== checkup) {
+        outcome = "late_generation";
+      } else {
+        // A NEW generation. Re-stamp the start from the SERVER clock; the
+        // agent supplies only its id, never a timestamp, because the wake
+        // count derives from this stamp.
         inner.heartbeats.generation_started_at = utcnowIso();
         inner.heartbeats.orchestrator_checkup_id = checkup;
         history.push(checkup);
         history.splice(0, Math.max(0, history.length - CHECKUP_HISTORY_LIMIT));
         inner.heartbeats.checkup_history = history;
         stale = false;
-      } else {
-        stale = false;
+        outcome = "new_generation";
       }
       if (!stale) {
         await store.saveTrack(inner);
@@ -970,6 +1001,7 @@ async function orchestratorScheduleConfirm(
               role: "orchestrator",
               schedule_id: inner.heartbeats.schedule_id,
               checkup_id: inner.heartbeats.orchestrator_checkup_id,
+              outcome,
               stale_generation: stale,
               generation_started_at: inner.heartbeats.generation_started_at,
             },
@@ -977,7 +1009,7 @@ async function orchestratorScheduleConfirm(
           inner.project_id,
         );
       }
-      return { locked: inner, stale };
+      return { locked: inner, stale, outcome };
     });
     const now = utcnowIso();
     const result: Record<string, unknown> = {
@@ -1007,7 +1039,17 @@ async function orchestratorScheduleConfirm(
     if (locked.stale) {
       result["stale_generation"] = true;
       result["note"] =
-        "this checkup_id was confirmed before, so it is a generation that woke after its successor; nothing was stamped and the wake budget belongs to the current generation";
+        "this checkup_id was confirmed earlier and is NOT the one holding the track, so a successor generation took over; nothing was stamped and the wake budget belongs to the current generation";
+    } else if (locked.outcome === "holder_reconfirm_no_op") {
+      result["note"] =
+        `re-confirm by the current holder (${checkup}): no-op. You are the ` +
+        "generation this track is on, nothing was stamped, and the cadence " +
+        "below is your own position. Collect.";
+    } else if (locked.outcome === "schedule_recorded") {
+      result["note"] =
+        "recorded the schedule id only; no checkup_id was supplied, so no " +
+        "generation was stamped and the cadence below belongs to whatever " +
+        "generation is current";
     }
     return result;
   } catch (exc) {

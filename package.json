@@ -26,7 +26,7 @@
     "prepack": "npm run build:clean",
     "typecheck": "tsgo --noEmit",
     "test": "vitest run",
-    "parity": "vitest run tests/parity/parity.test.ts",
+    "parity": "PARITY=1 vitest run tests/parity/parity.test.ts",
     "snapshot:schemas": "node scripts/capture-tool-list.mjs",
     "fixture:regen": "node scripts/regenerate-fixture.mjs"
   },

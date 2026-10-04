@@ -412,8 +412,20 @@ export function buildCases(fx: { projectId: string; trackId: string }): Case[] {
       { path: "track.project_id", var: "sys_project_id" },
     ],
   });
+  // LAO #69 (pin 13fc0cb): holder re-confirm is an idempotent no-op (NOT
+  // stale); only a DIFFERENT id already in history is a late predecessor.
   add({
-    name: "heartbeat/orchestrator-confirm-stale",
+    name: "heartbeat/orchestrator-confirm-reconfirm",
+    tool: "heartbeat",
+    args: { role: "orchestrator", action: "confirm", checkup_id: FIXED_ORCH_CHECKUP },
+  });
+  add({
+    name: "heartbeat/orchestrator-confirm-new-gen",
+    tool: "heartbeat",
+    args: { role: "orchestrator", action: "confirm", checkup_id: "eeee2222" },
+  });
+  add({
+    name: "heartbeat/orchestrator-confirm-late",
     tool: "heartbeat",
     args: { role: "orchestrator", action: "confirm", checkup_id: FIXED_ORCH_CHECKUP },
   });

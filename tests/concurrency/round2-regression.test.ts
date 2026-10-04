@@ -7,8 +7,10 @@
  * (b) concurrent task_add x2 — BOTH tasks persist (lost-update guard);
  * (c) concurrent turn_report x2 — distinct turn numbers, both rows present,
  *     turn_count consistent (no orphaned turn_count);
- * (d) cross-connection exclusion — BEGIN IMMEDIATE on the repo connection
- *     makes a second connection's write fail busy/locked until commit.
+ * (d) cross-connection busy-retry — a rival lock on a second connection WAITS
+ *     and acquires after release (bounded ~5s retry matching Python's
+ *     busy_timeout=5000); contention beyond budget still throws the original
+ *     busy/locked error.
  *
  * Each test opens a fresh temp fleet.db via TursoRepository (the ONLY module
  * importing @tursodatabase/database, per the turso-import gate). Temp dirs
@@ -142,29 +144,60 @@ describe("round2: transactional lock + re-read-inside-lock (F1-F3)", () => {
     expect((await repo.getTrack(trackId)).turn_count).toBe(2);
   });
 
-  it("(d) BEGIN IMMEDIATE excludes a concurrent writer on a second connection", async () => {
+  it("(d) rival lock WAITS and acquires after release (bounded busy-retry, Python parity)", async () => {
     const { repo, dbPath, projectId, trackId } = await makeStore();
-    const probeArgs = [projectId, trackId, "probe", "2030-01-01T00:00:00.000Z", "{}"] as const;
-    const insertProbe = (): Promise<Record<string, unknown>[]> =>
-      TursoRepository.queryRows(
-        dbPath,
-        "INSERT INTO orch_events(project_id, track_id, type, ts, payload) VALUES(?, ?, ?, ?, ?)",
-        ...probeArgs,
-      );
-
+    // Rival on a SECOND connection (the M3 dual-alive shape — a separate
+    // process's BEGIN IMMEDIATE). Opened BEFORE contention: Turso 0.7.2
+    // cannot even run open-time DDL under a held write lock, so like the
+    // real dual-alive pair both sides are up before the race starts. Python
+    // would wait on busy_timeout=5000, so the TS lock retries instead of
+    // failing fast.
+    const rival = await TursoRepository.open(path.dirname(dbPath), dbPath);
+    openRepos.push(rival);
     const holder = repo.lock("hold", async () => {
       await new Promise((r) => setTimeout(r, 1500));
       return "held";
     });
-    // Let the holder reach BEGIN IMMEDIATE before the rival write lands.
+    // Let the holder reach BEGIN IMMEDIATE before the rival lock lands.
     await new Promise((r) => setTimeout(r, 300));
-    await expect(insertProbe()).rejects.toThrow(/busy|locked/i);
+    const started = Date.now();
+    const out = await rival.lock("rival", async () => {
+      await rival.appendEvent(
+        {
+          ts: "2030-01-01T00:00:00.000Z",
+          type: "probe",
+          project_id: projectId,
+          track_id: trackId,
+          payload: {},
+        },
+        projectId,
+      );
+      return "rival-ran";
+    });
+    expect(out).toBe("rival-ran");
+    // It waited for the holder rather than failing fast or racing ahead.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
     expect(await holder).toBe("held");
 
-    // Same statement succeeds after commit: the failure was the held write
-    // lock, not the statement itself.
-    await insertProbe();
     const probes = (await repo.readEvents(projectId)).filter((e) => e["type"] === "probe");
     expect(probes.length).toBe(1);
   }, 15000);
+
+  it("(d) lock contention beyond the ~5s budget still throws the busy error", async () => {
+    const { repo, dbPath } = await makeStore();
+    const rival = await TursoRepository.open(path.dirname(dbPath), dbPath);
+    openRepos.push(rival);
+    const holder = repo.lock("hold-long", async () => {
+      await new Promise((r) => setTimeout(r, 6500));
+      return "held";
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    const started = Date.now();
+    // The ORIGINAL busy error surfaces — never a synthesized timeout.
+    await expect(rival.lock("rival", async () => "never")).rejects.toThrow(/busy|locked/i);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(4500);
+    expect(elapsed).toBeLessThan(15000);
+    expect(await holder).toBe("held");
+  }, 25000);
 });

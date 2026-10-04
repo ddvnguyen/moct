@@ -19,8 +19,14 @@ const COPY = path.join(TMP, "orch-copy.sqlite");
 const FLEET_DB = path.join(TMP, "fleet.db");
 const SEED_SQL = path.join(PKG, "tests", "fixtures", "seed.sql");
 
-const LIVE_DB =
-  "/mnt/WorkDisk/Workplace/LLM-Agents-Orchestration/orchestration/state/mcp/orchestration.sqlite";
+const LIVE_DB = (process.env["FLEET_PARITY_LIVE_DB"] || "").trim();
+if (!LIVE_DB) {
+  throw new Error(
+    "FLEET_PARITY_LIVE_DB is not set. Regeneration reads the live orchestration " +
+      "ledger (read-only snapshot) — export the path explicitly; no machine-local " +
+      "default is baked in.",
+  );
+}
 
 const TABLE_MAP = [
   ["projects", "orch_projects"],
@@ -151,6 +157,21 @@ for (const [_orig, renamed] of TABLE_MAP) {
 }
 await dump.close();
 sql += "PRAGMA foreign_keys=ON;\n";
+// Scrub machine-local values BEFORE writing (round 3, owner should-fix #2):
+// the fixture is checked into a PUBLIC repo. Value substitution only — row
+// counts and structure are untouched. Rules documented in tests/parity/SCRUB.md.
+sql = sql
+  .replace(/\/home\/ddv/g, "/path/to/home")
+  .replace(/\/mnt\/WorkDisk/g, "/path/to/work")
+  .replace(/\/mnt\/workspace/g, "/path/to/workspace")
+  .replace(/hydra\.app\.01@gmail\.com/g, "operator@example.com")
+  .replace(/(?<![A-Za-z0-9_/\-.])ddv(?![A-Za-z0-9_\-.])/g, "operator");
+const banned = ["/home/ddv", "/mnt/WorkDisk", "/mnt/workspace", "@gmail.com"];
+for (const pattern of banned) {
+  if (sql.includes(pattern)) {
+    throw new Error(`scrub incomplete: fixture still contains ${pattern}; refusing to write.`);
+  }
+}
 mkdirSync(path.dirname(SEED_SQL), { recursive: true });
 writeFileSync(SEED_SQL, sql);
 const sha = createHash("sha256").update(sql).digest("hex");

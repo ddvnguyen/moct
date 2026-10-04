@@ -219,8 +219,16 @@ export class TursoRepository implements Store {
     } catch {
       /* best-effort */
     }
+    // Deliberate deviation from Python (which sets busy_timeout=5000):
+    // busy_timeout=0 FAILS FAST on a held lock instead of blocking the Node
+    // event loop inside the native call (measured: a 5000-budget BEGIN blocks
+    // the loop for the full budget, starving the holder's own COMMIT past the
+    // waiter's deadline). Waiting is done cooperatively in
+    // beginImmediateWithRetry, which yields between attempts so the holder
+    // progresses — same observable behavior (~5s wait, then the original
+    // error) without freezing the server.
     try {
-      await repo.db.exec("PRAGMA busy_timeout=5000;");
+      await repo.db.exec("PRAGMA busy_timeout=0;");
     } catch {
       /* best-effort */
     }
@@ -250,6 +258,37 @@ export class TursoRepository implements Store {
   private conn(): Database {
     if (!this.db) throw new StateError("repository is closed");
     return this.db;
+  }
+
+  /**
+   * BEGIN IMMEDIATE with bounded retry-with-backoff.
+   *
+   * Python honors busy_timeout=5000 and WAITS on a contended ledger; Turso
+   * 0.7.2 fresh connects fail fast on busy|locked instead (the PRAGMA is set
+   * but not honored for the initial lock grab). Without this retry, TS tool
+   * calls error wherever Python waits — the failure mode that matters in the
+   * M3 dual-alive window with both backends on one DB. Total budget ~5s to
+   * match Python's observable behavior; afterwards the ORIGINAL (last busy)
+   * error is thrown, never synthesized. Non-busy errors throw immediately.
+   */
+  private static async beginImmediateWithRetry(db: Database): Promise<void> {
+    const budgetMs = 5000;
+    const deadline = Date.now() + budgetMs;
+    let backoffMs = 20;
+    let lastError: unknown = null;
+    for (;;) {
+      try {
+        await db.exec("BEGIN IMMEDIATE");
+        return;
+      } catch (exc) {
+        if (!/busy|locked/i.test((exc as Error)?.message ?? String(exc))) throw exc;
+        lastError = exc;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw lastError;
+        await new Promise((r) => setTimeout(r, Math.min(backoffMs, remaining)));
+        backoffMs = Math.min(250, Math.floor(backoffMs * 1.5));
+      }
+    }
   }
 
   async lock<T>(_name: string, fn: () => Promise<T>): Promise<T> {
@@ -286,7 +325,7 @@ export class TursoRepository implements Store {
     await prev;
     try {
       const db = this.conn();
-      await db.exec("BEGIN IMMEDIATE");
+      await TursoRepository.beginImmediateWithRetry(db);
       try {
         const out = await this.txContext.run(true, fn);
         await db.exec("COMMIT");

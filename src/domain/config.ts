@@ -32,6 +32,22 @@ function isDir(p: string): boolean {
 }
 
 export function findRepoRoot(start?: string): string {
+  const found = detectRepoRoot(start);
+  if (found !== null) return found;
+  return path.resolve(start ?? process.cwd());
+}
+
+/**
+ * The repo root by marker, or null when no marker is found.
+ *
+ * Deliberately NOT findRepoRoot, whose documented fallback is the current
+ * directory when no AGENTS.md + orchestration/ pair is found. That fallback
+ * is right for callers that need *some* answer, and catastrophic for a guard:
+ * with the cwd standing in for the root, every session appears to sit AT the
+ * repo root, so every byCwd key looks unsafe and the whole tier map collapses
+ * to the env default. A guard that cannot tell must say so, not guess.
+ */
+export function detectRepoRoot(start?: string): string | null {
   let current = path.resolve(start ?? process.cwd());
   const chain: string[] = [current];
   let parent = path.dirname(current);
@@ -48,7 +64,7 @@ export function findRepoRoot(start?: string): string {
       return candidate;
     }
   }
-  return path.resolve(start ?? process.cwd());
+  return null;
 }
 
 export function repoRoot(): string {
@@ -416,7 +432,14 @@ export function deferredTools(): Set<string> {
 export function isUnsafeTierKey(cwd: string): boolean {
   const candidate = String(cwd || "").trim();
   if (!candidate) return false;
-  const root = findRepoRoot();
+  const root = detectRepoRoot();
+  if (root === null) {
+    // No marker anywhere above us, so there is no root to be an ancestor of.
+    // Fail OPEN here on purpose: the key still has to be present in the
+    // owner-controlled fleet.json to do anything, whereas refusing every key
+    // would silently collapse every session to MCP_ORCH_TIER.
+    return false;
+  }
   let rootReal: string;
   let candidateReal: string;
   try {
@@ -435,15 +458,41 @@ function escapeReg(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * The directory this session runs in, from the best signal available.
+ *
+ * In order: the explicit argument, then paseo's PASEO_AGENT_CWD, then the
+ * PROCESS cwd. The last one is not a convenience — it is the only signal that
+ * exists in production (measured on PROD 2026-10-01: paseo does not inject
+ * PASEO_AGENT_CWD into the MCP server subprocess, so resolveTier saw an empty
+ * cwd, never consulted tiers.byCwd, and fell through to MCP_ORCH_TIER from
+ * .mcp.json for every session).
+ *
+ * Ordered deliberately — paseo's session-scoped variable beats ambient process
+ * state, so a caller that knows its cwd is never re-pointed by wherever it
+ * happens to be executing.
+ */
+export function agentCwd(agentCwdArg?: string | null): string {
+  const explicit = (agentCwdArg || "").trim();
+  if (explicit) return explicit;
+  const envValue = (process.env["PASEO_AGENT_CWD"] || "").trim();
+  if (envValue) return envValue;
+  try {
+    return process.cwd();
+  } catch {
+    return "";
+  }
+}
+
 export function resolveTier(
   override?: string | null,
   stateDir?: string,
-  agentCwd?: string | null,
+  agentCwdArg?: string | null,
 ): string {
   const explicit = (override || "").trim().toLowerCase();
   if (explicit) return explicit;
   const tiers = fleetMap(stateDir).tiers || {};
-  const cwd = (agentCwd || process.env["PASEO_AGENT_CWD"] || "").trim();
+  const cwd = agentCwd(agentCwdArg);
   if (cwd) {
     const byCwd = tiers["byCwd"] || {};
     let hit: string | undefined = byCwd[cwd];
@@ -707,6 +756,28 @@ export function orchestratorWakesPerLife(): number {
 }
 export function orchestratorMaxRuns(): number {
   return orchestratorCadence()["max_runs"];
+}
+
+/**
+ * Optional workspace to REUSE for every collector generation, or null.
+ *
+ * paseo currently provisions a fresh workspace per schedule run, so N runs
+ * meant N workspaces. `workspaceId` on the schedule target is the upstream
+ * change that allows reuse; until the daemon honours it, this field is inert
+ * and the spec simply omits it rather than emitting a key the running daemon
+ * would strip.
+ *
+ * Read from positions.orchestrator.workspace_id so the id lives in the
+ * registry next to the cwd it must match, and stays in one place.
+ */
+export function orchestratorWorkspaceId(stateDir?: string): string | null {
+  const entry = (fleetMap(stateDir).positions["orchestrator"] ?? {}) as unknown as Record<
+    string,
+    unknown
+  >;
+  const value = entry["workspace_id"];
+  if (typeof value === "string" && value.trim()) return value.trim();
+  return null;
 }
 
 function cronStepMinutes(cron: string): number | null {
