@@ -8,7 +8,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { agentCwd, detectRepoRoot, isUnsafeTierKey } from "../../src/domain/config.js";
+import { agentCwd, detectRepoRoot, isUnsafeTierKey, stateRoot } from "../../src/domain/config.js";
 
 const savedCwd = process.cwd();
 const savedEnv = process.env["PASEO_AGENT_CWD"];
@@ -78,5 +78,46 @@ describe("detectRepoRoot / isUnsafeTierKey fail-open (LAO #69)", () => {
     expect(isUnsafeTierKey(path.dirname(root))).toBe(true);
     expect(isUnsafeTierKey(sub)).toBe(false);
     expect(isUnsafeTierKey(path.join(tmpdir(), "unrelated"))).toBe(false);
+  });
+});
+
+describe("stateRoot default (F6: no cwd drift)", () => {
+  it("resolves <detected repo root>/orchestration/state/mcp with env unset, even when cwd is a marker-less dir under the root", () => {
+    const savedStateDir = process.env["MCP_ORCH_STATE_DIR"];
+    const savedRepoRoot = process.env["FLEET_REPO_ROOT"];
+    delete process.env["MCP_ORCH_STATE_DIR"];
+    delete process.env["FLEET_REPO_ROOT"];
+    try {
+      const root = freshDir();
+      writeFileSync(path.join(root, "AGENTS.md"), "x");
+      mkdirSync(path.join(root, "orchestration"));
+      const deep = path.join(root, "sub", "deep");
+      mkdirSync(deep, { recursive: true });
+      process.chdir(deep);
+      expect(stateRoot()).toBe(path.join(root, "orchestration", "state", "mcp"));
+    } finally {
+      if (savedStateDir === undefined) delete process.env["MCP_ORCH_STATE_DIR"];
+      else process.env["MCP_ORCH_STATE_DIR"] = savedStateDir;
+      if (savedRepoRoot === undefined) delete process.env["FLEET_REPO_ROOT"];
+      else process.env["FLEET_REPO_ROOT"] = savedRepoRoot;
+    }
+  });
+  it("env override wins over repo detection", () => {
+    const savedStateDir = process.env["MCP_ORCH_STATE_DIR"];
+    const savedRepoRoot = process.env["FLEET_REPO_ROOT"];
+    try {
+      const root = freshDir();
+      writeFileSync(path.join(root, "AGENTS.md"), "x");
+      mkdirSync(path.join(root, "orchestration"));
+      process.env["MCP_ORCH_STATE_DIR"] = "/from-env/state";
+      delete process.env["FLEET_REPO_ROOT"];
+      process.chdir(root);
+      expect(stateRoot()).toBe(path.resolve("/from-env/state"));
+    } finally {
+      if (savedStateDir === undefined) delete process.env["MCP_ORCH_STATE_DIR"];
+      else process.env["MCP_ORCH_STATE_DIR"] = savedStateDir;
+      if (savedRepoRoot === undefined) delete process.env["FLEET_REPO_ROOT"];
+      else process.env["FLEET_REPO_ROOT"] = savedRepoRoot;
+    }
   });
 });

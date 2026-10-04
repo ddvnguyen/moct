@@ -3,7 +3,7 @@
  *
  * Env:
  *   FLEET_DB_PATH            path to fleet.db (default: ./fleet.db in cwd)
- *   MCP_ORCH_STATE_DIR       state dir for fleet.json/usage.json (default: <repo>/orchestration/state/mcp)
+ *   MCP_ORCH_STATE_DIR       state dir (default: <repo>/orchestration/state/mcp via domain/config.ts stateRoot())
  *   MCP_ORCH_SUMMARY_PATH    orchestration.md destination (default: <repo>/orchestration.md)
  *   MCP_ORCH_LESSONS_DIR     lessons dir (default: <repo>/lessons)
  *   MCP_ORCH_REFERENCES_DIR  references dir (default: <repo>/references)
@@ -16,6 +16,7 @@
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as path from "node:path";
+import { stateRoot } from "./domain/config.js";
 import { createFleetMcpServer } from "./surfaces/mcp/server.js";
 import { TursoRepository } from "./store/turso-repository.js";
 
@@ -30,9 +31,9 @@ function forbiddenDbPaths(): string[] {
 
 async function main(): Promise<void> {
   const dbPath = path.resolve(process.env["FLEET_DB_PATH"] || path.join(process.cwd(), "fleet.db"));
-  const stateDir = process.env["MCP_ORCH_STATE_DIR"]
-    ? path.resolve(process.env["MCP_ORCH_STATE_DIR"])
-    : path.join(process.cwd(), "fleet-state");
+  // Single default: domain/config.ts stateRoot() (MCP_ORCH_STATE_DIR override
+  // wins, else <repo root>/orchestration/state/mcp). mcp.ts holds no parallel fallback.
+  const stateDir = stateRoot();
   const forbidden = forbiddenDbPaths();
   if (forbidden.includes(dbPath)) {
     console.error(
