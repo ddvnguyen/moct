@@ -49,7 +49,7 @@ pnpm --filter @getpaseo/fleet-backend parity
 
 ## Gate placement (round-3 nit decision)
 
-Parity (~2.5 min, 140 cases, two servers over stdio) is EXCLUDED from the
+Parity (~5 min measured, 140 cases, two servers over stdio) is EXCLUDED from the
 default `vitest run` via `vitest.config.ts` (the `exclude` also filters
 explicit file args, so there is exactly one door: `pnpm parity` sets
 `PARITY=1` to lift the exclusion). The default PR gate stays fast on
