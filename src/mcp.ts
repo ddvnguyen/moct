@@ -54,6 +54,9 @@ async function main(): Promise<void> {
   };
   process.on("SIGTERM", () => void shutdown());
   process.on("SIGINT", () => void shutdown());
+  // stdin-EOF: the host closed the pipe — exit promptly instead of lingering
+  // with fleet.db held open (Turso lock release is async via store.close()).
+  transport.onclose = () => void shutdown();
   await server.connect(transport);
   console.error(`fleet-backend: serving MCP stdio (db=${dbPath} state=${stateDir})`);
 }
