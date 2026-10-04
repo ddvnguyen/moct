@@ -7,7 +7,8 @@
  * control structure mirrors the Python source arm-for-arm; the parity harness
  * (138 same-input cases over MCP stdio) guards behavior, not style metrics. */
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { isReservedProjectSlug } from "../config.js";
 import { projectDump, queueItemDump, trackDump } from "../dump.js";
 import {
@@ -30,30 +31,34 @@ import { refuseSystemTrackWrite } from "./leader-guards.js";
 // gh subprocess helpers (CPython-identical error synthesis)
 // ---------------------------------------------------------------------------
 
+const execFileAsync = promisify(execFile);
+
 interface GhResult {
   returncode: number;
   stdout: string;
   stderr: string;
 }
 
-function runGh(
+async function runGh(
   args: string[],
   timeoutSec: number,
-):
+): Promise<
   | { ok: true; result: GhResult }
-  | { ok: false; kind: "missing" | "timeout" | "os"; message: string } {
+  | { ok: false; kind: "missing" | "timeout" | "os"; message: string }
+> {
   try {
-    const out = execFileSync(args[0], args.slice(1), {
+    const { stdout, stderr } = await execFileAsync(args[0], args.slice(1), {
       encoding: "utf-8",
       timeout: timeoutSec * 1000,
       windowsHide: true,
-    }) as string;
-    return { ok: true, result: { returncode: 0, stdout: out ?? "", stderr: "" } };
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return { ok: true, result: { returncode: 0, stdout: stdout ?? "", stderr: stderr ?? "" } };
   } catch (exc) {
     const err = exc as NodeJS.ErrnoException & {
       stdout?: string;
       stderr?: string;
-      status?: number;
+      code?: string | number;
       killed?: boolean;
       signal?: string;
     };
@@ -68,12 +73,12 @@ function runGh(
         message: `Command '${cmdStr}' timed out after ${timeoutSec} seconds`,
       };
     }
-    if (typeof err.status === "number") {
-      // execFileSync throws on nonzero exit carrying stdout/stderr.
+    if (typeof err.code === "number") {
+      // async execFile rejects with code = exit status, carrying stdout/stderr.
       return {
         ok: true,
         result: {
-          returncode: err.status,
+          returncode: err.code,
           stdout: String(err.stdout ?? ""),
           stderr: String(err.stderr ?? ""),
         },
@@ -83,8 +88,8 @@ function runGh(
   }
 }
 
-export function verifyPrDelivered(pr: string): [boolean, string] {
-  const r = runGh(["gh", "pr", "view", pr, "--json", "state,reviewDecision"], 30);
+export async function verifyPrDelivered(pr: string): Promise<[boolean, string]> {
+  const r = await runGh(["gh", "pr", "view", pr, "--json", "state,reviewDecision"], 30);
   if (!r.ok) return [false, `gh unavailable: ${r.message}`];
   const { result } = r;
   if (result.returncode !== 0) {
@@ -157,7 +162,7 @@ export async function projectCreate(
             hint: "gh must be authenticated; pass validate_repos=false to skip",
           };
         }
-        const r = runGh(["gh", "repo", "view", repoStr, "--json", "name"], 20);
+        const r = await runGh(["gh", "repo", "view", repoStr, "--json", "name"], 20);
         if (!r.ok) {
           const tail = r.kind === "timeout" ? `${r.message} `.slice(-200) : r.message.slice(-200);
           return {
@@ -312,7 +317,7 @@ export async function trackClose(
           hint: "pass pr='owner/repo#N' (merged or approved); or archive=True for a superseded track",
         };
       }
-      const [ok, detail] = verifyPrDelivered(pr);
+      const [ok, detail] = await verifyPrDelivered(pr);
       if (!ok) {
         return {
           ok: false,

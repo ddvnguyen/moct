@@ -7,7 +7,8 @@
  * control structure mirrors the Python source arm-for-arm; the parity harness
  * (138 same-input cases over MCP stdio) guards behavior, not style metrics. */
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import {
@@ -54,22 +55,25 @@ interface GhRun {
   stderr: string;
 }
 
-function runCli(
+const execFileAsync = promisify(execFile);
+
+async function runCli(
   args: string[],
   timeoutSec: number,
-): { ok: true; result: GhRun } | { ok: false; kind: string; message: string } {
+): Promise<{ ok: true; result: GhRun } | { ok: false; kind: string; message: string }> {
   try {
-    const out = execFileSync(args[0], args.slice(1), {
+    const { stdout, stderr } = await execFileAsync(args[0], args.slice(1), {
       encoding: "utf-8",
       timeout: timeoutSec * 1000,
       windowsHide: true,
-    }) as string;
-    return { ok: true, result: { returncode: 0, stdout: out ?? "", stderr: "" } };
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return { ok: true, result: { returncode: 0, stdout: stdout ?? "", stderr: stderr ?? "" } };
   } catch (exc) {
     const err = exc as NodeJS.ErrnoException & {
       stdout?: string;
       stderr?: string;
-      status?: number;
+      code?: string | number;
       killed?: boolean;
     };
     if (err.code === "ENOENT") {
@@ -86,11 +90,11 @@ function runCli(
         message: `Command '${pyStr(args)}' timed out after ${timeoutSec} seconds`,
       };
     }
-    if (typeof err.status === "number") {
+    if (typeof err.code === "number") {
       return {
         ok: true,
         result: {
-          returncode: err.status,
+          returncode: err.code,
           stdout: String(err.stdout ?? ""),
           stderr: String(err.stderr ?? ""),
         },
@@ -100,8 +104,8 @@ function runCli(
   }
 }
 
-function ompListModels(): AdapterResult {
-  const r = runCli(["omp", "models", "--json"], 15);
+async function ompListModels(): Promise<AdapterResult> {
+  const r = await runCli(["omp", "models", "--json"], 15);
   if (!r.ok) return { status: "unverified", data: [], error: r.message, checked_at: utcnowIso() };
   const { result } = r;
   const stdout = result.stdout || "";
@@ -149,8 +153,8 @@ function ompListModels(): AdapterResult {
   }
 }
 
-function opencodeListModels(): AdapterResult {
-  const r = runCli(["opencode", "models"], 30);
+async function opencodeListModels(): Promise<AdapterResult> {
+  const r = await runCli(["opencode", "models"], 30);
   if (!r.ok) return { status: "unverified", data: [], error: r.message, checked_at: utcnowIso() };
   const { result } = r;
   const stdout = result.stdout || "";
@@ -173,7 +177,7 @@ function opencodeListModels(): AdapterResult {
   }
 }
 
-function getAdapterListModels(harnessName: string): AdapterResult {
+async function getAdapterListModels(harnessName: string): Promise<AdapterResult> {
   if (!(KNOWN_HARNESSES as readonly string[]).includes(harnessName))
     throw new ValueError("unknown harness");
   if (harnessName === "omp") return ompListModels();
@@ -202,7 +206,11 @@ const CATALOG_ITEM_KEYS = [
   "notes",
 ];
 
-export function teamCatalog(store: Store, harness = "omp", position = ""): Record<string, unknown> {
+export async function teamCatalog(
+  store: Store,
+  harness = "omp",
+  position = "",
+): Promise<Record<string, unknown>> {
   try {
     if (!(KNOWN_HARNESSES as readonly string[]).includes(harness)) {
       return {
@@ -235,15 +243,15 @@ export function teamCatalog(store: Store, harness = "omp", position = ""): Recor
       }
       positionsMap = { [position]: positionsMap[position] };
     }
-    function attempt(
+    async function attempt(
       harnessName: string,
-    ): [string, string | null, string, Record<string, unknown>[]] {
+    ): Promise<[string, string | null, string, Record<string, unknown>[]]> {
       let status = "unverified";
       let error: string | null = null;
       let checkedAt = utcnowIso();
       let data: Record<string, unknown>[] = [];
       try {
-        const result = getAdapterListModels(harnessName);
+        const result = await getAdapterListModels(harnessName);
         status = result.status;
         error = result.error;
         checkedAt = result.checked_at || utcnowIso();
@@ -265,7 +273,7 @@ export function teamCatalog(store: Store, harness = "omp", position = ""): Recor
       adapterCheckedAt: string,
       adapterData: Record<string, unknown>[];
     try {
-      [adapterStatus, adapterError, adapterCheckedAt, adapterData] = attempt(harness);
+      [adapterStatus, adapterError, adapterCheckedAt, adapterData] = await attempt(harness);
     } catch (exc) {
       return {
         ok: false,
@@ -274,7 +282,7 @@ export function teamCatalog(store: Store, harness = "omp", position = ""): Recor
       };
     }
     if (adapterStatus !== "verified" && harness === "omp") {
-      const [fbStatus, fbError, fbCheckedAt, fbData] = attempt("opencode");
+      const [fbStatus, fbError, fbCheckedAt, fbData] = await attempt("opencode");
       if (fbStatus === "verified") {
         fallbackFrom = "omp";
         harness = "opencode";
@@ -999,7 +1007,7 @@ export function fleetUsageGet(store: Store, includeStale = true): Record<string,
 // fleet / fleet_usage dispatchers
 // ---------------------------------------------------------------------------
 
-export function fleet(
+export async function fleet(
   store: Store,
   mode = "catalog",
   harness = "omp",
@@ -1013,7 +1021,7 @@ export function fleet(
   purpose = "",
   taskId = "",
   model = "",
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   if (mode === "catalog") return teamCatalog(store, harness, position);
   if (mode === "recommend") {
     if (!position) {

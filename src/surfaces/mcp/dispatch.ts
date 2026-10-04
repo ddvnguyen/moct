@@ -170,33 +170,20 @@ export function dispatchTool(
         args["decision_limit"] ?? 0,
       );
     case "fleet":
-      return Promise.resolve(
-        fleet(
-          store,
-          (args["mode"] as string) ?? "catalog",
-          (args["harness"] as string) ?? "omp",
-          (args["position"] as string) ?? "",
-          args["usage"] ?? null,
-          args["quota"] ?? null,
-          (args["live"] as boolean) ?? false,
-          args["count"] ?? 1,
-          (args["title"] as string) ?? "",
-          (args["track_id"] as string) ?? "",
-          (args["purpose"] as string) ?? "",
-          (args["task_id"] as string) ?? "",
-          (args["model"] as string) ?? "",
-        ),
-      );
-    case "fleet_usage":
-      return Promise.resolve(
-        fleetUsage(
-          store,
-          (args["action"] as string) ?? "get",
-          args["usage"] ?? null,
-          (args["source"] as string) ?? "",
-          (args["note"] as string) ?? "",
-          (args["include_stale"] as boolean) ?? true,
-        ),
+      return fleet(
+        store,
+        (args["mode"] as string) ?? "catalog",
+        (args["harness"] as string) ?? "omp",
+        (args["position"] as string) ?? "",
+        args["usage"] ?? null,
+        args["quota"] ?? null,
+        (args["live"] as boolean) ?? false,
+        args["count"] ?? 1,
+        (args["title"] as string) ?? "",
+        (args["track_id"] as string) ?? "",
+        (args["purpose"] as string) ?? "",
+        (args["task_id"] as string) ?? "",
+        (args["model"] as string) ?? "",
       );
     case "heartbeat":
       return heartbeat(
