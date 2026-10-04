@@ -13,7 +13,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { realpathSync } from "node:fs";
 import * as path from "node:path";
-import { SYSTEM_PROJECT_SLUG, pyRepr } from "./models.js";
+import { SYSTEM_PROJECT_SLUG, pyRepr, pyTypeName } from "./models.js";
 
 // ---------------------------------------------------------------------------
 // paths
@@ -152,7 +152,7 @@ export function normalizeModelRecord(record: unknown, defaultHarness = "omp"): M
   if (typeof record === "string") rec = { model: record };
   else if (record !== null && typeof record === "object" && !Array.isArray(record))
     rec = { ...(record as Record<string, unknown>) };
-  else throw new Error(`model record must be str or dict, got ${pyTypeNameOf(record)}`);
+  else throw new Error(`model record must be str or dict, got ${pyTypeName(record)}`);
   const model = rec["model"];
   if (typeof model !== "string" || !model)
     throw new Error("model record missing non-empty 'model'");
@@ -182,15 +182,6 @@ export function normalizeModelRecord(record: unknown, defaultHarness = "omp"): M
     enabled: typeof enabledRaw === "boolean" ? enabledRaw : true,
     notes: (rec["notes"] as string) ?? "",
   };
-}
-
-function pyTypeNameOf(v: unknown): string {
-  if (typeof v === "string") return "str";
-  if (typeof v === "boolean") return "bool";
-  if (typeof v === "number") return Number.isInteger(v) ? "int" : "float";
-  if (Array.isArray(v)) return "list";
-  if (v === null || v === undefined) return "NoneType";
-  return "dict";
 }
 
 function normalizePosition(entry: unknown): {

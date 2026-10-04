@@ -700,15 +700,48 @@ export class TursoRepository implements Store {
           )
         : await db.all("SELECT * FROM orch_tracks ORDER BY created_at ASC")
     ) as Record<string, unknown>[];
+    if (rows.length === 0) return [];
+    // One batched tasks query + one batched workers query (chunked to stay
+    // under the SQLite variable limit), grouped by track_id in memory.
+    // Output shape identical to the former per-track loop.
+    const ids = rows.map((row) => String(row["id"]));
+    const taskRows: Record<string, unknown>[] = [];
+    const workerRows: Record<string, unknown>[] = [];
+    for (let i = 0; i < ids.length; i += 400) {
+      const chunk = ids.slice(i, i + 400);
+      const placeholders = chunk.map(() => "?").join(",");
+      taskRows.push(
+        ...((await db.all(
+          `SELECT * FROM orch_tasks WHERE track_id IN (${placeholders}) ORDER BY added_at ASC`,
+          ...chunk,
+        )) as Record<string, unknown>[]),
+      );
+      workerRows.push(
+        ...((await db.all(
+          `SELECT * FROM orch_workers WHERE track_id IN (${placeholders}) ORDER BY dispatched_at ASC`,
+          ...chunk,
+        )) as Record<string, unknown>[]),
+      );
+    }
+    const tasksByTrack = new Map<string, Record<string, unknown>[]>();
+    for (const tr of taskRows) {
+      const tid = String(tr["track_id"]);
+      const list = tasksByTrack.get(tid);
+      if (list) list.push(tr);
+      else tasksByTrack.set(tid, [tr]);
+    }
+    const workersByTrack = new Map<string, Record<string, unknown>[]>();
+    for (const wr of workerRows) {
+      const tid = String(wr["track_id"]);
+      const list = workersByTrack.get(tid);
+      if (list) list.push(wr);
+      else workersByTrack.set(tid, [wr]);
+    }
     const out: Track[] = [];
     for (const row of rows) {
       try {
         const tid = String(row["id"]);
-        const taskRows = (await db.all(
-          "SELECT * FROM orch_tasks WHERE track_id=? ORDER BY added_at ASC",
-          tid,
-        )) as Record<string, unknown>[];
-        const tasks = taskRows.map((tr) => ({
+        const tasks = (tasksByTrack.get(tid) ?? []).map((tr) => ({
           id: tr["id"],
           title: tr["title"],
           detail: tr["detail"],
@@ -721,11 +754,7 @@ export class TursoRepository implements Store {
           note: (tr["note"] as string) || "",
           detail_amendments: decodeAmendments(tr["detail_amendments"]),
         }));
-        const workerRows = (await db.all(
-          "SELECT * FROM orch_workers WHERE track_id=? ORDER BY dispatched_at ASC",
-          tid,
-        )) as Record<string, unknown>[];
-        const workers = workerRows.map((wr) => ({
+        const workers = (workersByTrack.get(tid) ?? []).map((wr) => ({
           agent_id: wr["agent_id"],
           role: wr["role"],
           model: wr["model"],
