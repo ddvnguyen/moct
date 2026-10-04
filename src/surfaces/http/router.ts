@@ -139,8 +139,12 @@ export function createFleetHttpServer(options: HttpSurfaceOptions): Server {
       return;
     }
 
-    // /mcp first: it owns its own transport and its own body handling.
-    if (path === "/mcp" || path.startsWith("/mcp/")) {
+    // /mcp first: it owns its own transport and its own body handling. The
+    // match is EXACT because the Python app mounts streamable_http_app() at
+    // /mcp — a Starlette mount does not answer sub-paths, so /mcp/nope is a 404
+    // there and must be here. Forwarding the prefix would hand sub-paths to the
+    // transport, which answers 406 for a missing Accept header.
+    if (path === "/mcp") {
       if (options.mcp !== undefined && (await options.mcp(req, res))) return;
       notFound(res);
       return;

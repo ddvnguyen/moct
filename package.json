@@ -17,6 +17,11 @@
       "types": "./dist/mcp.d.ts",
       "source": "./src/mcp.ts",
       "default": "./dist/mcp.js"
+    },
+    "./daemon": {
+      "types": "./dist/daemon.d.ts",
+      "source": "./src/daemon.ts",
+      "default": "./dist/daemon.js"
     }
   },
   "scripts": {
