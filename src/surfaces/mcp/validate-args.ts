@@ -12,7 +12,7 @@
  * control structure mirrors the Python source arm-for-arm; the parity harness
  * (138 same-input cases over MCP stdio) guards behavior, not style metrics. */
 
-import { pyRepr } from "../../domain/models.js";
+import { pyRepr, pyTypeName } from "../../domain/models.js";
 
 const ERROR_URL = "https://errors.pydantic.dev/2.13/v";
 
@@ -38,12 +38,7 @@ interface SingleError {
 }
 
 function pyTypeOf(v: unknown): string {
-  if (v === null || v === undefined) return "NoneType";
-  if (typeof v === "boolean") return "bool";
-  if (typeof v === "string") return "str";
-  if (typeof v === "number") return Number.isInteger(v) ? "int" : "float";
-  if (Array.isArray(v)) return "list";
-  return "dict";
+  return pyTypeName(v);
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -130,14 +125,45 @@ function checkValue(
   errors: SingleError[],
   loc: (string | number)[],
 ): unknown {
-  let prop = schema;
+  const prop = schema;
   if (prop.anyOf) {
-    const nonNull = prop.anyOf.filter((s) => s.type !== "null");
+    const branches = prop.anyOf;
+    const nonNull = branches.filter((s) => s.type !== "null");
     if (value === null || value === undefined) {
-      if (nonNull.length !== prop.anyOf.length) return null;
+      if (nonNull.length !== branches.length) return null;
+      if (nonNull.length === 0) {
+        errors.push({
+          loc,
+          msg: "Input should be a valid string",
+          type: "string_type",
+          input: value,
+          inputType: pyTypeOf(value),
+        });
+        return undefined;
+      }
       return checkValue(nonNull[0] ?? { type: "string" }, value, errors, loc);
     }
-    prop = nonNull[0];
+    if (nonNull.length === 0) {
+      // none-only union (anyOf=[{type:"null"}]) with a non-null value.
+      errors.push({
+        loc,
+        msg: "Input should be a valid string",
+        type: "string_type",
+        input: value,
+        inputType: pyTypeOf(value),
+      });
+      return undefined;
+    }
+    // pydantic lax union semantics: first branch that validates wins.
+    let firstErrors: SingleError[] | null = null;
+    for (const branch of nonNull) {
+      const trial: SingleError[] = [];
+      const checked = checkValue(branch, value, trial, loc);
+      if (trial.length === 0) return checked;
+      if (firstErrors === null) firstErrors = trial;
+    }
+    for (const e of firstErrors ?? []) errors.push(e);
+    return undefined;
   }
   const t = prop.type;
   if (t === "string") {
