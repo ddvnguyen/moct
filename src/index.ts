@@ -8,3 +8,12 @@ export { TursoRepository } from "./store/turso-repository.js";
 export { StateError, makeRowFilter, rowMatches } from "./store/store-interface.js";
 export type { RowFilter, Store } from "./store/store-interface.js";
 export { FLEET_SCHEMA_SQL, SCHEMA_VERSION } from "./store/schema.js";
+export {
+  TOOL_DOMAINS,
+  buildRegistry,
+  createToolRegistry,
+  resolveTool,
+  runTool,
+  runToolFrom,
+} from "./tools/registry.js";
+export type { ToolDomain, ToolSpec } from "./tools/registry.js";

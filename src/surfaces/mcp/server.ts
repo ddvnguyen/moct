@@ -15,7 +15,7 @@ import {
 import { sessionTierTools } from "../../domain/config.js";
 import { pyReprStr } from "../../domain/models.js";
 import type { Store } from "../../store/store-interface.js";
-import { dispatchTool } from "./dispatch.js";
+import { runTool } from "../../tools/registry.js";
 import { validateToolArgs, type ToolSchema } from "./validate-args.js";
 import TOOL_SNAPSHOT from "./tool-list.snapshot.json" with { type: "json" };
 
@@ -87,7 +87,7 @@ export function createFleetMcpServer(store: Store): Server {
       return { content: [{ type: "text", text: checked.text }], isError: true };
     }
     try {
-      const result = await dispatchTool(store, name, checked.args);
+      const result = await runTool(store, name, checked.args);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: false };
     } catch (exc) {
       const failure = {
