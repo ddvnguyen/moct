@@ -26,6 +26,37 @@ export interface RowFilter {
   since: string | null;
 }
 
+/**
+ * Team domain rows (LLM-Agents-Orchestration#70). Shapes are the DDL columns
+ * verbatim: `first_mate` is a SQLite boolean, `ended_at === null` is a live
+ * seat session.
+ */
+export interface TeamRow {
+  id: string;
+  name: string;
+  mission: string;
+  created_at: string;
+}
+
+export interface SeatRow {
+  team_id: string;
+  seat: string;
+  role: string;
+  tier: string;
+  first_mate: number;
+  persona_md: string;
+}
+
+export interface SeatSessionRow {
+  team_id: string;
+  seat: string;
+  agent_id: string;
+  model: string;
+  started_at: string;
+  ended_at: string | null;
+  end_reason: string;
+}
+
 export function makeRowFilter(init?: Partial<RowFilter>): RowFilter {
   return {
     types: init?.types ?? null,
@@ -116,6 +147,27 @@ export interface Store {
   writeSuggestions(projectId: string, suggestions: Record<string, unknown>[]): Promise<void>;
   readModelEvaluations(projectId: string): Promise<Record<string, unknown>[]>;
   writeModelEvaluations(projectId: string, evaluations: Record<string, unknown>[]): Promise<void>;
+
+  // -- team domain (#70) --
+  /**
+   * Insert a team and its seats in one transaction. The caller owns the
+   * first_mate derivation; this layer never guesses it.
+   */
+  createTeam(team: TeamRow, seats: SeatRow[]): Promise<void>;
+  getTeam(teamId: string): Promise<TeamRow | null>;
+  listTeams(): Promise<TeamRow[]>;
+  addTeamTrack(teamId: string, trackId: string): Promise<void>;
+  listTeamTracks(teamId: string): Promise<string[]>;
+  listSeats(teamId: string): Promise<SeatRow[]>;
+  getSeat(teamId: string, seat: string): Promise<SeatRow | null>;
+  /**
+   * Record a seat session and close any live session it supersedes.
+   * `exclusiveSeats` decides the cardinality: a first-mate seat holds at most
+   * one live row, a pooled worker seat may hold many (#70 G4).
+   */
+  startSeatSession(session: SeatSessionRow, exclusive: boolean): Promise<void>;
+  listLiveSeatSessions(teamId: string): Promise<SeatSessionRow[]>;
+  listLiveSeatSessionsForSeat(seat: string): Promise<SeatSessionRow[]>;
 }
 
 export type {

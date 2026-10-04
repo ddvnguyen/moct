@@ -20,9 +20,22 @@
  *   decisions_no_update / decisions_no_delete
  *                     -> orch_decisions_no_update / orch_decisions_no_delete
  *                        (same RAISE(ABORT, 'decisions is INSERT-ONLY') payload)
+ *   v3 (team domain, LLM-Agents-Orchestration#70)
+ *                     -> teams / team_tracks / seats / seat_sessions
+ *                        (new tables, no rename — they have no Python
+ *                         counterpart, so nothing to un-prefix for parity)
  */
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
+
+/**
+ * Versions whose DDL ships in FLEET_SCHEMA_SQL, oldest first. FLEET_SCHEMA_SQL
+ * is idempotent (CREATE TABLE IF NOT EXISTS), so opening an older fleet.db
+ * applies the missing tables; each version then gets its own `meta` row
+ * (`schema_version:<n>` -> applied_at), which is how this DB records the
+ * migration history. Never drop a version from this list.
+ */
+export const APPLIED_SCHEMA_VERSIONS: readonly number[] = [2, 3];
 
 export const FLEET_SCHEMA_SQL = `
 PRAGMA journal_mode=WAL;
@@ -204,4 +217,56 @@ CREATE TABLE IF NOT EXISTS orch_model_evaluations (
 CREATE INDEX IF NOT EXISTS idx_orch_model_evals_project_ts ON orch_model_evaluations(project_id, evaluated_at);
 CREATE INDEX IF NOT EXISTS idx_orch_model_evals_track_ts ON orch_model_evaluations(track_id, evaluated_at);
 CREATE INDEX IF NOT EXISTS idx_orch_model_evals_agent ON orch_model_evaluations(agent_id);
+
+-- teams (#70 team domain, schema v3). A team is long-lived and sits ABOVE
+-- tracks: it owns the seats and spans many tracks over time (G6). There is no
+-- project_id column — the project is reached through team_tracks ->
+-- orch_tracks.project_id, so one team may span tracks in several projects.
+CREATE TABLE IF NOT EXISTS teams (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    mission TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+-- team_tracks: team -> track membership. No FK onto orch_tasks/orch_workers:
+-- saveTrack() DELETEs and re-INSERTs those rows, so anything anchoring on them
+-- would be wiped by an unrelated track save (#70 finding 9). orch_tracks rows
+-- are upserted (INSERT .. ON CONFLICT DO UPDATE), so this FK is safe.
+CREATE TABLE IF NOT EXISTS team_tracks (
+    team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL REFERENCES orch_tracks(id) ON DELETE CASCADE,
+    PRIMARY KEY (team_id, track_id)
+);
+
+-- seats: the seat (position) IS the identity — sessions, models and Paseo
+-- agent ids are disposable and attach to a seat. first_mate is DERIVED, never
+-- caller-supplied: only 'lead' and 'architect' are first-mate (#70). role and
+-- tier record the fleet position this seat maps onto.
+CREATE TABLE IF NOT EXISTS seats (
+    team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    seat TEXT NOT NULL,
+    role TEXT NOT NULL,
+    tier TEXT NOT NULL DEFAULT '',
+    first_mate INTEGER NOT NULL DEFAULT 0,
+    persona_md TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (team_id, seat)
+);
+
+-- seat_sessions: seat -> agent-id history. 'ended_at IS NULL' = live. A
+-- first-mate seat holds AT MOST ONE live row (its binding is a single identity);
+-- a pooled worker seat may hold many (G4: role seats are pools). FK is on
+-- team_id only, not (team_id, seat): a session row is ledger history and must
+-- survive the seat being redefined, while dropping a team still cleans up.
+CREATE TABLE IF NOT EXISTS seat_sessions (
+    team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    seat TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    end_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_seat_sessions_live ON seat_sessions(team_id, seat, ended_at);
+CREATE INDEX IF NOT EXISTS idx_seat_sessions_agent ON seat_sessions(agent_id);
 `;

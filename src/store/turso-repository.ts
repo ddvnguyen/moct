@@ -13,8 +13,9 @@ import { connect } from "@tursodatabase/database";
 import type { Database } from "@tursodatabase/database";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as path from "node:path";
-import { FLEET_SCHEMA_SQL } from "./schema.js";
+import { FLEET_SCHEMA_SQL, APPLIED_SCHEMA_VERSIONS } from "./schema.js";
 import { StateError, makeRowFilter, type RowFilter, type Store } from "./store-interface.js";
+import type { SeatRow, SeatSessionRow, TeamRow } from "./store-interface.js";
 import {
   coerceTrack,
   defaultHandoff,
@@ -233,17 +234,18 @@ export class TursoRepository implements Store {
       /* best-effort */
     }
     await repo.db.exec(FLEET_SCHEMA_SQL);
-    // record schema version (idempotent)
-    const existing = (await repo.db.get(
-      "SELECT value FROM meta WHERE key=?",
-      "schema_version:2",
-    )) as Record<string, unknown> | undefined;
-    if (!existing) {
-      await repo.db.run(
-        "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
-        "schema_version:2",
-        utcnowIso(),
-      );
+    // Record every applied schema version (idempotent, one meta row each).
+    // FLEET_SCHEMA_SQL is CREATE TABLE IF NOT EXISTS, so opening a fleet.db
+    // written by an older build applies the newer tables in place; stamping
+    // each version is what records that this file now carries that DDL.
+    for (const version of APPLIED_SCHEMA_VERSIONS) {
+      const key = `schema_version:${version}`;
+      const existing = (await repo.db.get("SELECT value FROM meta WHERE key=?", key)) as
+        | Record<string, unknown>
+        | undefined;
+      if (!existing) {
+        await repo.db.run("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)", key, utcnowIso());
+      }
     }
     return repo;
   }
@@ -1181,6 +1183,165 @@ export class TursoRepository implements Store {
       );
     }
   }
+
+  // -- team domain (LLM-Agents-Orchestration#70) ------------------------------
+  // Teams/seats/sessions are their own tables with no FK onto orch_tasks or
+  // orch_workers, so none of this is disturbed by saveTrack()'s rewrite of
+  // those rows. Reads are deterministic (explicit ORDER BY) because the tools
+  // surface seat order and the pool order to callers.
+
+  async createTeam(team: TeamRow, seats: SeatRow[]): Promise<void> {
+    const db = this.conn();
+    await db.run(
+      "INSERT INTO teams(id, name, mission, created_at) VALUES(?, ?, ?, ?)",
+      team.id,
+      team.name,
+      team.mission,
+      team.created_at,
+    );
+    for (const seat of seats) {
+      await db.run(
+        `INSERT INTO seats(team_id, seat, role, tier, first_mate, persona_md)
+         VALUES(?, ?, ?, ?, ?, ?)`,
+        seat.team_id,
+        seat.seat,
+        seat.role,
+        seat.tier,
+        seat.first_mate,
+        seat.persona_md,
+      );
+    }
+  }
+
+  async getTeam(teamId: string): Promise<TeamRow | null> {
+    const row = (await this.conn().get(
+      "SELECT id, name, mission, created_at FROM teams WHERE id=?",
+      teamId,
+    )) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row["id"]),
+      name: String(row["name"]),
+      mission: String(row["mission"] ?? ""),
+      created_at: String(row["created_at"]),
+    };
+  }
+
+  async listTeams(): Promise<TeamRow[]> {
+    const rows = (await this.conn().all(
+      "SELECT id, name, mission, created_at FROM teams ORDER BY created_at, id",
+    )) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r["id"]),
+      name: String(r["name"]),
+      mission: String(r["mission"] ?? ""),
+      created_at: String(r["created_at"]),
+    }));
+  }
+
+  async addTeamTrack(teamId: string, trackId: string): Promise<void> {
+    await this.conn().run(
+      "INSERT OR IGNORE INTO team_tracks(team_id, track_id) VALUES(?, ?)",
+      teamId,
+      trackId,
+    );
+  }
+
+  async listTeamTracks(teamId: string): Promise<string[]> {
+    // rowid order = the order tracks were attached, so a multi-track team
+    // resolves its bootstrap track the same way on every call.
+    const rows = (await this.conn().all(
+      "SELECT track_id FROM team_tracks WHERE team_id=? ORDER BY rowid",
+      teamId,
+    )) as Record<string, unknown>[];
+    return rows.map((r) => String(r["track_id"]));
+  }
+
+  async listSeats(teamId: string): Promise<SeatRow[]> {
+    const rows = (await this.conn().all(
+      "SELECT team_id, seat, role, tier, first_mate, persona_md FROM seats WHERE team_id=? ORDER BY seat",
+      teamId,
+    )) as Record<string, unknown>[];
+    return rows.map(rowToSeat);
+  }
+
+  async getSeat(teamId: string, seat: string): Promise<SeatRow | null> {
+    const row = await this.conn().get(
+      "SELECT team_id, seat, role, tier, first_mate, persona_md FROM seats WHERE team_id=? AND seat=?",
+      teamId,
+      seat,
+    );
+    return row ? rowToSeat(row as Record<string, unknown>) : null;
+  }
+
+  async startSeatSession(session: SeatSessionRow, exclusive: boolean): Promise<void> {
+    const db = this.conn();
+    await this.lock(`seat-${session.team_id}-${session.seat}`, async () => {
+      if (exclusive) {
+        // A first-mate seat is a single identity: the new binding supersedes
+        // the previous one. The closed row stays as history (end_reason records
+        // why), which is what team_resolve reads 'live' against.
+        await db.run(
+          `UPDATE seat_sessions SET ended_at=?, end_reason='replaced'
+           WHERE team_id=? AND seat=? AND ended_at IS NULL`,
+          session.started_at,
+          session.team_id,
+          session.seat,
+        );
+      }
+      await db.run(
+        `INSERT INTO seat_sessions(team_id, seat, agent_id, model, started_at, ended_at, end_reason)
+         VALUES(?, ?, ?, ?, ?, NULL, '')`,
+        session.team_id,
+        session.seat,
+        session.agent_id,
+        session.model,
+        session.started_at,
+      );
+    });
+  }
+
+  async listLiveSeatSessions(teamId: string): Promise<SeatSessionRow[]> {
+    const rows = (await this.conn().all(
+      `SELECT team_id, seat, agent_id, model, started_at, ended_at, end_reason
+       FROM seat_sessions WHERE team_id=? AND ended_at IS NULL ORDER BY started_at, agent_id`,
+      teamId,
+    )) as Record<string, unknown>[];
+    return rows.map(rowToSeatSession);
+  }
+
+  async listLiveSeatSessionsForSeat(seat: string): Promise<SeatSessionRow[]> {
+    const rows = (await this.conn().all(
+      `SELECT team_id, seat, agent_id, model, started_at, ended_at, end_reason
+       FROM seat_sessions WHERE seat=? AND ended_at IS NULL ORDER BY started_at, team_id, agent_id`,
+      seat,
+    )) as Record<string, unknown>[];
+    return rows.map(rowToSeatSession);
+  }
+}
+
+function rowToSeat(row: Record<string, unknown>): SeatRow {
+  return {
+    team_id: String(row["team_id"]),
+    seat: String(row["seat"]),
+    role: String(row["role"] ?? ""),
+    tier: String(row["tier"] ?? ""),
+    first_mate: Number(row["first_mate"] ?? 0),
+    persona_md: String(row["persona_md"] ?? ""),
+  };
+}
+
+function rowToSeatSession(row: Record<string, unknown>): SeatSessionRow {
+  const ended = row["ended_at"];
+  return {
+    team_id: String(row["team_id"]),
+    seat: String(row["seat"]),
+    agent_id: String(row["agent_id"]),
+    model: String(row["model"] ?? ""),
+    started_at: String(row["started_at"]),
+    ended_at: ended === null || ended === undefined ? null : String(ended),
+    end_reason: String(row["end_reason"] ?? ""),
+  };
 }
 
 function orZeroInt(v: unknown): number {
