@@ -7,7 +7,7 @@
  * from identical rows without ever touching the live ledger.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { RpcClient } from "./rpc.js";
@@ -108,6 +108,7 @@ export function verifyPin(): void {
     } catch (exc) {
       throw new Error(
         `PARITY PIN: cannot read ${rel} at ${LAO_PIN_SHA} from ${gitDir}: ${(exc as Error).message}`,
+        { cause: exc },
       );
     }
     const livePath = path.join(PY_SRC, rel.replace("mcp-orchestration/src/", ""));
@@ -118,6 +119,7 @@ export function verifyPin(): void {
       throw new Error(
         `PARITY PIN: cannot read baseline file ${livePath}: ${(exc as Error).message}. ` +
           `Check FLEET_PARITY_PY_SRC (defaults to $FLEET_PARITY_LAO_ROOT/mcp-orchestration/src).`,
+        { cause: exc },
       );
     }
     if (live !== pinned) {
