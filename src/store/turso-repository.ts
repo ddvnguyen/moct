@@ -744,19 +744,14 @@ export class TursoRepository implements Store {
   // -- events --
 
   async appendEvent(event: FleetEvent, projectId: string): Promise<void> {
-    // Same shared-connection hazard as appendDecision. Events are the timeline
-    // other tools page through, so a silently rolled-back append shows up as a
-    // hole in history rather than a loud failure.
-    await this.lock("appendEvent", async () => {
-      await this.conn().run(
-        "INSERT INTO orch_events(project_id, track_id, type, ts, payload) VALUES(?, ?, ?, ?, ?)",
-        projectId,
-        event.track_id,
-        event.type,
-        event.ts,
-        pyDumps(event.payload),
-      );
-    });
+    await this.conn().run(
+      "INSERT INTO orch_events(project_id, track_id, type, ts, payload) VALUES(?, ?, ?, ?, ?)",
+      projectId,
+      event.track_id,
+      event.type,
+      event.ts,
+      pyDumps(event.payload),
+    );
   }
 
   async readEvents(projectId: string): Promise<Record<string, unknown>[]> {
@@ -787,29 +782,19 @@ export class TursoRepository implements Store {
   // -- decisions --
 
   async appendDecision(decision: Decision, projectId: string): Promise<void> {
-    // Every write must take the lock, even a single-statement append. The
-    // repository shares ONE connection, so an unlocked write silently joins
-    // whatever BEGIN IMMEDIATE a concurrent locked section has open -- and is
-    // then discarded by that section's ROLLBACK after this call already
-    // resolved. The decision ledger is the lossless record; a decision that
-    // returns ok and then vanishes is worse than one that errors.
-    //
-    // Callers that already hold the lock nest via SAVEPOINT (see lock()).
-    await this.lock("appendDecision", async () => {
-      await this.conn().run(
-        "INSERT INTO orch_decisions(id, project_id, track_id, ts, decision, rationale, source, irreversible, author, payload) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        decision.id,
-        projectId,
-        decision.track_id,
-        decision.ts,
-        decision.decision,
-        decision.rationale,
-        decision.source,
-        decision.irreversible ? 1 : 0,
-        decision.author,
-        pyDumps(decision),
-      );
-    });
+    await this.conn().run(
+      "INSERT INTO orch_decisions(id, project_id, track_id, ts, decision, rationale, source, irreversible, author, payload) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      decision.id,
+      projectId,
+      decision.track_id,
+      decision.ts,
+      decision.decision,
+      decision.rationale,
+      decision.source,
+      decision.irreversible ? 1 : 0,
+      decision.author,
+      pyDumps(decision),
+    );
   }
 
   async readDecisions(projectId: string): Promise<Record<string, unknown>[]> {
@@ -842,27 +827,24 @@ export class TursoRepository implements Store {
 
   async saveTurn(projectId: string, trackId: string, delta: TurnDelta): Promise<void> {
     const raw = pyDumps(delta);
-    // Same shared-connection hazard as appendDecision/appendEvent.
-    await this.lock("saveTurn", async () => {
-      await this.conn().run(
-        `INSERT INTO orch_turns(n, project_id, track_id, ts, summary, status, done, next, blockers, decisions, knowledge, author_agent, author_model, raw)
+    await this.conn().run(
+      `INSERT INTO orch_turns(n, project_id, track_id, ts, summary, status, done, next, blockers, decisions, knowledge, author_agent, author_model, raw)
        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        delta.n,
-        projectId,
-        trackId,
-        delta.ts,
-        delta.summary,
-        delta.status,
-        pyDumps(delta.done),
-        pyDumps(delta.next),
-        pyDumps(delta.blockers),
-        pyDumps(delta.decisions),
-        pyDumps(delta.knowledge),
-        delta.author_agent,
-        delta.author_model,
-        raw,
-      );
-    });
+      delta.n,
+      projectId,
+      trackId,
+      delta.ts,
+      delta.summary,
+      delta.status,
+      pyDumps(delta.done),
+      pyDumps(delta.next),
+      pyDumps(delta.blockers),
+      pyDumps(delta.decisions),
+      pyDumps(delta.knowledge),
+      delta.author_agent,
+      delta.author_model,
+      raw,
+    );
   }
 
   async readTurns(projectId: string, trackId: string): Promise<Record<string, unknown>[]> {
