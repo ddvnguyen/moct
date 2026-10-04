@@ -105,127 +105,143 @@ export async function turnReport(
   const blockersList = pyTruthy(blockers) ? blockers : [];
   const decisionsList = pyTruthy(decisions) ? decisions : [];
   const docsUpdated = pyTruthy(knowledgeDocsUpdated) ? knowledgeDocsUpdated : [];
-  let track;
-  try {
-    track = await store.getTrack(trackId);
-  } catch (exc) {
-    return { ok: false, error: (exc as Error).message, hint: "track not found" };
-  }
-  if (role === "orchestrator") {
-    const refusal = await refuseOrchestratorWrite(store, trackId, "turn_report");
-    if (refusal !== null) return refusal;
-  }
-  if (!track.leader) {
-    return { ok: false, error: "track has no leader", hint: "register leader first" };
-  }
-  if (task && !authorAgent) {
-    return {
-      ok: false,
-      error: "author_agent required when task is set",
-      hint: "the worker passes its own agent id as author_agent",
-    };
-  }
-  if (!authorAgent) authorAgent = track.leader.agent_id;
-  if (!summary)
-    return { ok: false, error: "summary must be non-empty", hint: "provide a summary <=50 words" };
-  if (typeof summary !== "string")
-    throw new Error(`'${pyTypeName(summary)}' object has no attribute 'strip'`);
-  if (!summary.trim())
-    return { ok: false, error: "summary must be non-empty", hint: "provide a summary <=50 words" };
-  if (!(TURN_STATUSES as readonly string[]).includes(status)) {
-    return {
-      ok: false,
-      error: `invalid status ${pyRepr(status)}`,
-      hint: `must be one of ${pyRepr([...TURN_STATUSES].sort())}`,
-    };
-  }
-  const tokenText = summary + " " + pyJoin(" ", doneList) + " " + pyJoin(" ", nextList);
-  const nTokens = estimateTokens(tokenText);
-  if (nTokens > TURN_DELTA_TOKEN_MAX) {
-    return {
-      ok: false,
-      error: `turn delta token estimate ${nTokens} exceeds limit ${TURN_DELTA_TOKEN_MAX}`,
-      hint: `reduce summary/done/next to under ${TURN_DELTA_TOKEN_MAX} tokens (~${TURN_DELTA_TOKEN_MAX * 4} chars); leaders aim ~500`,
-    };
-  }
-  const n = await store.nextTurnNumber(track.project_id, track.id);
-  const delta = {
-    n,
-    ts: utcnowIso(),
-    summary: summary.trim(),
-    status,
-    done: pyList(doneList),
-    next: pyList(nextList),
-    blockers: pyList(blockersList),
-    decisions: pyList(decisionsList),
-    knowledge: {
-      lesson_topic: knowledgeLessonTopic || null,
-      docs_updated: pyList(docsUpdated),
-    },
-    author_agent: authorAgent,
-    author_model: authorModel,
-  };
-  try {
-    if (status === "blocked") track.status = "blocked";
-    else if (status === "handing_off") track.status = "handing_off";
-    else if (status === "running" || status === "idle") track.status = "active";
-    track.turn_count = n;
-    await store.saveTrack(track);
-    await store.saveTurn(track.project_id, track.id, delta);
-    await store.appendEvent(
-      {
-        ts: utcnowIso(),
-        type: "turn_reported",
-        project_id: track.project_id,
-        track_id: track.id,
-        payload: { n, status, summary: pySlice(summary, 120) },
+  // The whole read-compute-write sequence runs inside one lock+transaction:
+  // nextTurnNumber is re-read from the fresh track, and saveTrack + saveTurn
+  // + appendEvent commit atomically — so two overlapping reports get distinct
+  // turn numbers and a turn_count is never persisted without its turn row.
+  return await store.lock(`track-${trackId}`, async () => {
+    let track;
+    try {
+      track = await store.getTrack(trackId);
+    } catch (exc) {
+      return { ok: false, error: (exc as Error).message, hint: "track not found" };
+    }
+    if (role === "orchestrator") {
+      const refusal = await refuseOrchestratorWrite(store, trackId, "turn_report");
+      if (refusal !== null) return refusal;
+    }
+    if (!track.leader) {
+      return { ok: false, error: "track has no leader", hint: "register leader first" };
+    }
+    if (task && !authorAgent) {
+      return {
+        ok: false,
+        error: "author_agent required when task is set",
+        hint: "the worker passes its own agent id as author_agent",
+      };
+    }
+    if (!authorAgent) authorAgent = track.leader.agent_id;
+    if (!summary)
+      return {
+        ok: false,
+        error: "summary must be non-empty",
+        hint: "provide a summary <=50 words",
+      };
+    if (typeof summary !== "string")
+      throw new Error(`'${pyTypeName(summary)}' object has no attribute 'strip'`);
+    if (!summary.trim())
+      return {
+        ok: false,
+        error: "summary must be non-empty",
+        hint: "provide a summary <=50 words",
+      };
+    if (!(TURN_STATUSES as readonly string[]).includes(status)) {
+      return {
+        ok: false,
+        error: `invalid status ${pyRepr(status)}`,
+        hint: `must be one of ${pyRepr([...TURN_STATUSES].sort())}`,
+      };
+    }
+    const tokenText = summary + " " + pyJoin(" ", doneList) + " " + pyJoin(" ", nextList);
+    const nTokens = estimateTokens(tokenText);
+    if (nTokens > TURN_DELTA_TOKEN_MAX) {
+      return {
+        ok: false,
+        error: `turn delta token estimate ${nTokens} exceeds limit ${TURN_DELTA_TOKEN_MAX}`,
+        hint: `reduce summary/done/next to under ${TURN_DELTA_TOKEN_MAX} tokens (~${TURN_DELTA_TOKEN_MAX * 4} chars); leaders aim ~500`,
+      };
+    }
+    const n = await store.nextTurnNumber(track.project_id, track.id);
+    const delta = {
+      n,
+      ts: utcnowIso(),
+      summary: summary.trim(),
+      status,
+      done: pyList(doneList),
+      next: pyList(nextList),
+      blockers: pyList(blockersList),
+      decisions: pyList(decisionsList),
+      knowledge: {
+        lesson_topic: knowledgeLessonTopic || null,
+        docs_updated: pyList(docsUpdated),
       },
-      track.project_id,
-    );
-  } catch (exc) {
-    return { ok: false, error: `failed to save turn: ${(exc as Error).message}` };
-  }
-  const out: Record<string, unknown> = {
-    ok: true,
-    turn: n,
-    md_rebuild_hint:
-      "call summary_read(action=spec) then write the content yourself and summary_write (summarizer role removed owner 2026-09-27)",
-  };
-  if (task) {
-    const workerStatus =
-      ({ blocked: "blocked", idle: "done", running: "partial" } as Record<string, string>)[
-        status
-      ] ?? "partial";
-    const res = await workerReport(
-      store,
-      trackId,
-      authorAgent,
-      task,
-      summary.trim(),
-      role || "dev",
-      authorModel,
-      workerStatus,
-      evaluation,
-      pr,
-      pyTruthy(artifacts) ? pyList(artifacts) : [],
-    );
-    if (!res["ok"]) return res;
-    out["worker_reported"] = true;
-  }
-  if (decision) {
-    const res = await decisionRecord(
-      store,
-      trackId,
-      decision,
-      decisionRationale,
-      decisionSource,
-      irreversible,
-      authorAgent,
-    );
-    if (!res["ok"]) return res;
-    out["decision_id"] = res["decision_id"];
-  }
-  return out;
+      author_agent: authorAgent,
+      author_model: authorModel,
+    };
+    try {
+      if (status === "blocked") track.status = "blocked";
+      else if (status === "handing_off") track.status = "handing_off";
+      else if (status === "running" || status === "idle") track.status = "active";
+      track.turn_count = n;
+      await store.saveTrack(track);
+      await store.saveTurn(track.project_id, track.id, delta);
+      await store.appendEvent(
+        {
+          ts: utcnowIso(),
+          type: "turn_reported",
+          project_id: track.project_id,
+          track_id: track.id,
+          payload: { n, status, summary: pySlice(summary, 120) },
+        },
+        track.project_id,
+      );
+    } catch (exc) {
+      return { ok: false, error: `failed to save turn: ${(exc as Error).message}` };
+    }
+    const out: Record<string, unknown> = {
+      ok: true,
+      turn: n,
+      md_rebuild_hint:
+        "call summary_read(action=spec) then write the content yourself and summary_write (summarizer role removed owner 2026-09-27)",
+    };
+    if (task) {
+      const workerStatus =
+        ({ blocked: "blocked", idle: "done", running: "partial" } as Record<string, string>)[
+          status
+        ] ?? "partial";
+      // Nested lock: runs in a SAVEPOINT of this same transaction (F1), so
+      // the turn row and the worker report still commit atomically.
+      const res = await workerReport(
+        store,
+        trackId,
+        authorAgent,
+        task,
+        summary.trim(),
+        role || "dev",
+        authorModel,
+        workerStatus,
+        evaluation,
+        pr,
+        pyTruthy(artifacts) ? pyList(artifacts) : [],
+      );
+      if (!res["ok"]) return res;
+      out["worker_reported"] = true;
+    }
+    if (decision) {
+      const res = await decisionRecord(
+        store,
+        trackId,
+        decision,
+        decisionRationale,
+        decisionSource,
+        irreversible,
+        authorAgent,
+      );
+      if (!res["ok"]) return res;
+      out["decision_id"] = res["decision_id"];
+    }
+    return out;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -329,17 +345,19 @@ export async function workerReport(
     }
     const [evalObj, evalErr] = validateEvaluationDict(evaluation);
     if (evalErr !== null) return evalErr;
-    let track;
-    try {
-      track = await store.getTrack(trackId);
-    } catch (exc) {
-      return {
-        ok: false,
-        error: `track not found: ${trackId}: ${(exc as Error).message}`,
-        hint: "ask the leader for the track_id",
-      };
-    }
-    await store.lock(`track-${trackId}`, async () => {
+    // Re-read INSIDE the lock (lost-update guard, same as task_add): the
+    // track feeds saveTrack's whole-workers rewrite.
+    const outcome = await store.lock(`track-${trackId}`, async () => {
+      let track;
+      try {
+        track = await store.getTrack(trackId);
+      } catch (exc) {
+        return {
+          ok: false as const,
+          error: `track not found: ${trackId}: ${(exc as Error).message}`,
+          hint: "ask the leader for the track_id",
+        };
+      }
       const now = utcnowIso();
       const existing = track.workers.find((w) => w.agent_id === agentId) ?? null;
       if (existing !== null) {
@@ -388,7 +406,9 @@ export async function workerReport(
         },
         track.project_id,
       );
+      return { ok: true as const };
     });
+    if (!outcome.ok) return outcome;
     return {
       ok: true,
       recorded: true,
@@ -1240,17 +1260,19 @@ export async function workerEvaluate(
     );
     if (evalErr !== null) return evalErr;
     if (!evalObj) throw new Error("evaluation validation produced no object");
-    let track;
-    try {
-      track = await store.getTrack(trackId);
-    } catch (exc) {
-      return {
-        ok: false,
-        error: `track not found: ${trackId}: ${(exc as Error).message}`,
-        hint: "ask the leader for the track_id",
-      };
-    }
-    await store.lock(`track-${trackId}`, async () => {
+    // Re-read INSIDE the lock (lost-update guard, same as task_add): the
+    // track feeds saveTrack's whole-workers rewrite.
+    const outcome = await store.lock(`track-${trackId}`, async () => {
+      let track;
+      try {
+        track = await store.getTrack(trackId);
+      } catch (exc) {
+        return {
+          ok: false as const,
+          error: `track not found: ${trackId}: ${(exc as Error).message}`,
+          hint: "ask the leader for the track_id",
+        };
+      }
       const now = utcnowIso();
       const existing = track.workers.find((w) => w.agent_id === agentId) ?? null;
       if (existing !== null) {
@@ -1277,7 +1299,9 @@ export async function workerEvaluate(
         },
         track.project_id,
       );
+      return { ok: true as const };
     });
+    if (!outcome.ok) return outcome;
     return { ok: true, recorded: true, evaluation: workerEvalDump(evalObj) };
   } catch (exc) {
     return {

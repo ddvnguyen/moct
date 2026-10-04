@@ -5,10 +5,13 @@
  * SQL-mode port of mcp-orchestration/state/store.py against fleet.db v1
  * (orch_* tables + meta; see store/schema.ts for the rename mapping).
  * Single connection, single writer; lock() serializes read-modify-write
- * critical sections with an async mutex.
+ * critical sections with an async mutex (intra-process) inside a real
+ * SQLite transaction — BEGIN IMMEDIATE / COMMIT / ROLLBACK, SAVEPOINT for
+ * nesting (cross-process, mirroring Python Store.lock's SQL mode).
  */
 import { connect } from "@tursodatabase/database";
 import type { Database } from "@tursodatabase/database";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as path from "node:path";
 import { FLEET_SCHEMA_SQL } from "./schema.js";
 import { StateError, makeRowFilter, type RowFilter, type Store } from "./store-interface.js";
@@ -139,6 +142,16 @@ export class TursoRepository implements Store {
   private readonly dbPath: string;
   private db: Database | null = null;
   private mutex: Promise<void> = Promise.resolve();
+  /**
+   * AsyncLocalStorage marks the async call chain currently inside this
+   * repo's transaction. A nested lock() on the SAME repo (e.g. turn_report
+   * calling worker_report) takes a SAVEPOINT instead of re-acquiring the
+   * mutex (which would deadlock) or double-BEGIN-ing (which would fail).
+   * A concurrent rival runs in a different async chain, sees no context,
+   * and serializes on the mutex + BEGIN IMMEDIATE as usual. Mirrors
+   * Python Store.lock's `conn.in_transaction` outer/inner split.
+   */
+  private readonly txContext = new AsyncLocalStorage<true>();
 
   private constructor(root: string, dbPath: string) {
     this.root = root;
@@ -240,7 +253,31 @@ export class TursoRepository implements Store {
   }
 
   async lock<T>(_name: string, fn: () => Promise<T>): Promise<T> {
-    // Single connection + single writer: serialize critical sections.
+    // Nested lock on the same repo inside an open transaction: SAVEPOINT,
+    // mirroring Python Store.lock's inner arm (RELEASE / ROLLBACK TO +
+    // RELEASE). The name is advisory only in SQL mode, as in Python.
+    if (this.txContext.getStore() === true) {
+      const db = this.conn();
+      await db.exec("SAVEPOINT store_lock");
+      try {
+        const out = await fn();
+        await db.exec("RELEASE SAVEPOINT store_lock");
+        return out;
+      } catch (exc) {
+        try {
+          await db.exec("ROLLBACK TO SAVEPOINT store_lock");
+          await db.exec("RELEASE SAVEPOINT store_lock");
+        } catch {
+          /* best-effort, mirrors Python's except-pass */
+        }
+        throw exc;
+      }
+    }
+    // Outermost boundary: intra-process serialization via the mutex plus
+    // cross-process exclusion via BEGIN IMMEDIATE on the single connection
+    // (mirrors Python Store.lock's SQL mode: BEGIN IMMEDIATE, commit on
+    // success, rollback on error). Every lock body — saveTrack's
+    // DELETE-then-N-INSERTs, turn read-compute-write triples — is atomic.
     const prev = this.mutex;
     let release!: () => void;
     this.mutex = new Promise<void>((resolve) => {
@@ -248,7 +285,20 @@ export class TursoRepository implements Store {
     });
     await prev;
     try {
-      return await fn();
+      const db = this.conn();
+      await db.exec("BEGIN IMMEDIATE");
+      try {
+        const out = await this.txContext.run(true, fn);
+        await db.exec("COMMIT");
+        return out;
+      } catch (exc) {
+        try {
+          await db.exec("ROLLBACK");
+        } catch {
+          /* best-effort, mirrors Python's except-pass */
+        }
+        throw exc;
+      }
     } finally {
       release();
     }

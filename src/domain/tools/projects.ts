@@ -467,13 +467,19 @@ export async function taskAdd(
     if (!(TASK_GATES as readonly string[]).includes(gate)) {
       return { ok: false, error: `invalid gate ${pyRepr(gate)}`, hint: TASK_GATES.join(" | ") };
     }
-    let track;
-    try {
-      track = await store.getTrack(trackId);
-    } catch (exc) {
-      return { ok: false, error: `track not found: ${trackId}: ${(exc as Error).message}` };
-    }
-    const item = await store.lock(`track-${trackId}`, async () => {
+    // The track is (re-)read INSIDE the lock: saveTrack rewrites the whole
+    // queue from the fetched copy, so mutating a pre-lock copy would erase a
+    // concurrent writer's tasks (lost update). Same pattern as track_close.
+    const outcome = await store.lock(`track-${trackId}`, async () => {
+      let track;
+      try {
+        track = await store.getTrack(trackId);
+      } catch (exc) {
+        return {
+          ok: false as const,
+          error: `track not found: ${trackId}: ${(exc as Error).message}`,
+        };
+      }
       const created = makeQueueItem({ title, detail, gate, assignee });
       track.queue.push(created);
       await store.saveTrack(track);
@@ -487,8 +493,10 @@ export async function taskAdd(
         },
         track.project_id,
       );
-      return created;
+      return { ok: true as const, created, track };
     });
+    if (!outcome.ok) return outcome;
+    const { created: item, track } = outcome;
     return {
       ok: true,
       task: queueItemDump(item),
@@ -653,13 +661,18 @@ export async function taskUpdate(
       return { ok: false, error: "progress must be 0..100" };
     }
     const progressNum = prog as number;
-    let track;
-    try {
-      track = await store.getTrack(trackId);
-    } catch (exc) {
-      return { ok: false, error: `track not found: ${trackId}: ${(exc as Error).message}` };
-    }
+    // Re-read INSIDE the lock (lost-update guard, same as task_add): the
+    // track feeds saveTrack's whole-queue rewrite.
     const outcome = await store.lock(`track-${trackId}`, async () => {
+      let track;
+      try {
+        track = await store.getTrack(trackId);
+      } catch (exc) {
+        return {
+          ok: false as const,
+          error: `track not found: ${trackId}: ${(exc as Error).message}`,
+        };
+      }
       const now = utcnowIso();
       const item = track.queue.find((q) => q.id === taskId) ?? null;
       if (item === null) {
