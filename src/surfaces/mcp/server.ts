@@ -13,7 +13,7 @@ import {
   type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { sessionTierTools } from "../../domain/config.js";
-import { pyReprStr } from "../../domain/models.js";
+import { excRepr } from "../../domain/models.js";
 import type { Store } from "../../store/store-interface.js";
 import { runTool } from "../../tools/registry.js";
 import { validateToolArgs, type ToolSchema } from "./validate-args.js";
@@ -42,11 +42,17 @@ export function listToolsForSession(): SnapshotTool[] {
   return SNAPSHOT.filter((t) => allowed === null || allowed.has(t.name));
 }
 
-function excRepr(exc: unknown): string {
-  if (exc instanceof Error) {
-    return `${exc.name || "Error"}(${pyReprStr(String(exc.message ?? ""))})`;
-  }
-  return `Error(${pyReprStr(String(exc))})`;
+/**
+ * The UNFILTERED tool table.
+ *
+ * backend.py's /schema reads `mcp._tool_manager.list_tools()` — every tool the
+ * server knows — not the tier-filtered session view. A thin stdio client uses
+ * /schema to discover what it may call, so tier filtering here would hide tools
+ * the caller is entitled to. Kept separate from listToolsForSession for that
+ * reason; do not merge them.
+ */
+export function listAllTools(): readonly SnapshotTool[] {
+  return SNAPSHOT;
 }
 
 export function createFleetMcpServer(store: Store): Server {
