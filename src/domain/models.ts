@@ -156,6 +156,20 @@ export function pyReprStr(s: string): string {
   return `'${esc.replace(/'/g, "\\'")}'`;
 }
 
+/**
+ * CPython repr() of a raised exception, e.g. `ValueError('bad row')`.
+ *
+ * backend.py renders its last-resort 500 as `unexpected: {exc!r}`, so the REST
+ * surface needs the same rendering. Lives beside pyReprStr because it is the
+ * repr-parity module and two implementations would drift.
+ */
+export function excRepr(exc: unknown): string {
+  if (exc instanceof Error) {
+    return `${exc.name || "Error"}(${pyReprStr(String(exc.message ?? ""))})`;
+  }
+  return `Error(${pyReprStr(String(exc))})`;
+}
+
 /** Python str() for interpolation: bare strings stay bare; containers use repr items. */
 export function pyStr(v: unknown): string {
   if (v === null || v === undefined) return "None";

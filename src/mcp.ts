@@ -21,8 +21,13 @@ import { stateRoot } from "./domain/config.js";
 import { createFleetMcpServer } from "./surfaces/mcp/server.js";
 import { TursoRepository } from "./store/turso-repository.js";
 
-function forbiddenDbPaths(): string[] {
-  const raw = process.env["FLEET_FORBIDDEN_DB_PATHS"] || "";
+/**
+ * DB paths this process must never open. Shared with daemon.ts so both
+ * entrypoints enforce ONE guard — a second copy would be a second rule, and
+ * the one that drifts is the one nobody reads.
+ */
+export function forbiddenDbPaths(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env["FLEET_FORBIDDEN_DB_PATHS"] || "";
   return raw
     .split(",")
     .map((s) => s.trim())

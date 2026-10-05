@@ -356,7 +356,8 @@ export async function teamCatalog(
 // spawn spec
 // ---------------------------------------------------------------------------
 
-const SPAWN_SCAFFOLD =
+/** Raw spawn template. GET /config serves it UNINTERPOLATED (config_api parity). */
+export const SPAWN_SCAFFOLD =
   "[#Engineer]\n" +
   "You are spawned into position '{position}' of the orchestration fleet" +
   "{track_ctx}. First: read AGENTS.md (and orchestration.md if present) at " +
@@ -369,7 +370,8 @@ const SPAWN_SCAFFOLD =
   "\n\nTASK:\n{purpose}" +
   "{report_duty}";
 
-const REPORT_DUTY =
+/** Raw report-duty block. GET /config serves it UNINTERPOLATED (config_api parity). */
+export const REPORT_DUTY =
   "\n\nWORK LOOP (Ralph) — operate turn-by-turn until done or blocked, never single-shot:\n" +
   '1. At each turn start: task_update(track_id="{track_id}", task_id="{task_id}", ' +
   'progress=<0-100>, status="running") so the leader sees progress.\n' +
