@@ -511,8 +511,30 @@ export function tierTools(raw: string | null | undefined, stateDir?: string): Se
     .trim()
     .toLowerCase();
   if (value === "all") return null;
-  return TOOL_TIERS[value] ?? TOOL_TIERS[DEFAULT_TIER];
+  // Compose rather than mutate: TOOL_TIERS holds shared Sets, and a caller that
+  // added to one in place would leak team tools into every other tier.
+  const base = TOOL_TIERS[value] ?? TOOL_TIERS[DEFAULT_TIER];
+  const domain = DOMAIN_TOOL_TIERS[value];
+  if (domain === undefined) return base;
+  return new Set([...base, ...domain]);
 }
+
+/**
+ * Domain (non-base) tools per tier — mirrors Python's `TEAM_TOOL_TIERS` in
+ * `config.py` (merged in LLM-Agents-Orchestration PR #330, 6a93a8348), where the
+ * tier set is composed as `base | TEAM_TOOL_TIERS.get(tier)`.
+ *
+ * `team_join` is deliberately ABSENT: it is call-by-name, not listed.
+ *
+ * Do NOT invert this into "domain tools are visible to every tier". That was
+ * tried and it broke parity — 139/140 with `protocol/tools-list` reporting
+ * `py [len 10]` against `ts [len 13]` — because a tier-filtered tool listing is a
+ * contract with clients, not a preference. See #31.
+ */
+const DOMAIN_TOOL_TIERS: Record<string, ReadonlySet<string>> = {
+  leader: new Set(["team", "team_resolve"]),
+  consult: new Set(["team", "team_resolve"]),
+};
 
 export function sessionTierTools(stateDir?: string): Set<string> | null {
   return tierTools(null, stateDir);

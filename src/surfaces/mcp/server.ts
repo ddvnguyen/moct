@@ -46,17 +46,18 @@ export function listToolsForSession(): SnapshotTool[] {
  * in the checked-in snapshot — the snapshot is the BASE surface, deliberately
  * frozen so a base tool can never silently change shape.
  *
- * TIER POLICY (flagged to the owner, 2026-10-05): the tier map in fleet.json is
- * keyed by the 26 base tool names. A domain tool is absent from it, so treating
- * "absent" as "denied" would make Lane T invisible to exactly the sessions that
- * need it (a seat agent is not a leader-tier role). Domain tools are therefore
- * visible to every tier until the owner says otherwise. Do not "fix" this by
- * silently excluding unknown tools — that reintroduces the invisibility.
+ * TIER POLICY (owner decision, 2026-10-05 — LLM-Agents-Orchestration PR #330):
+ * domain tools are NOT visible to every tier. `tierTools()` composes each tier's
+ * set as `base | DOMAIN_TOOL_TIERS[tier]`, mirroring Python's TEAM_TOOL_TIERS;
+ * `team_join` is deliberately unlisted (call-by-name). An earlier version here
+ * ignored the tier argument entirely, which showed up as a parity break —
+ * `protocol/tools-list`, py [len 10] vs ts [len 13] — because a tier-filtered
+ * listing is a contract with clients, not a preference.
  */
 function domainTools(tierAllowed: Set<string> | null): SnapshotTool[] {
-  void tierAllowed;
   return [...registeredTools().values()]
     .filter((spec) => !SNAPSHOT_TOOL_NAMES.has(spec.name))
+    .filter((spec) => tierAllowed === null || tierAllowed.has(spec.name))
     .map((spec) => ({
       name: spec.name,
       description: spec.description,
@@ -66,7 +67,7 @@ function domainTools(tierAllowed: Set<string> | null): SnapshotTool[] {
 
 const SNAPSHOT_TOOL_NAMES = new Set(SNAPSHOT.map((t) => t.name));
 
-/** Every advertised tool for a session: tier-filtered base + all domain tools. */
+/** Every advertised tool for a session: base and domain tools, both tier-filtered. */
 export function advertisedTools(tierAllowed: Set<string> | null): SnapshotTool[] {
   const base = SNAPSHOT.filter((t) => tierAllowed === null || tierAllowed.has(t.name));
   return [...base, ...domainTools(tierAllowed)];
