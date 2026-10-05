@@ -185,6 +185,24 @@ export function dispatchTool(
         (args["task_id"] as string) ?? "",
         (args["model"] as string) ?? "",
       );
+    case "fleet_usage":
+      // Was advertised in TOOL_NAMES and in the tools/list snapshot but had NO
+      // case here, so every client that discovered it got `unknown tool:
+      // fleet_usage`. The handler (catalog.ts fleetUsage, mirroring Python
+      // tools/catalog.py:801) was written, exported and imported — the wiring
+      // was the only missing piece, which is also why the repo-wide lint job
+      // reported `fleetUsage` as an unused import on this same line.
+      // dispatchTool is Promise-returning; fleetUsage is synchronous.
+      return Promise.resolve(
+        fleetUsage(
+          store,
+          (args["action"] as string) ?? "get",
+          args["usage"] ?? null,
+          (args["source"] as string) ?? "",
+          (args["note"] as string) ?? "",
+          (args["include_stale"] as boolean) ?? true,
+        ),
+      );
     case "heartbeat":
       return heartbeat(
         store,
