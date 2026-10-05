@@ -4,7 +4,7 @@
 // MCP_ORCH_TIER=all and saves the tools/list result as the checked-in
 // input-schema snapshot served verbatim by the TS MCP server.
 // Usage: npm run snapshot:schemas --workspace=@getpaseo/fleet-backend
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,6 +70,21 @@ const names = tools.map((t) => t.name);
 console.log(`captured ${tools.length} tools: ${names.join(",")}`);
 const out = path.join(PKG, "src", "surfaces", "mcp", "tool-list.snapshot.json");
 writeFileSync(out, JSON.stringify(tools, null, 2) + "\n");
+// The snapshot is a CHECKED-IN file, so regenerating it must be byte-reproducible
+// or every regeneration shows up as a spurious diff. Measured: writing
+// JSON.stringify(tools, null, 2) here and comparing against the committed file gave
+// 135 differing lines while the parsed JSON was IDENTICAL — oxfmt collapses the
+// expanded `"required": [...]` arrays. Format it here so the documented command
+// reproduces the committed bytes on its own.
+const oxfmt = path.join(PKG, "..", "..", "node_modules", ".bin", "oxfmt");
+const formatted = spawnSync(oxfmt, [out], { stdio: "inherit" });
+if (formatted.status !== 0) {
+  console.error(
+    `capture: oxfmt failed (${oxfmt}) — the snapshot is written UNFORMATTED and will\n` +
+      `  differ from the committed file. Fix the formatter path, or run oxfmt on it\n` +
+      `  by hand before committing.`,
+  );
+}
 console.log(`wrote ${out}`);
 server.kill();
 process.exit(0);
