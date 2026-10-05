@@ -49,7 +49,8 @@ describe("turso import gate", () => {
       // dynamic import(), require(), AND node_modules-prefixed specifiers.
       const hits =
         /(?:from\s+['"]|import\s*\(\s*['"]|require\s*\(\s*['"])[^'"]*@tursodatabase\/database(?:\/[^'"]*)?['"]/.test(
-        text);
+          text,
+        );
       if (hits && !ALLOWED.has(rel)) offenders.push(rel);
     }
     expect(offenders).toEqual([]);
