@@ -10,6 +10,29 @@ import { describe, expect, it } from "vitest";
 import { buildCases, summaryContent, type Case } from "./cases.js";
 import { canonical, diffNormalized, normalizeSide } from "./normalize.js";
 import { setupParity, teardownParity, type ParityWorld } from "./setup.js";
+import { registeredTools } from "../../src/tools/registry.js";
+
+/** Tool names advertised by a tools/list response. */
+function namesOf(list: unknown): string[] {
+  const tools = ((list as { result?: { tools?: unknown } }).result?.tools ?? []) as Array<{
+    name?: unknown;
+  }>;
+  return tools.map((t) => String(t.name)).sort();
+}
+
+/** The same tools/list response, restricted to the names `keep` accepts. */
+function pickTools(list: unknown, keep: (name: string) => boolean): unknown {
+  const tools = ((list as { result?: { tools?: unknown } }).result?.tools ?? []) as Array<{
+    name?: unknown;
+  }>;
+  return {
+    ...(list as object),
+    result: {
+      ...(list as { result?: object }).result,
+      tools: tools.filter((t) => keep(String(t.name))),
+    },
+  };
+}
 
 function getPath(obj: unknown, path: string): unknown {
   let cur = obj;
@@ -81,9 +104,43 @@ async function runCase(
     if (c.special === "tools-list") {
       const pyList = await world.py.listTools();
       const tsList = await world.ts.listTools();
-      const a = normalizeSide(pyList, { tmpPrefixes: [tmpPrefixes[0]] });
-      const b = normalizeSide(tsList, { tmpPrefixes: [tmpPrefixes[1]] });
+      // Domain tools (team/team_join/team_resolve) are a DELIBERATE TS-only
+      // extension: the owner froze new tools in Python MOCT on 2026-10-04 so they
+      // would be ported once, and Python has never registered them — not at the
+      // pinned baseline and not at LAO main. A byte-for-byte listing comparison
+      // therefore cannot pass while Lane T exists, and moving the pin would not
+      // help (verified: 0 occurrences in either Python server.py).
+      //
+      // What the gate still guarantees, now stated explicitly:
+      //   1. every tool Python advertises is advertised by TS, identically
+      //      (base parity — unchanged in strength);
+      //   2. the TS-only names are EXACTLY the registered domain tools, so a base
+      //      tool silently disappearing, or an undeclared tool appearing, still
+      //      fails.
+      const pyNames = namesOf(pyList);
+      const tsNames = namesOf(tsList);
+      const a = normalizeSide(
+        pickTools(pyList, (n) => pyNames.includes(n)),
+        {
+          tmpPrefixes: [tmpPrefixes[0]],
+        },
+      );
+      const b = normalizeSide(
+        pickTools(tsList, (n) => pyNames.includes(n)),
+        {
+          tmpPrefixes: [tmpPrefixes[1]],
+        },
+      );
       const diffs = diffNormalized(a, b);
+      const tsOnly = tsNames.filter((n) => !pyNames.includes(n)).sort();
+      const expected = [...registeredTools().keys()].filter((n) => !pyNames.includes(n)).sort();
+      if (tsOnly.join(",") !== expected.join(",")) {
+        return {
+          name: c.name,
+          pass: false,
+          diffs: [{ path: "$.result.tools[ts-only]", a: expected.join(","), b: tsOnly.join(",") }],
+        };
+      }
       return { name: c.name, pass: diffs.length === 0, diffs };
     }
     if (c.special === "unknown-tool") {
@@ -211,14 +268,36 @@ describe("mcp parity (python vs fleet-backend over stdio)", () => {
     try {
       const pyList = await world.py.listTools();
       const tsList = await world.ts.listTools();
-      const a = normalizeSide(pyList, { tmpPrefixes: [world.pyDir] });
-      const b = normalizeSide(tsList, { tmpPrefixes: [world.tsDir] });
+      const pyNames = namesOf(pyList);
+      // Base parity: every tool Python advertises at the default tier is
+      // advertised by TS, identically.
+      const a = normalizeSide(
+        pickTools(pyList, (n) => pyNames.includes(n)),
+        {
+          tmpPrefixes: [world.pyDir],
+        },
+      );
+      const b = normalizeSide(
+        pickTools(tsList, (n) => pyNames.includes(n)),
+        {
+          tmpPrefixes: [world.tsDir],
+        },
+      );
       const diffs = diffNormalized(a, b);
       if (diffs.length) console.log(canonical(diffs).slice(0, 2000));
       expect(diffs).toEqual([]);
-      // default tier is the leader surface (10 tools)
-      const tools = (tsList["result"] as Record<string, unknown>)["tools"] as unknown[];
-      expect(tools.length).toBe(10);
+      // The default tier is the leader surface: 10 base tools PLUS the owner's
+      // TEAM_TOOL_TIERS additions (`team` + `team_resolve`; `team_join` is
+      // call-by-name and must NOT be listed). Asserting 10 encoded "no domain
+      // tools exist yet" and broke the moment Lane T landed.
+      const tools = (tsList["result"] as Record<string, unknown>)["tools"] as Array<{
+        name: string;
+      }>;
+      const names = tools.map((t) => t.name);
+      expect(names).toHaveLength(12);
+      expect(names).toContain("team");
+      expect(names).toContain("team_resolve");
+      expect(names).not.toContain("team_join");
     } finally {
       await teardownParity(world);
     }
