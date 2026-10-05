@@ -153,6 +153,16 @@ export function resolveTool(name: string): ToolSpec | undefined {
 }
 
 /**
+ * Every tool the process will actually serve — base plus registered domains.
+ * Surfaces that ADVERTISE tools (MCP tools/list, REST /schema) must read this,
+ * not the base snapshot: the snapshot is the frozen base surface, so a domain
+ * tool is invisible to discovery until a surface enumerates the registry.
+ */
+export function registeredTools(): ReadonlyMap<string, ToolSpec> {
+  return toolRegistry();
+}
+
+/**
  * Dispatch against an explicit registry. Unknown names keep the switch's own
  * error text, byte-for-byte.
  */

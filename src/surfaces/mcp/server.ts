@@ -15,7 +15,7 @@ import {
 import { sessionTierTools } from "../../domain/config.js";
 import { excRepr } from "../../domain/models.js";
 import type { Store } from "../../store/store-interface.js";
-import { runTool } from "../../tools/registry.js";
+import { registeredTools, runTool } from "../../tools/registry.js";
 import { validateToolArgs, type ToolSchema } from "./validate-args.js";
 import TOOL_SNAPSHOT from "./tool-list.snapshot.json" with { type: "json" };
 
@@ -38,8 +38,54 @@ interface SnapshotTool {
 const SNAPSHOT = TOOL_SNAPSHOT as unknown as SnapshotTool[];
 
 export function listToolsForSession(): SnapshotTool[] {
-  const allowed = sessionTierTools();
-  return SNAPSHOT.filter((t) => allowed === null || allowed.has(t.name));
+  return advertisedTools(sessionTierTools());
+}
+
+/**
+ * Domain tools (Lane T's team/team_join/team_resolve) live in the registry, not
+ * in the checked-in snapshot — the snapshot is the BASE surface, deliberately
+ * frozen so a base tool can never silently change shape.
+ *
+ * TIER POLICY (flagged to the owner, 2026-10-05): the tier map in fleet.json is
+ * keyed by the 26 base tool names. A domain tool is absent from it, so treating
+ * "absent" as "denied" would make Lane T invisible to exactly the sessions that
+ * need it (a seat agent is not a leader-tier role). Domain tools are therefore
+ * visible to every tier until the owner says otherwise. Do not "fix" this by
+ * silently excluding unknown tools — that reintroduces the invisibility.
+ */
+function domainTools(tierAllowed: Set<string> | null): SnapshotTool[] {
+  void tierAllowed;
+  return [...registeredTools().values()]
+    .filter((spec) => !SNAPSHOT_TOOL_NAMES.has(spec.name))
+    .map((spec) => ({
+      name: spec.name,
+      description: spec.description,
+      inputSchema: spec.inputSchema as unknown as ToolSchema,
+    }));
+}
+
+const SNAPSHOT_TOOL_NAMES = new Set(SNAPSHOT.map((t) => t.name));
+
+/** Every advertised tool for a session: tier-filtered base + all domain tools. */
+export function advertisedTools(tierAllowed: Set<string> | null): SnapshotTool[] {
+  const base = SNAPSHOT.filter((t) => tierAllowed === null || tierAllowed.has(t.name));
+  return [...base, ...domainTools(tierAllowed)];
+}
+
+/** Schema for one tool, from the base snapshot or the registry. */
+function toolSchema(name: string): SnapshotTool | undefined {
+  return (
+    SNAPSHOT.find((t) => t.name === name) ??
+    ((): SnapshotTool | undefined => {
+      const spec = registeredTools().get(name);
+      if (!spec || SNAPSHOT_TOOL_NAMES.has(name)) return undefined;
+      return {
+        name: spec.name,
+        description: spec.description,
+        inputSchema: spec.inputSchema as unknown as ToolSchema,
+      };
+    })()
+  );
 }
 
 /**
@@ -52,7 +98,7 @@ export function listToolsForSession(): SnapshotTool[] {
  * reason; do not merge them.
  */
 export function listAllTools(): readonly SnapshotTool[] {
-  return SNAPSHOT;
+  return advertisedTools(null);
 }
 
 export function createFleetMcpServer(store: Store): Server {
@@ -83,7 +129,7 @@ export function createFleetMcpServer(store: Store): Server {
 
   server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
     const name = String(request.params?.name ?? "");
-    const entry = SNAPSHOT.find((t) => t.name === name);
+    const entry = toolSchema(name);
     if (!entry) {
       return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
     }

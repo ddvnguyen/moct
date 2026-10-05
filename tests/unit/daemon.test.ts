@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { registeredTools } from "../../src/tools/registry.js";
 import { startDaemon, resolveEnv, type DaemonHandle } from "../../src/daemon.js";
 import { TursoRepository } from "../../src/store/turso-repository.js";
 
@@ -87,7 +88,9 @@ describe("daemon boot", () => {
     const schema = await fetch(`${daemon.url}/schema`);
     expect(schema.status).toBe(200);
     const tools = ((await schema.json()) as { tools: unknown[] }).tools;
-    expect(tools.length).toBe(26);
+    // Registry-sized, not a literal 26: /schema advertises the base snapshot PLUS
+    // registered domains (Lane T adds team/team_join/team_resolve).
+    expect(tools.length).toBe(registeredTools().size);
   });
 
   it("reports the port actually bound when asked for 0", async () => {
@@ -228,7 +231,7 @@ describe("streamable /mcp", () => {
       tools: Array<{ name: string }>;
     };
     const schemaNames = schema.tools.map((t) => t.name);
-    expect(schemaNames).toHaveLength(26);
+    expect(schemaNames).toHaveLength(registeredTools().size);
     for (const name of names) expect(schemaNames).toContain(name);
     // worker_evaluate is TOOL_UTILITY, so it is outside the default leader tier.
     expect(names).not.toContain("worker_evaluate");

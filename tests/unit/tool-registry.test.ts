@@ -93,7 +93,16 @@ describe("domain registration seam", () => {
     // The whole point of the seam: production ships no synthetic tool, and the
     // seam never mutated the base layer to make room for one.
     expect(resolveTool(FAKE_NAME)).toBeUndefined();
-    expect([...createToolRegistry(TOOL_DOMAINS).keys()]).toEqual([...TOOL_NAMES]);
+    // Assert the intent, not an inventory: the base layer must be intact AND the
+    // synthetic tool absent. An exact `=== TOOL_NAMES` comparison encoded "no
+    // domain exists yet", which Lane T legitimately invalidated by registering
+    // team/team_join/team_resolve — a real feature, not a regression.
+    for (const name of TOOL_NAMES) {
+      expect(resolveTool(name)).toBeDefined();
+    }
+    expect([...createToolRegistry(TOOL_DOMAINS).keys()]).toEqual(
+      expect.arrayContaining([...TOOL_NAMES]),
+    );
     expect(() => runTool(STUB_STORE, FAKE_NAME, { value: "ping" })).toThrow(
       `unknown tool: ${FAKE_NAME}`,
     );

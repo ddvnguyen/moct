@@ -8,6 +8,7 @@
 import { writeFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { TOOL_NAMES } from "../../src/surfaces/mcp/dispatch.js";
+import { registeredTools } from "../../src/tools/registry.js";
 import { URI_REQUIRED_HINT } from "../../src/surfaces/http/responses.js";
 import { cleanupHarnesses, postJson, putJson, startHarness } from "./http-harness.js";
 
@@ -103,14 +104,20 @@ describe("GET /schema (backend.py:116)", () => {
     const body = await json(res);
     expect(body["ok"]).toBe(true);
     const tools = body["tools"] as Array<Record<string, unknown>>;
-    expect(tools).toHaveLength(TOOL_NAMES.length);
+    // Pinned to the REGISTRY, not to a count: /schema must advertise every tool
+    // the process serves (base snapshot + registered domains). Asserting
+    // `toHaveLength(TOOL_NAMES.length)` encoded "no domain exists yet", which
+    // Lane T invalidated by registering team/team_join/team_resolve.
+    expect(tools.map((t) => t["name"]).sort()).toEqual([...registeredTools().keys()].sort());
+    for (const name of TOOL_NAMES) {
+      expect(tools.map((t) => t["name"])).toContain(name);
+    }
     for (const tool of tools) {
       expect(Object.keys(tool).sort()).toEqual(["description", "inputSchema", "name"]);
       expect(typeof tool["name"]).toBe("string");
       expect(typeof tool["description"]).toBe("string");
       expect(typeof tool["inputSchema"]).toBe("object");
     }
-    expect(tools.map((t) => t["name"]).sort()).toEqual([...TOOL_NAMES].sort());
   });
 
   it("is not tier-filtered — it reports every tool the server knows", async () => {
@@ -120,7 +127,7 @@ describe("GET /schema (backend.py:116)", () => {
     // `fleet` is orchestrator-tier only; a consult session still needs to see it
     // in /schema to know it exists.
     expect(names.has("fleet")).toBe(true);
-    expect(names.size).toBe(TOOL_NAMES.length);
+    expect(names).toEqual(new Set(registeredTools().keys()));
   });
 });
 
