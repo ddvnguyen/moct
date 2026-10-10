@@ -17,6 +17,7 @@ Environment=ORCHESTRATION_BIND=127.0.0.1
 Environment=ORCHESTRATION_PORT=__PORT__
 Environment=FLEET_DB_PATH=__DB_PATH__
 Environment=MCP_ORCH_STATE_DIR=__STATE_DIR__
+Environment=MOCT_BACKUP_DIR=__BACKUP_DIR__
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
