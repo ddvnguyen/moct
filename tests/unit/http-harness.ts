@@ -16,6 +16,7 @@ import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import { TursoRepository } from "../../src/store/turso-repository.js";
 import { createFleetHttpServer, type HttpSurfaceOptions } from "../../src/surfaces/http/router.js";
+import { TeamRoomStore } from "../../src/team-room/store.js";
 
 export interface Harness {
   baseUrl: string;
@@ -41,7 +42,12 @@ export async function startHarness(overrides: Partial<HttpSurfaceOptions> = {}):
   process.env["MCP_ORCH_SUMMARY_PATH"] = summaryFile;
 
   const store = await TursoRepository.open(stateDir, path.join(stateDir, "fleet.db"));
-  const server = createFleetHttpServer({ store, token: "", ...overrides });
+  const server = createFleetHttpServer({
+    store,
+    token: "",
+    team: new TeamRoomStore(store.teamDb()),
+    ...overrides,
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
   const baseUrl = `http://127.0.0.1:${port}`;

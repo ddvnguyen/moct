@@ -106,7 +106,12 @@ describe("team domain DDL (schema v3)", () => {
       world.dbPath,
       "SELECT key FROM meta WHERE key LIKE 'schema_version:%' ORDER BY key",
     );
-    expect(versions.map((r) => r["key"])).toEqual(["schema_version:2", "schema_version:3"]);
+    // v6 is the Team Room DDL (moct contract §2); v4/v5 are reserved for paseo #68/#69.
+    expect(versions.map((r) => r["key"])).toEqual([
+      "schema_version:2",
+      "schema_version:3",
+      "schema_version:6",
+    ]);
   });
 
   it("round-trips team -> seats -> team_tracks -> seat_sessions", async () => {

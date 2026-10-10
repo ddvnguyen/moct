@@ -24,9 +24,14 @@
  *                     -> teams / team_tracks / seats / seat_sessions
  *                        (new tables, no rename — they have no Python
  *                         counterpart, so nothing to un-prefix for parity)
+ *   v6 (Team Room, contract moct-team-room v0.3 §2)
+ *                     -> team_operations / team_session_runs / team_thread_summaries
+ *                        (new tables, no Python counterpart). Versions 4 and 5 are
+ *                        reserved for paseo #68 (room_messages) and #69 (task_attempts);
+ *                        they are cherry-picked later and are NOT in this file yet.
  */
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 6;
 
 /**
  * Versions whose DDL ships in FLEET_SCHEMA_SQL, oldest first. FLEET_SCHEMA_SQL
@@ -35,7 +40,7 @@ export const SCHEMA_VERSION = 3;
  * (`schema_version:<n>` -> applied_at), which is how this DB records the
  * migration history. Never drop a version from this list.
  */
-export const APPLIED_SCHEMA_VERSIONS: readonly number[] = [2, 3];
+export const APPLIED_SCHEMA_VERSIONS: readonly number[] = [2, 3, 6];
 
 export const FLEET_SCHEMA_SQL = `
 PRAGMA journal_mode=WAL;
@@ -269,4 +274,53 @@ CREATE TABLE IF NOT EXISTS seat_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_seat_sessions_live ON seat_sessions(team_id, seat, ended_at);
 CREATE INDEX IF NOT EXISTS idx_seat_sessions_agent ON seat_sessions(agent_id);
+-- team_operations: the Team Room append-only operations log (contract §2).
+-- One row per ledger operation. sequence is assigned by the ledger and is never
+-- renumbered here: PRIMARY KEY (workspace_id, sequence) makes a duplicate a 409.
+-- operation_id is globally unique so a retried POST is idempotent.
+CREATE TABLE IF NOT EXISTS team_operations (
+    workspace_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, sequence)
+);
+
+-- team_session_runs: SessionRun stats rows (contract §3.2), one per dsh session.
+-- thread_refs_json is a JSON array; the per-thread lookup filters it in code.
+CREATE TABLE IF NOT EXISTS team_session_runs (
+    session_id TEXT PRIMARY KEY,
+    member_id TEXT NOT NULL,
+    parent_session_id TEXT,
+    thread_refs_json TEXT NOT NULL DEFAULT '[]',
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    tool_calls INTEGER NOT NULL DEFAULT 0,
+    run_ms INTEGER NOT NULL DEFAULT 0,
+    model_provider TEXT NOT NULL DEFAULT '',
+    model_name TEXT NOT NULL DEFAULT '',
+    last_assistant_at TEXT,
+    state TEXT NOT NULL DEFAULT 'warm'
+);
+CREATE INDEX IF NOT EXISTS idx_team_session_runs_member ON team_session_runs(member_id);
+
+-- team_thread_summaries: rolling and wrap-up summaries per thread (contract §3.3).
+-- (thread_ref, generation) is unique; the latest generation is the seed.
+CREATE TABLE IF NOT EXISTS team_thread_summaries (
+    thread_ref TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    trigger TEXT NOT NULL,
+    text TEXT NOT NULL,
+    covers_through_sequence INTEGER NOT NULL DEFAULT 0,
+    tokens INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL,
+    PRIMARY KEY (thread_ref, generation)
+);
 `;

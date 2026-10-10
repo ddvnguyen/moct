@@ -16,6 +16,7 @@ import * as path from "node:path";
 import { FLEET_SCHEMA_SQL, APPLIED_SCHEMA_VERSIONS } from "./schema.js";
 import { StateError, makeRowFilter, type RowFilter, type Store } from "./store-interface.js";
 import type { SeatRow, SeatSessionRow, TeamRow } from "./store-interface.js";
+import type { TeamDb } from "./team-db.js";
 import {
   coerceTrack,
   defaultHandoff,
@@ -250,6 +251,28 @@ export class TursoRepository implements Store {
     return repo;
   }
 
+  /**
+   * The Team Room seam (contract §2). Every statement goes through this
+   * repository's connection; writes are wrapped in lock() by the caller.
+   */
+  teamDb(): TeamDb {
+    return {
+      get: async (sql, ...params) =>
+        (await this.conn().get(sql, ...params)) as Record<string, unknown> | undefined,
+      all: async (sql, ...params) =>
+        (await this.conn().all(sql, ...params)) as Record<string, unknown>[],
+      run: async (sql, ...params) => {
+        await this.conn().run(sql, ...params);
+      },
+      transaction: (fn) => this.lock("team-room", fn),
+      vacuumInto: (file) =>
+        this.serialized(async () => {
+          const literal = `'${file.replace(/'/g, "''")}'`;
+          await this.conn().exec(`VACUUM INTO ${literal}`);
+        }),
+    };
+  }
+
   async close(): Promise<void> {
     if (this.db) {
       await this.db.close();
@@ -290,6 +313,21 @@ export class TursoRepository implements Store {
         await new Promise((r) => setTimeout(r, Math.min(backoffMs, remaining)));
         backoffMs = Math.min(250, Math.floor(backoffMs * 1.5));
       }
+    }
+  }
+
+  /** Runs fn holding the repository mutex, with no BEGIN (for VACUUM and friends). */
+  private async serialized<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.mutex;
+    let release!: () => void;
+    this.mutex = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
     }
   }
 

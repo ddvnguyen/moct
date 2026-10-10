@@ -1,0 +1,25 @@
+# systemd user unit template for the MOCT Team Room backend (contract v0.3 §1–2).
+# The deploy script substitutes the __PLACEHOLDERS__ and writes
+# ~/.config/systemd/user/moct-backend.service (TEST) or moct-backend-prod.service (PROD).
+#
+# Loopback only, no auth: MCP_ORCH_AUTH_TOKEN is deliberately NOT set (human
+# decision, "no auth need for now"). /team/v1 and /mcp are reachable from any
+# local process, so keep ORCHESTRATION_BIND on 127.0.0.1.
+[Unit]
+Description=MOCT Team Room backend (__ENV__)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__MOCT_ROOT__
+ExecStart=/usr/bin/env node __MOCT_ROOT__/dist/daemon.js
+Environment=ORCHESTRATION_BIND=127.0.0.1
+Environment=ORCHESTRATION_PORT=__PORT__
+Environment=FLEET_DB_PATH=__DB_PATH__
+Environment=MCP_ORCH_STATE_DIR=__STATE_DIR__
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

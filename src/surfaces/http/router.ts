@@ -28,6 +28,8 @@ import { handleHealth, handleSchema } from "./health.js";
 import { handleResourcesList, handleResourcesRead } from "./resources.js";
 import { sendJson, sendUnauthorized } from "./responses.js";
 import { handleCallTool } from "./tools.js";
+import { TEAM_PREFIX, routeTeam } from "./team-room.js";
+import type { TeamRoomStore } from "../../team-room/store.js";
 import type { Store } from "../../store/store-interface.js";
 
 /**
@@ -41,6 +43,8 @@ export interface HttpSurfaceOptions {
   /** Bearer token; defaults to MCP_ORCH_AUTH_TOKEN. Empty disables auth. */
   token?: string;
   mcp?: McpHandler;
+  /** Team Room store; without it /team/v1 answers 404. */
+  team?: TeamRoomStore;
   log?: (message: string) => void;
 }
 
@@ -56,7 +60,7 @@ function methodNotAllowed(res: ServerResponse): void {
 }
 
 export function createFleetHttpServer(options: HttpSurfaceOptions): Server {
-  const { store, log } = options;
+  const { store, log, team } = options;
   const token = options.token ?? authToken();
 
   const server = createServer((req, res) => {
@@ -147,6 +151,14 @@ export function createFleetHttpServer(options: HttpSurfaceOptions): Server {
     if (path === "/mcp") {
       if (options.mcp !== undefined && (await options.mcp(req, res))) return;
       notFound(res);
+      return;
+    }
+
+    if (path === TEAM_PREFIX || path.startsWith(`${TEAM_PREFIX}/`)) {
+      // Team Room is loopback-only and unauthenticated by contract (§2). Keep it
+      // off any non-loopback bind, which is the daemon's default.
+      if (team === undefined) notFound(res);
+      else await routeTeam(req, res, team, url);
       return;
     }
 

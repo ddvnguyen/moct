@@ -18,6 +18,8 @@
  *                            disables auth (backwards compatible)
  *   ORCHESTRATION_BIND       listen address (default 127.0.0.1)
  *   ORCHESTRATION_PORT       listen port (default 8099)
+ *   MOCT_BACKUP_DIR          where POST /team/v1/backup writes snapshots
+ *                            (default ~/.moct/backups)
  *   FLEET_FORBIDDEN_DB_PATHS comma-separated DB paths this process must never
  *                            open (same guard the stdio entrypoint uses)
  *
@@ -29,10 +31,12 @@
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { stateRoot } from "./domain/config.js";
 import { forbiddenDbPaths, wireShutdown, type ShutdownDeps } from "./mcp.js";
+import { TeamRoomStore } from "./team-room/store.js";
 import { TursoRepository } from "./store/turso-repository.js";
 import type { Store } from "./store/store-interface.js";
 import { createFleetMcpServer } from "./surfaces/mcp/server.js";
@@ -43,6 +47,7 @@ export interface DaemonEnv {
   port: number;
   dbPath: string;
   stateDir: string;
+  backupDir: string;
 }
 
 /** backend.py:281-284 — same defaults, so a cutover keeps the same address. */
@@ -54,12 +59,15 @@ export function resolveEnv(env: NodeJS.ProcessEnv = process.env): DaemonEnv {
     port: Number.isInteger(parsed) ? parsed : 8099,
     dbPath: path.resolve(env["FLEET_DB_PATH"] || path.join(process.cwd(), "fleet.db")),
     stateDir: stateRoot(),
+    backupDir: env["MOCT_BACKUP_DIR"] || path.join(os.homedir(), ".moct", "backups"),
   };
 }
 
 export interface DaemonOptions {
   /** Already-open store. The daemon NEVER opens one per request. */
   store: Store & { close(): Promise<void> };
+  /** Team Room store (contract §2). Omitted in tests that don't exercise /team/v1. */
+  team?: TeamRoomStore;
   host?: string;
   port?: number;
   token?: string;
@@ -157,6 +165,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     store,
     token: options.token,
     mcp: createMcpHandler(store, log),
+    team: options.team,
     log,
   });
 
@@ -207,6 +216,7 @@ async function main(): Promise<void> {
   const store = await TursoRepository.open(env.stateDir, env.dbPath);
   const daemon = await startDaemon({
     store,
+    team: new TeamRoomStore(store.teamDb(), env.dbPath, env.backupDir),
     host: env.host,
     port: env.port,
     log: (message) => console.error(message),
