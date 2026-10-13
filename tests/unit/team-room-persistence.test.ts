@@ -46,11 +46,13 @@ describe("team room — restart (A2)", () => {
     await repo.close();
   });
 
-  it("stamps schema v6 on a fresh database", async () => {
+  it("stamps schema v6 and v7 on a fresh database", async () => {
     const { root, dbPath } = scratch();
     const repo = await TursoRepository.open(root, dbPath);
     const meta = await TursoRepository.queryRows(dbPath, "SELECT key FROM meta WHERE key = 'schema_version:6'");
     expect(meta).toHaveLength(1);
+    const v7 = await TursoRepository.queryRows(dbPath, "SELECT key FROM meta WHERE key = 'schema_version:7'");
+    expect(v7).toHaveLength(1);
     await repo.close();
   });
 });
