@@ -34,10 +34,11 @@
  *                        (server-side projections of team_operations; derived, so
  *                         they can be dropped and rebuilt from the log)
  *   v8 (Team memory, additive)
- *                     -> team_memory / team_memory_versions (layers expert >
- *                        team > channel > task; backend-owned state, NOT a projection of the ledger:
- *                         the expert layer spans Workspaces and a purge must
- *                         remove text, which an append-only log cannot)
+ *                     -> team_memory_records / _tags / _links / _versions / _settings
+ *                        (typed records with visibility tags; backend-owned state,
+ *                         NOT a projection of the ledger: how_to_work spans
+ *                         Workspaces and a purge must remove text, which an
+ *                         append-only log cannot)
  */
 
 export const SCHEMA_VERSION = 8;
@@ -376,30 +377,34 @@ CREATE TABLE IF NOT EXISTS team_thread_bindings (
 );
 CREATE INDEX IF NOT EXISTS idx_team_thread_bindings_member ON team_thread_bindings(workspace_id, member_id);
 
--- team_memory: current state of one memory entry (v8). Four layers, each with a
--- fixed scope shape: expert = member_id only (the Member id spans Workspaces;
--- origin_workspace_id records the team it was written in, for audit), team =
--- workspace_id, channel = workspace_id + channel_ref, task = workspace_id +
--- channel_ref + thread_ref (a Thread sits in one Channel). content is NULL only
--- after a purge. embedding is reserved for vector search and unused in v8.
--- An entry never changes layer or scope: a promote writes a NEW entry in the
--- wider layer and retracts the source, and the pair is linked through
--- promoted_from / promoted_to. status 'pending' is an expert note waiting for
--- the human's approval (only when team_memory_settings expert_approval =
--- 'required'; off by default).
-CREATE TABLE IF NOT EXISTS team_memory (
+-- team_memory_records: one typed memory record (v8). Backend-owned state, not a
+-- projection of the ledger: how_to_work follows an expert across Workspaces and a
+-- purge must remove text, which an append-only log cannot.
+--   type        rule | decision | convention | how_to_work | task | branch
+--   home_*      the narrowest visibility tag (task < channel < team; expert apart),
+--               kept in step with team_memory_tags by the store; it picks the
+--               injection bucket and wins ties on conflict
+--   unique_key  'task:<taskRef>' or 'branch:<repo>#<branch>', NULL for the other
+--               types; NULLs are distinct, so only those two types are unique
+--   title/body/attrs are NULL only after a purge. embedding is reserved.
+CREATE TABLE IF NOT EXISTS team_memory_records (
     id TEXT PRIMARY KEY,
-    layer TEXT NOT NULL CHECK (layer IN ('expert', 'team', 'channel', 'task')),
-    member_id TEXT,
     workspace_id TEXT,
-    channel_ref TEXT,
-    thread_ref TEXT,
-    origin_workspace_id TEXT,
-    promoted_from TEXT,
-    promoted_to TEXT,
-    content TEXT,
+    type TEXT NOT NULL CHECK (type IN ('rule', 'decision', 'convention', 'how_to_work', 'task', 'branch')),
+    title TEXT,
+    body TEXT,
+    attrs TEXT,
+    home_kind TEXT NOT NULL CHECK (home_kind IN ('task', 'channel', 'team', 'expert')),
+    home_ref TEXT NOT NULL,
+    priority INTEGER NOT NULL,
     pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
-    status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'retracted', 'expired', 'purged')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'superseded', 'retracted', 'expired', 'purged')),
+    flag TEXT,
+    supersedes TEXT,
+    superseded_by TEXT,
+    conflicts_with TEXT NOT NULL DEFAULT '[]',
+    task_ref TEXT,
+    unique_key TEXT,
     author_kind TEXT NOT NULL CHECK (author_kind IN ('human', 'member')),
     author_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -408,31 +413,56 @@ CREATE TABLE IF NOT EXISTS team_memory (
     use_count INTEGER NOT NULL DEFAULT 0,
     version INTEGER NOT NULL,
     embedding BLOB,
+    CHECK ((type = 'how_to_work') = (workspace_id IS NULL)),
     CHECK (
-        (layer = 'expert' AND member_id IS NOT NULL AND workspace_id IS NULL AND channel_ref IS NULL AND thread_ref IS NULL)
-        OR (layer = 'team' AND member_id IS NULL AND workspace_id IS NOT NULL AND channel_ref IS NULL AND thread_ref IS NULL)
-        OR (layer = 'channel' AND member_id IS NULL AND workspace_id IS NOT NULL AND channel_ref IS NOT NULL AND thread_ref IS NULL)
-        OR (layer = 'task' AND member_id IS NULL AND workspace_id IS NOT NULL AND channel_ref IS NOT NULL AND thread_ref IS NOT NULL)
+        (type IN ('rule', 'convention') AND home_kind IN ('team', 'channel'))
+        OR (type = 'decision' AND home_kind IN ('channel', 'task'))
+        OR (type = 'how_to_work' AND home_kind = 'expert')
+        OR (type = 'task' AND home_kind = 'task')
+        OR (type = 'branch' AND home_kind = 'channel')
     )
 );
-CREATE INDEX IF NOT EXISTS idx_team_memory_workspace ON team_memory(workspace_id, layer, status);
-CREATE INDEX IF NOT EXISTS idx_team_memory_member ON team_memory(member_id, status);
-CREATE INDEX IF NOT EXISTS idx_team_memory_scope ON team_memory(workspace_id, channel_ref, thread_ref);
+CREATE INDEX IF NOT EXISTS idx_team_memory_records_home ON team_memory_records(workspace_id, home_kind, home_ref, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_team_memory_records_unique_key ON team_memory_records(workspace_id, unique_key);
 
--- team_memory_versions: every change to an entry, with who and when (v8). All
--- versions are kept (content is capped at 2000 characters). Rows are insert-only,
--- except that a purge may scrub content: first overwrite it in place with '#'
--- filler of the same byte length (so the old bytes do not survive in the page),
--- then set it to NULL. Nothing may delete a row.
+-- team_memory_tags: who and what a record belongs to (v8). team / channel / task /
+-- expert grant visibility; repo / branch only describe and never widen it.
+CREATE TABLE IF NOT EXISTS team_memory_tags (
+    record_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('team', 'channel', 'task', 'expert', 'repo', 'branch')),
+    ref TEXT NOT NULL,
+    PRIMARY KEY (record_id, kind, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_team_memory_tags_ref ON team_memory_tags(kind, ref);
+
+-- team_memory_links: the task picture (v8). Created by the store from a cited
+-- taskRef only; a model never names a link target.
+CREATE TABLE IF NOT EXISTS team_memory_links (
+    from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('on_branch', 'decided_in', 'blocks', 'relates')),
+    PRIMARY KEY (from_id, to_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_team_memory_links_to ON team_memory_links(to_id);
+
+-- team_memory_versions: every change to a record, with who and when (v8). All
+-- versions are kept. Insert-only, except that a purge may scrub title, body and
+-- attrs: first overwrite in place with '#' filler of the same byte length, then
+-- set NULL. tags_json snapshots the tags, so a widen keeps the old scope on record.
 CREATE TABLE IF NOT EXISTS team_memory_versions (
     memory_id TEXT NOT NULL,
     version INTEGER NOT NULL,
-    action TEXT NOT NULL CHECK (action IN ('create', 'edit', 'pin', 'unpin', 'promote', 'approve', 'retract', 'restore', 'expire', 'purge')),
-    layer TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('create', 'edit', 'pin', 'unpin', 'priority', 'widen', 'approve', 'supersede',
+        'retract', 'restore', 'expire', 'purge')),
     workspace_id TEXT,
-    channel_ref TEXT,
-    thread_ref TEXT,
-    content TEXT,
+    type TEXT NOT NULL,
+    home_kind TEXT NOT NULL,
+    home_ref TEXT NOT NULL,
+    tags_json TEXT NOT NULL,
+    title TEXT,
+    body TEXT,
+    attrs TEXT,
+    priority INTEGER NOT NULL,
     pinned INTEGER NOT NULL,
     status TEXT NOT NULL,
     actor_kind TEXT NOT NULL,
@@ -441,25 +471,31 @@ CREATE TABLE IF NOT EXISTS team_memory_versions (
     at TEXT NOT NULL,
     PRIMARY KEY (memory_id, version)
 );
+CREATE INDEX IF NOT EXISTS idx_team_memory_versions_feed ON team_memory_versions(workspace_id, type, at);
 CREATE TRIGGER IF NOT EXISTS team_memory_versions_no_delete BEFORE DELETE ON team_memory_versions BEGIN
     SELECT RAISE(ABORT, 'team_memory_versions is INSERT-ONLY');
 END;
 CREATE TRIGGER IF NOT EXISTS team_memory_versions_purge_only BEFORE UPDATE ON team_memory_versions
-WHEN (NEW.content IS NOT OLD.content AND NEW.content IS NOT NULL
-        AND NOT (length(CAST(NEW.content AS BLOB)) = length(CAST(OLD.content AS BLOB)) AND trim(NEW.content, '#') = ''))
+WHEN (NEW.title IS NOT OLD.title AND NEW.title IS NOT NULL
+        AND NOT (length(CAST(NEW.title AS BLOB)) = length(CAST(OLD.title AS BLOB)) AND trim(NEW.title, '#') = ''))
+    OR (NEW.body IS NOT OLD.body AND NEW.body IS NOT NULL
+        AND NOT (length(CAST(NEW.body AS BLOB)) = length(CAST(OLD.body AS BLOB)) AND trim(NEW.body, '#') = ''))
+    OR (NEW.attrs IS NOT OLD.attrs AND NEW.attrs IS NOT NULL
+        AND NOT (length(CAST(NEW.attrs AS BLOB)) = length(CAST(OLD.attrs AS BLOB)) AND trim(NEW.attrs, '#') = ''))
     OR NEW.memory_id IS NOT OLD.memory_id OR NEW.version IS NOT OLD.version OR NEW.action IS NOT OLD.action
-    OR NEW.layer IS NOT OLD.layer OR NEW.workspace_id IS NOT OLD.workspace_id
-    OR NEW.channel_ref IS NOT OLD.channel_ref OR NEW.thread_ref IS NOT OLD.thread_ref
-    OR NEW.pinned IS NOT OLD.pinned OR NEW.status IS NOT OLD.status OR NEW.actor_kind IS NOT OLD.actor_kind
-    OR NEW.actor_id IS NOT OLD.actor_id OR NEW.reason IS NOT OLD.reason OR NEW.at IS NOT OLD.at
+    OR NEW.workspace_id IS NOT OLD.workspace_id OR NEW.type IS NOT OLD.type
+    OR NEW.home_kind IS NOT OLD.home_kind OR NEW.home_ref IS NOT OLD.home_ref OR NEW.tags_json IS NOT OLD.tags_json
+    OR NEW.priority IS NOT OLD.priority OR NEW.pinned IS NOT OLD.pinned OR NEW.status IS NOT OLD.status
+    OR NEW.actor_kind IS NOT OLD.actor_kind OR NEW.actor_id IS NOT OLD.actor_id
+    OR NEW.reason IS NOT OLD.reason OR NEW.at IS NOT OLD.at
 BEGIN
     SELECT RAISE(ABORT, 'team_memory_versions is INSERT-ONLY except purge');
 END;
 
--- team_memory_settings: human-set memory switches (v8). expert_approval = 'off'
--- | 'required': when required, an expert's own expert-layer notes start
--- 'pending' until the human approves them (for a Team that holds another
--- party's data). A missing row means the default ('off').
+-- team_memory_settings: human-set memory switches (v8). expert_approval
+-- ('required' | 'off'), orchestrators (JSON list of member ids with full memory
+-- access and control), inject_layer_tokens (auto-load target per layer, <= 2000).
+-- A missing row means the default.
 CREATE TABLE IF NOT EXISTS team_memory_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
