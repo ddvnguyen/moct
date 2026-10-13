@@ -570,6 +570,80 @@ describe("team memory — rule feed", () => {
   });
 });
 
+describe("team memory — usage", () => {
+  it("reports each home's always-load use with the same numbers the cap enforces", async () => {
+    const { memory } = await makeWorld();
+    const a = await write(memory, rule("rule alpha", homes.channel, { body: big(1) }), HUMAN);
+    const b = await write(memory, rule("rule beta", homes.channel, { body: big(2) }), HUMAN);
+    await write(memory, rule("team rule", homes.team), HUMAN);
+    // Not always-load: an unpinned convention, an active decision (its task home is not listed),
+    // a pending rule, a retracted rule.
+    await write(memory, convention("plain convention", homes.channel), HUMAN);
+    await write(memory, decision("ship the memory page"), HUMAN);
+    await write(memory, rule("queue deploys behind approval", homes.team), ALICE);
+    const gone = await write(memory, rule("retracted rule", homes.channel), HUMAN);
+    await memory.retract(gone.id, { baseVersion: 1, actor: HUMAN });
+    // Another Workspace's home is not listed.
+    await write(memory, rule("other ws rule", homes.channel, { workspaceId: "ws-2" }), HUMAN);
+    // A pending rule blocked by the full channel home is counted there.
+    const blocked = await write(memory, rule("oversized onboarding checklist", homes.channel, { body: big(9) }), ALICE);
+    expect((await refusal(memory.approve(blocked.id, { baseVersion: 1, actor: LEAD }))).code).toBe("BUDGET_FULL");
+
+    const usage = await memory.usage(WS);
+    expect(usage).toMatchObject({ workspaceId: WS, capTokens: MEMORY_INJECT_LAYER_CAP_TOKENS, injectLayerTokens: { min: 1, max: MEMORY_INJECT_LAYER_CAP_TOKENS } });
+    expect(usage.homes.map((h) => h.home)).toEqual([homes.channel, homes.team]);
+    const channel = usage.homes[0]!;
+    expect(channel).toMatchObject({ records: 2, blockedPending: 1, usedTokens: a.tokens + b.tokens });
+    expect(channel.largest.map((c) => c.id).sort()).toEqual([a.id, b.id].sort());
+    // The number the page shows is the one BUDGET_FULL reports.
+    const exc = await refusal(note(memory, rule("rule gamma", homes.channel, { body: big(3) }), HUMAN));
+    expect(exc.details?.["usedTokens"]).toBe(channel.usedTokens);
+    expect(usage.homes[1]).toMatchObject({ records: 1, blockedPending: 0 });
+  });
+
+  it("keeps another Workspace's homes and blocked records out of this Workspace's usage", async () => {
+    const { memory } = await makeWorld();
+    const B = "ws-b";
+    // Workspace A: a channel home with a little always-load use.
+    const mine = await write(memory, rule("stage only your own files", homes.channel), HUMAN);
+    // Workspace B: a rule in a home A does not have, and a full home sharing A's channel ref
+    // with a pending rule blocked by it.
+    await write(memory, rule("b channel two rule", { kind: "channel", ref: CH2 }, { workspaceId: B }), HUMAN);
+    await write(memory, rule("b alpha", homes.channel, { workspaceId: B, body: big(1) }), HUMAN);
+    await write(memory, rule("b beta", homes.channel, { workspaceId: B, body: big(2) }), HUMAN);
+    const blockedB = await write(memory, rule("b oversized checklist", homes.channel, { workspaceId: B, body: big(9) }), ALICE);
+    expect((await refusal(memory.approve(blockedB.id, { baseVersion: 1, actor: LEAD }))).code).toBe("BUDGET_FULL");
+
+    const usage = await memory.usage(WS);
+    expect(usage.homes).toEqual([
+      { home: homes.channel, usedTokens: mine.tokens, records: 1, blockedPending: 0, largest: [expect.objectContaining({ id: mine.id })] },
+    ]);
+    // B sees its own two homes and its own blocked record.
+    const b = await memory.usage(B);
+    expect(b.homes.map((h) => h.home.ref).sort()).toEqual([CH, CH2].sort());
+    expect(b.homes.find((h) => h.home.ref === CH)?.blockedPending).toBe(1);
+  });
+
+  it("lists an expert home in every Workspace, since how_to_work belongs to none", async () => {
+    const { memory } = await makeWorld();
+    const mine = await write(memory, howTo("squash before merging", ALICE), ALICE);
+    await memory.approve(mine.id, { baseVersion: 1, actor: HUMAN });
+    await memory.patch(mine.id, { baseVersion: 2, actor: HUMAN, pinned: true });
+    const elsewhere = await write(memory, howTo("review diffs file by file", ALICE), ALICE);
+    await memory.approve(elsewhere.id, { baseVersion: 1, actor: HUMAN });
+    await memory.patch(elsewhere.id, { baseVersion: 2, actor: HUMAN, pinned: true });
+    const usage = await memory.usage(WS);
+    const expert = usage.homes.find((h) => h.home.kind === "expert")!;
+    expect(expert.home).toEqual({ kind: "expert", ref: ALICE.id });
+    expect(expert.records).toBe(2);
+    expect(expert.largest.every((c) => c.pinned)).toBe(true);
+    expect(mine.workspaceId).toBeNull();
+    // Another Workspace sees the same expert home and no team, channel or task home.
+    expect((await memory.usage("ws-other")).homes).toEqual([expert]);
+    expect((await refusal(memory.usage(""))).code).toBe("INVALID_SCOPE");
+  });
+});
+
 describe("team memory — HTTP surface", () => {
   const json = (method: string, body: unknown): RequestInit => ({
     method,
@@ -621,5 +695,13 @@ describe("team memory — HTTP surface", () => {
     const inj = await h.get(`/team/v1/memory/inject?expertId=${ALICE.id}&workspaceId=${WS}`);
     expect(await inj.json()).toMatchObject({ layerTokens: 1200, entries: [] });
     expect(await (await h.get(`/team/v1/memory/rule-feed?workspaceId=${WS}`)).json()).toEqual({ versions: [] });
+    expect(await (await h.get(`/team/v1/memory/usage?workspaceId=${WS}`)).json()).toEqual({
+      workspaceId: WS,
+      capTokens: MEMORY_INJECT_LAYER_CAP_TOKENS,
+      injectLayerTokens: { min: 1, max: MEMORY_INJECT_LAYER_CAP_TOKENS },
+      homes: [],
+    });
+    expect((await h.get("/team/v1/memory/usage")).status).toBe(400);
+    expect((await h.request(`/team/v1/memory/usage?workspaceId=${WS}`, { method: "POST" })).status).toBe(405);
   });
 });

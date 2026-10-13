@@ -66,6 +66,8 @@ export const MEMORY_MAX_BODY_CHARS = 2000;
 export const MEMORY_INJECT_LAYER_TOKENS = 1000;
 /** Hard ceiling per home for what always loads (rules and pinned records), and for the setting. */
 export const MEMORY_INJECT_LAYER_CAP_TOKENS = 2000;
+/** The smallest injectLayerTokens setting the backend accepts. */
+export const MEMORY_INJECT_LAYER_MIN_TOKENS = 1;
 /** Unpinned conventions and how_to_work notes expire this long after their last edit or citation. */
 export const MEMORY_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
 export const MEMORY_INDEX_IDS_PER_LAYER = 5;
@@ -172,6 +174,33 @@ export class MemoryError extends Error {
 }
 
 /** Same estimate the plugin's thread seed uses: UTF-8 bytes / 3. */
+/** One always-load record as the budget counts it. */
+export interface BudgetConsumer {
+  id: string;
+  type: MemoryType;
+  title: string | null;
+  tokens: number;
+  pinned: boolean;
+}
+
+/** One home's use of the always-load cap. */
+export interface HomeUsage {
+  home: MemoryHome;
+  usedTokens: number;
+  records: number;
+  /** Approved records held pending because this home was full. */
+  blockedPending: number;
+  largest: BudgetConsumer[];
+}
+
+export interface MemoryUsage {
+  workspaceId: string;
+  capTokens: number;
+  /** Bounds of the injectLayerTokens setting, so a client validates against the backend's own. */
+  injectLayerTokens: { min: number; max: number };
+  homes: HomeUsage[];
+}
+
 export function estimateTokens(text: string): number {
   return Math.ceil(Buffer.byteLength(text, "utf8") / 3);
 }
@@ -179,6 +208,19 @@ export function estimateTokens(text: string): number {
 function recordTokens(title: string | null, body: string | null): number {
   return estimateTokens(`${title ?? ""}\n${body ?? ""}`);
 }
+
+function budgetConsumer(row: Record<string, unknown>): BudgetConsumer {
+  const title = (row["title"] as string | null) ?? null;
+  return {
+    id: String(row["id"]),
+    type: row["type"] as MemoryType,
+    title,
+    tokens: recordTokens(title, (row["body"] as string | null) ?? null),
+    pinned: Number(row["pinned"]) === 1,
+  };
+}
+
+const byTokens = (a: BudgetConsumer, b: BudgetConsumer): number => b.tokens - a.tokens || a.id.localeCompare(b.id);
 
 function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
@@ -576,10 +618,10 @@ export class TeamMemoryStore {
     if (
       injectLayerTokens !== undefined &&
       (!Number.isInteger(injectLayerTokens) ||
-        (injectLayerTokens as number) < 1 ||
+        (injectLayerTokens as number) < MEMORY_INJECT_LAYER_MIN_TOKENS ||
         (injectLayerTokens as number) > MEMORY_INJECT_LAYER_CAP_TOKENS)
     ) {
-      throw new MemoryError(400, "INVALID_SETTING", `injectLayerTokens must be 1..${MEMORY_INJECT_LAYER_CAP_TOKENS}`);
+      throw new MemoryError(400, "INVALID_SETTING", `injectLayerTokens must be ${MEMORY_INJECT_LAYER_MIN_TOKENS}..${MEMORY_INJECT_LAYER_CAP_TOKENS}`);
     }
     await this.db.transaction(async () => {
       if (expertApproval !== undefined) await this.putSetting("expert_approval", expertApproval as string, input.actor);
@@ -909,11 +951,12 @@ export class TeamMemoryStore {
   }
 
   /**
-   * Refuse a write that would push a home's always-load set (rules and pinned
-   * records) past the cap. The refusal names the largest consumers, so a human
-   * or orchestrator can unpin or retract the right thing.
+   * A home's always-load set (active rules and pinned records) with each
+   * record's token count. An expert home spans every Workspace; the others are
+   * one Workspace's. The write-time cap and the Memory page's usage read share
+   * this, so the page never shows a number the cap does not enforce.
    */
-  private async assertBudget(workspaceId: string | null, home: MemoryHome, addTokens: number, excludeId: string | null): Promise<void> {
+  private async alwaysLoad(workspaceId: string | null, home: MemoryHome): Promise<BudgetConsumer[]> {
     const params: unknown[] = [home.kind, home.ref];
     let sql = `SELECT * FROM team_memory_records WHERE home_kind = ? AND home_ref = ? AND status = 'active'
                AND (type = 'rule' OR pinned = 1)`;
@@ -921,17 +964,19 @@ export class TeamMemoryStore {
       sql += " AND workspace_id = ?";
       params.push(workspaceId);
     }
-    const rows = (await this.db.all(sql, ...params)).filter((row) => String(row["id"]) !== excludeId);
-    const consumers = rows.map((row) => ({
-      id: String(row["id"]),
-      type: row["type"] as MemoryType,
-      title: (row["title"] as string | null) ?? null,
-      tokens: recordTokens((row["title"] as string | null) ?? null, (row["body"] as string | null) ?? null),
-      pinned: Number(row["pinned"]) === 1,
-    }));
+    return (await this.db.all(sql, ...params)).map(budgetConsumer);
+  }
+
+  /**
+   * Refuse a write that would push a home's always-load set (rules and pinned
+   * records) past the cap. The refusal names the largest consumers, so a human
+   * or orchestrator can unpin or retract the right thing.
+   */
+  private async assertBudget(workspaceId: string | null, home: MemoryHome, addTokens: number, excludeId: string | null): Promise<void> {
+    const consumers = (await this.alwaysLoad(workspaceId, home)).filter((c) => c.id !== excludeId);
     const used = consumers.reduce((sum, c) => sum + c.tokens, 0);
     if (used + addTokens <= MEMORY_INJECT_LAYER_CAP_TOKENS) return;
-    consumers.sort((a, b) => b.tokens - a.tokens || a.id.localeCompare(b.id));
+    consumers.sort(byTokens);
     throw new MemoryError(409, "BUDGET_FULL", `the ${home.kind} home's always-load set would exceed ${MEMORY_INJECT_LAYER_CAP_TOKENS} tokens`, {
       home,
       capTokens: MEMORY_INJECT_LAYER_CAP_TOKENS,
@@ -939,6 +984,48 @@ export class TeamMemoryStore {
       neededTokens: addTokens,
       largest: consumers.slice(0, BUDGET_LARGEST),
     });
+  }
+
+  /**
+   * The Memory page's budget view: every home with an always-load record or a
+   * pending record blocked by a full home, with its use against the cap. Team,
+   * channel and task homes are this Workspace's. An expert's how_to_work belongs
+   * to no Workspace, so every expert home with an always-load record is listed
+   * and counted across Workspaces, as the cap counts it; a client that shows one
+   * Workspace narrows them to its Members. Read-only; no citation.
+   */
+  async usage(workspaceId: string): Promise<MemoryUsage> {
+    if (!nonEmpty(workspaceId)) throw new MemoryError(400, "INVALID_SCOPE", "workspaceId is required");
+    const rows = await this.db.all(
+      `SELECT DISTINCT home_kind, home_ref FROM team_memory_records
+       WHERE (workspace_id = ? OR (home_kind = 'expert' AND workspace_id IS NULL))
+         AND ((status = 'active' AND (type = 'rule' OR pinned = 1)) OR (status = 'pending' AND flag = 'blocked_budget'))`,
+      workspaceId,
+    );
+    const homes: HomeUsage[] = [];
+    for (const row of rows) {
+      const home: MemoryHome = { kind: row["home_kind"] as HomeKind, ref: String(row["home_ref"]) };
+      const consumers = (await this.alwaysLoad(workspaceId, home)).sort(byTokens);
+      const blocked = await this.db.get(
+        `SELECT count(*) AS n FROM team_memory_records WHERE home_kind = ? AND home_ref = ? AND status = 'pending'
+         AND flag = 'blocked_budget'${home.kind === "expert" ? "" : " AND workspace_id = ?"}`,
+        ...(home.kind === "expert" ? [home.kind, home.ref] : [home.kind, home.ref, workspaceId]),
+      );
+      homes.push({
+        home,
+        usedTokens: consumers.reduce((sum, c) => sum + c.tokens, 0),
+        records: consumers.length,
+        blockedPending: Number(blocked?.["n"] ?? 0),
+        largest: consumers.slice(0, BUDGET_LARGEST),
+      });
+    }
+    homes.sort((a, b) => b.usedTokens - a.usedTokens || a.home.kind.localeCompare(b.home.kind) || a.home.ref.localeCompare(b.home.ref));
+    return {
+      workspaceId,
+      capTokens: MEMORY_INJECT_LAYER_CAP_TOKENS,
+      injectLayerTokens: { min: MEMORY_INJECT_LAYER_MIN_TOKENS, max: MEMORY_INJECT_LAYER_CAP_TOKENS },
+      homes,
+    };
   }
 
   /** Link a record to the task record its cited taskRef names. The model never names link targets. */

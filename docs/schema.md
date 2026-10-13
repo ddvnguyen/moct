@@ -177,6 +177,7 @@ still holds the text. Delete or re-take those copies to finish removal.
 - `GET|PUT /team/v1/memory/settings`
 - `GET /team/v1/memory/inject?expertId=&workspaceId=&channelRef=&taskRef=&layerTokens=`
 - `GET /team/v1/memory/rule-feed?workspaceId=&limit=`
+- `GET /team/v1/memory/usage?workspaceId=` — each home's always-load use against the cap, with the `injectLayerTokens` bounds (read-only, not a citation). `how_to_work` belongs to no Workspace, so every expert home with an always-load record is listed in every Workspace and counted as the cap counts it; a client narrows them to the Workspace's Members.
 
 Refusals answer `{ok:false, code, error[, details]}` with status 400, 403, 404, 409 or 422.
 
