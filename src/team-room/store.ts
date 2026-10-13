@@ -13,6 +13,7 @@ import * as path from "node:path";
 import type { TeamDb } from "../store/team-db.js";
 import { utcnowIso } from "../domain/models.js";
 import { PROJECTION_META_KEY, projectOperation } from "./projection.js";
+import { TeamMemoryStore } from "./memory.js";
 
 export type OperationRecord = Record<string, unknown> & {
   sequence: number;
@@ -118,12 +119,18 @@ function likeMember(ref: string): string {
 }
 
 export class TeamRoomStore {
+  /** Team memory (schema v8): backend-owned tables on the same connection. */
+  readonly memory: TeamMemoryStore;
+
   /** `dbPath` is reported by /team/v1/health so an operator can see which fleet.db is live. */
   constructor(
     private readonly db: TeamDb,
     readonly dbPath: string | null = null,
     readonly backupDir: string | null = null,
-  ) {}
+    now?: () => Date,
+  ) {
+    this.memory = new TeamMemoryStore(db, now);
+  }
 
   /** Consistent copy of fleet.db into backupDir, on the live connection. */
   async backup(stamp: string): Promise<string> {

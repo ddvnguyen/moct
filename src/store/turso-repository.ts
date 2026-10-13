@@ -270,6 +270,10 @@ export class TursoRepository implements Store {
           const literal = `'${file.replace(/'/g, "''")}'`;
           await this.conn().exec(`VACUUM INTO ${literal}`);
         }),
+      checkpoint: () =>
+        this.serialized(async () => {
+          await this.conn().exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        }),
     };
   }
 
