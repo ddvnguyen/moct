@@ -601,6 +601,29 @@ describe("team memory — usage", () => {
     expect(usage.homes[1]).toMatchObject({ records: 1, blockedPending: 0 });
   });
 
+  it("keeps another Workspace's homes and blocked records out of this Workspace's usage", async () => {
+    const { memory } = await makeWorld();
+    const B = "ws-b";
+    // Workspace A: a channel home with a little always-load use.
+    const mine = await write(memory, rule("stage only your own files", homes.channel), HUMAN);
+    // Workspace B: a rule in a home A does not have, and a full home sharing A's channel ref
+    // with a pending rule blocked by it.
+    await write(memory, rule("b channel two rule", { kind: "channel", ref: CH2 }, { workspaceId: B }), HUMAN);
+    await write(memory, rule("b alpha", homes.channel, { workspaceId: B, body: big(1) }), HUMAN);
+    await write(memory, rule("b beta", homes.channel, { workspaceId: B, body: big(2) }), HUMAN);
+    const blockedB = await write(memory, rule("b oversized checklist", homes.channel, { workspaceId: B, body: big(9) }), ALICE);
+    expect((await refusal(memory.approve(blockedB.id, { baseVersion: 1, actor: LEAD }))).code).toBe("BUDGET_FULL");
+
+    const usage = await memory.usage(WS);
+    expect(usage.homes).toEqual([
+      { home: homes.channel, usedTokens: mine.tokens, records: 1, blockedPending: 0, largest: [expect.objectContaining({ id: mine.id })] },
+    ]);
+    // B sees its own two homes and its own blocked record.
+    const b = await memory.usage(B);
+    expect(b.homes.map((h) => h.home.ref).sort()).toEqual([CH, CH2].sort());
+    expect(b.homes.find((h) => h.home.ref === CH)?.blockedPending).toBe(1);
+  });
+
   it("lists an expert home in every Workspace, since how_to_work belongs to none", async () => {
     const { memory } = await makeWorld();
     const mine = await write(memory, howTo("squash before merging", ALICE), ALICE);
