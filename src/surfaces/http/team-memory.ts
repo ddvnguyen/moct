@@ -228,6 +228,11 @@ async function dispatch(
     });
   }
 
+  if (path === "/memory/usage") {
+    if (method !== "GET") return methodNotAllowed(res);
+    return sendJson(res, 200, await memory.usage(reqString(query.get("workspaceId"), "workspaceId")));
+  }
+
   const parts = path.slice("/memory/".length).split("/").map(decodeURIComponent);
   const id = parts[0] ?? "";
   if (id.length === 0 || parts.length > 2) return notFound(res);
