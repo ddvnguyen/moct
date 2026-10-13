@@ -332,7 +332,7 @@ function checkText(type: MemoryType, title: unknown, body: unknown, attrs: unkno
 }
 
 function uniqueKeyFor(type: MemoryType, attrs: Record<string, unknown>): string | null {
-  if (type === "task") return `task:${String(attrs["taskRef"])}`;
+  if (type === "task") return String(attrs["taskRef"]);
   if (type === "branch") return `branch:${String(attrs["repo"])}#${String(attrs["branch"])}`;
   return null;
 }
@@ -962,7 +962,7 @@ export class TeamMemoryStore {
     const task = await this.db.get(
       "SELECT id FROM team_memory_records WHERE workspace_id = ? AND unique_key = ?",
       record.workspaceId,
-      `task:${record.taskRef}`,
+      record.taskRef,
     );
     if (task === undefined) return;
     if (record.type === "decision") await this.link(record.id, String(task["id"]), "decided_in");
@@ -1293,6 +1293,17 @@ export class TeamMemoryStore {
     });
   }
 
+  /** True when the actor wrote any create or edit version of the record. */
+  private async wroteText(id: string, actor: MemoryActor): Promise<boolean> {
+    const row = await this.db.get(
+      "SELECT 1 AS hit FROM team_memory_versions WHERE memory_id = ? AND action IN ('create', 'edit') AND actor_kind = ? AND actor_id = ? LIMIT 1",
+      id,
+      actor.kind,
+      actor.id,
+    );
+    return row !== undefined;
+  }
+
   /**
    * Release a pending record. The human or an orchestrator approves; nobody
    * approves their own record, and a team-scoped rule needs the human. A record
@@ -1303,7 +1314,9 @@ export class TeamMemoryStore {
     const role = await this.role(input.actor);
     if (role === "worker") throw new MemoryError(403, "APPROVER_ONLY", "approve is reserved for orchestrators and the human");
     const record = await this.require(id);
-    if (isAuthor(record, input.actor)) throw new MemoryError(403, "SELF_APPROVAL", "an author cannot approve its own record");
+    if (isAuthor(record, input.actor) || (await this.wroteText(id, input.actor))) {
+      throw new MemoryError(403, "SELF_APPROVAL", "a writer of this record's text cannot approve it");
+    }
     this.checkBase(record, input.baseVersion);
     if (record.status !== "pending") throw new MemoryError(409, "NOT_PENDING", `record is ${record.status}`);
     if (record.type === "rule" && record.home.kind === "team" && role !== "human") {
@@ -1490,7 +1503,7 @@ export class TeamMemoryStore {
              JOIN team_memory_records r ON r.id = CASE WHEN l.from_id = t.id THEN l.to_id ELSE l.from_id END
              WHERE t.workspace_id = ? AND t.unique_key = ? AND r.status = 'active'`,
             query.workspaceId,
-            `task:${ref}`,
+            ref,
           )),
         );
       }

@@ -384,7 +384,7 @@ CREATE INDEX IF NOT EXISTS idx_team_thread_bindings_member ON team_thread_bindin
 --   home_*      the narrowest visibility tag (task < channel < team; expert apart),
 --               kept in step with team_memory_tags by the store; it picks the
 --               injection bucket and wins ties on conflict
---   unique_key  'task:<taskRef>' or 'branch:<repo>#<branch>', NULL for the other
+--   unique_key  the taskRef itself ('task:<uuid>') or 'branch:<repo>#<branch>', NULL for the other
 --               types; NULLs are distinct, so only those two types are unique
 --   title/body/attrs are NULL only after a purge. embedding is reserved.
 CREATE TABLE IF NOT EXISTS team_memory_records (

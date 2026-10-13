@@ -87,7 +87,7 @@ visibility tags (design v5, approved on the MOCT memory thread).
 
   `status` is one of `pending`, `active`, `superseded`, `retracted`, `expired`,
   `purged`. `flag` is `blocked_budget` when an approval was refused because the
-  home's always-load set is full. `unique_key` is `task:<taskRef>` or
+  home's always-load set is full. `unique_key` is the taskRef itself (`task:<uuid>`) or
   `branch:<repo>#<branch>`, with `UNIQUE(workspace_id, unique_key)` (NULLs are
   distinct, so other types are unaffected). `embedding` is reserved for vector
   search and is unused in 0.11.0.

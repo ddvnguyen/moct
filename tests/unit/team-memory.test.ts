@@ -299,6 +299,15 @@ describe("team memory — approval", () => {
     expect((await memory.get(r.id))?.status).toBe("pending");
   });
 
+  it("refuses an approver who edited the record's text (edit-then-approve)", async () => {
+    const { memory } = await makeWorld();
+    const r = await write(memory, rule("worker drafted rule"), ALICE);
+    const edited = await memory.patch(r.id, { baseVersion: 1, actor: LEAD, body: "lead rewrote this" });
+    expect(edited.status).toBe("pending");
+    expect((await refusal(memory.approve(r.id, { baseVersion: 2, actor: LEAD }))).code).toBe("SELF_APPROVAL");
+    expect(await memory.approve(r.id, { baseVersion: 2, actor: ARCH })).toMatchObject({ status: "active", version: 3 });
+  });
+
   it("sends every team-scoped rule from a non-human to the human (team-rule gate)", async () => {
     const { memory } = await makeWorld();
     const r = await write(memory, rule("lead team rule", homes.team), LEAD);
@@ -358,6 +367,7 @@ describe("team memory — task and branch records", () => {
     const { memory } = await makeWorld();
     const first = await note(memory, task("open"), LEAD);
     expect(first.upsert).toBe("created");
+    expect(first.record?.uniqueKey).toBe(TASK);
     const again = await note(memory, task("open"), ARCH);
     expect(again.upsert).toBe("unchanged");
     expect(again.record?.id).toBe(first.record?.id);
