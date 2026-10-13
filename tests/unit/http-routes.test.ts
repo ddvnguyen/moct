@@ -5,11 +5,12 @@
  * Everything runs against a real scratch fleet.db and a real node:http server —
  * see http-harness.ts for why.
  */
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { TOOL_NAMES } from "../../src/surfaces/mcp/dispatch.js";
 import { registeredTools } from "../../src/tools/registry.js";
 import { URI_REQUIRED_HINT } from "../../src/surfaces/http/responses.js";
+import { BACKEND_VERSION } from "../../src/surfaces/http/health.js";
 import { cleanupHarnesses, postJson, putJson, startHarness } from "./http-harness.js";
 
 afterEach(cleanupHarnesses);
@@ -44,6 +45,13 @@ describe("GET /health (backend.py:95)", () => {
     expect(body["summary_path"]).toBe(harness.summaryFile);
     expect(body["summary_exists"]).toBe(false);
     expect(body["build"]).toEqual({ number: "dev", date: "unknown", git_sha: "unknown" });
+  });
+
+  it("reports the package version, so a deploy reads as the sha it runs", async () => {
+    const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string };
+    expect(BACKEND_VERSION).toBe(pkg.version);
+    const harness = await startHarness();
+    expect((await json(await harness.get("/health")))["version"]).toBe(pkg.version);
   });
 
   it("counts projects, tracks, events and decisions", async () => {
