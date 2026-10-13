@@ -10,6 +10,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson } from "./responses.js";
 import { TeamRoomStore, type OperationRecord, type SessionRunRow, type SummaryRow } from "../../team-room/store.js";
 import { SCHEMA_VERSION } from "../../store/schema.js";
+import { routeMemory } from "./team-memory.js";
 
 export const TEAM_PREFIX = "/team/v1";
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -213,6 +214,8 @@ async function dispatch(
     if (method !== "GET") return methodNotAllowed(res);
     return getBindings(res, team, url.searchParams);
   }
+
+  if (await routeMemory(req, res, team.memory, url, path, method, () => readJsonBody(req))) return;
 
   if (path.startsWith("/thread-summaries/")) {
     const threadRef = decodeURIComponent(path.slice("/thread-summaries/".length));

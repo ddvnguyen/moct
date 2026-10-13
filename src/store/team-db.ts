@@ -16,4 +16,10 @@ export interface TeamDb {
    * the fleet writers, so a copy never sees a half-written transaction.
    */
   vacuumInto(file: string): Promise<void>;
+  /**
+   * Fold the write-ahead log into the main file and truncate it
+   * (wal_checkpoint(TRUNCATE)), serialised with the fleet writers. A purge calls
+   * it so scrubbed bytes do not survive in the log.
+   */
+  checkpoint(): Promise<void>;
 }

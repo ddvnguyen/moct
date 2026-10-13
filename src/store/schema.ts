@@ -33,9 +33,14 @@
  *                     -> team_turns / team_thread_bindings
  *                        (server-side projections of team_operations; derived, so
  *                         they can be dropped and rebuilt from the log)
+ *   v8 (Team memory, additive)
+ *                     -> team_memory / team_memory_versions (layers expert >
+ *                        team > channel > task; backend-owned state, NOT a projection of the ledger:
+ *                         the expert layer spans Workspaces and a purge must
+ *                         remove text, which an append-only log cannot)
  */
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /**
  * Versions whose DDL ships in FLEET_SCHEMA_SQL, oldest first. FLEET_SCHEMA_SQL
@@ -44,7 +49,7 @@ export const SCHEMA_VERSION = 7;
  * (`schema_version:<n>` -> applied_at), which is how this DB records the
  * migration history. Never drop a version from this list.
  */
-export const APPLIED_SCHEMA_VERSIONS: readonly number[] = [2, 3, 6, 7];
+export const APPLIED_SCHEMA_VERSIONS: readonly number[] = [2, 3, 6, 7, 8];
 
 export const FLEET_SCHEMA_SQL = `
 PRAGMA journal_mode=WAL;
@@ -370,5 +375,96 @@ CREATE TABLE IF NOT EXISTS team_thread_bindings (
     PRIMARY KEY (workspace_id, thread_ref, member_id)
 );
 CREATE INDEX IF NOT EXISTS idx_team_thread_bindings_member ON team_thread_bindings(workspace_id, member_id);
+
+-- team_memory: current state of one memory entry (v8). Four layers, each with a
+-- fixed scope shape: expert = member_id only (the Member id spans Workspaces;
+-- origin_workspace_id records the team it was written in, for audit), team =
+-- workspace_id, channel = workspace_id + channel_ref, task = workspace_id +
+-- channel_ref + thread_ref (a Thread sits in one Channel). content is NULL only
+-- after a purge. embedding is reserved for vector search and unused in v8.
+-- An entry never changes layer or scope: a promote writes a NEW entry in the
+-- wider layer and retracts the source, and the pair is linked through
+-- promoted_from / promoted_to. status 'pending' is an expert note waiting for
+-- the human's approval (only when team_memory_settings expert_approval =
+-- 'required'; off by default).
+CREATE TABLE IF NOT EXISTS team_memory (
+    id TEXT PRIMARY KEY,
+    layer TEXT NOT NULL CHECK (layer IN ('expert', 'team', 'channel', 'task')),
+    member_id TEXT,
+    workspace_id TEXT,
+    channel_ref TEXT,
+    thread_ref TEXT,
+    origin_workspace_id TEXT,
+    promoted_from TEXT,
+    promoted_to TEXT,
+    content TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'retracted', 'expired', 'purged')),
+    author_kind TEXT NOT NULL CHECK (author_kind IN ('human', 'member')),
+    author_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_used_at TEXT,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL,
+    embedding BLOB,
+    CHECK (
+        (layer = 'expert' AND member_id IS NOT NULL AND workspace_id IS NULL AND channel_ref IS NULL AND thread_ref IS NULL)
+        OR (layer = 'team' AND member_id IS NULL AND workspace_id IS NOT NULL AND channel_ref IS NULL AND thread_ref IS NULL)
+        OR (layer = 'channel' AND member_id IS NULL AND workspace_id IS NOT NULL AND channel_ref IS NOT NULL AND thread_ref IS NULL)
+        OR (layer = 'task' AND member_id IS NULL AND workspace_id IS NOT NULL AND channel_ref IS NOT NULL AND thread_ref IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_team_memory_workspace ON team_memory(workspace_id, layer, status);
+CREATE INDEX IF NOT EXISTS idx_team_memory_member ON team_memory(member_id, status);
+CREATE INDEX IF NOT EXISTS idx_team_memory_scope ON team_memory(workspace_id, channel_ref, thread_ref);
+
+-- team_memory_versions: every change to an entry, with who and when (v8). All
+-- versions are kept (content is capped at 2000 characters). Rows are insert-only,
+-- except that a purge may scrub content: first overwrite it in place with '#'
+-- filler of the same byte length (so the old bytes do not survive in the page),
+-- then set it to NULL. Nothing may delete a row.
+CREATE TABLE IF NOT EXISTS team_memory_versions (
+    memory_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('create', 'edit', 'pin', 'unpin', 'promote', 'approve', 'retract', 'restore', 'expire', 'purge')),
+    layer TEXT NOT NULL,
+    workspace_id TEXT,
+    channel_ref TEXT,
+    thread_ref TEXT,
+    content TEXT,
+    pinned INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    actor_kind TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL,
+    PRIMARY KEY (memory_id, version)
+);
+CREATE TRIGGER IF NOT EXISTS team_memory_versions_no_delete BEFORE DELETE ON team_memory_versions BEGIN
+    SELECT RAISE(ABORT, 'team_memory_versions is INSERT-ONLY');
+END;
+CREATE TRIGGER IF NOT EXISTS team_memory_versions_purge_only BEFORE UPDATE ON team_memory_versions
+WHEN (NEW.content IS NOT OLD.content AND NEW.content IS NOT NULL
+        AND NOT (length(CAST(NEW.content AS BLOB)) = length(CAST(OLD.content AS BLOB)) AND trim(NEW.content, '#') = ''))
+    OR NEW.memory_id IS NOT OLD.memory_id OR NEW.version IS NOT OLD.version OR NEW.action IS NOT OLD.action
+    OR NEW.layer IS NOT OLD.layer OR NEW.workspace_id IS NOT OLD.workspace_id
+    OR NEW.channel_ref IS NOT OLD.channel_ref OR NEW.thread_ref IS NOT OLD.thread_ref
+    OR NEW.pinned IS NOT OLD.pinned OR NEW.status IS NOT OLD.status OR NEW.actor_kind IS NOT OLD.actor_kind
+    OR NEW.actor_id IS NOT OLD.actor_id OR NEW.reason IS NOT OLD.reason OR NEW.at IS NOT OLD.at
+BEGIN
+    SELECT RAISE(ABORT, 'team_memory_versions is INSERT-ONLY except purge');
+END;
+
+-- team_memory_settings: human-set memory switches (v8). expert_approval = 'off'
+-- | 'required': when required, an expert's own expert-layer notes start
+-- 'pending' until the human approves them (for a Team that holds another
+-- party's data). A missing row means the default ('off').
+CREATE TABLE IF NOT EXISTS team_memory_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
 
 `;

@@ -203,6 +203,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   };
 }
 
+const MEMORY_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+
 async function main(): Promise<void> {
   const env = resolveEnv();
   const forbidden = forbiddenDbPaths();
@@ -222,6 +224,17 @@ async function main(): Promise<void> {
       ? "fleet-backend: team read models already backfilled"
       : `fleet-backend: team read models backfilled from ${backfill.projected} stored operations`,
   );
+  // Expire idle unpinned memory: once now, then hourly. The sweep never deletes.
+  const sweepMemory = (): void => {
+    team.memory.sweep().then(
+      (expired) => {
+        if (expired > 0) console.error(`fleet-backend: memory sweep expired ${expired} idle entries`);
+      },
+      (exc: unknown) => console.error(`fleet-backend: memory sweep failed: ${String(exc)}`),
+    );
+  };
+  sweepMemory();
+  setInterval(sweepMemory, MEMORY_SWEEP_INTERVAL_MS).unref();
   const daemon = await startDaemon({
     store,
     team,

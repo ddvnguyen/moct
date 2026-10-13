@@ -188,10 +188,10 @@ describe("team room — thread summaries", () => {
 });
 
 describe("team room — health and routing", () => {
-  it("reports the v7 schema", async () => {
+  it("reports the v8 schema", async () => {
     const h = await startHarness();
     const body = await (await h.get("/team/v1/health")).json();
-    expect(body).toMatchObject({ ok: true, schema: 7 });
+    expect(body).toMatchObject({ ok: true, schema: 8 });
   });
 
   it("answers 404 for an unknown team route and 405 for a wrong method", async () => {
