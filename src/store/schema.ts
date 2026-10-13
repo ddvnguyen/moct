@@ -29,9 +29,13 @@
  *                        (new tables, no Python counterpart). Versions 4 and 5 are
  *                        reserved for paseo #68 (room_messages) and #69 (task_attempts);
  *                        they are cherry-picked later and are NOT in this file yet.
+ *   v7 (Team Room read models, additive)
+ *                     -> team_turns / team_thread_bindings
+ *                        (server-side projections of team_operations; derived, so
+ *                         they can be dropped and rebuilt from the log)
  */
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /**
  * Versions whose DDL ships in FLEET_SCHEMA_SQL, oldest first. FLEET_SCHEMA_SQL
@@ -40,7 +44,7 @@ export const SCHEMA_VERSION = 6;
  * (`schema_version:<n>` -> applied_at), which is how this DB records the
  * migration history. Never drop a version from this list.
  */
-export const APPLIED_SCHEMA_VERSIONS: readonly number[] = [2, 3, 6];
+export const APPLIED_SCHEMA_VERSIONS: readonly number[] = [2, 3, 6, 7];
 
 export const FLEET_SCHEMA_SQL = `
 PRAGMA journal_mode=WAL;
@@ -323,4 +327,48 @@ CREATE TABLE IF NOT EXISTS team_thread_summaries (
     at TEXT NOT NULL,
     PRIMARY KEY (thread_ref, generation)
 );
+-- team_turns: read model of team/session-turn-recorded operations (v7). One row
+-- per recorded Turn, keyed by the operation it came from. Token columns are NULL
+-- when the Turn did not report that figure, so a sum never counts an unknown as 0.
+-- Derived from team_operations; rebuildable.
+CREATE TABLE IF NOT EXISTS team_turns (
+    workspace_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    operation_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    turn INTEGER,
+    started_at TEXT,
+    ended_at TEXT NOT NULL,
+    tool_calls INTEGER NOT NULL DEFAULT 0,
+    run_ms INTEGER NOT NULL DEFAULT 0,
+    uncached_input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    thread_refs_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (workspace_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_team_turns_member ON team_turns(workspace_id, member_id, ended_at);
+CREATE INDEX IF NOT EXISTS idx_team_turns_session ON team_turns(workspace_id, session_id);
+
+-- team_thread_bindings: current Thread -> Session and Thread -> Instance-slot map
+-- per Member (v7), folded from team/thread-session-bound and
+-- team/thread-instance-bound. The *_sequence columns record which operation set
+-- each half, so an older operation never overwrites a newer one.
+CREATE TABLE IF NOT EXISTS team_thread_bindings (
+    workspace_id TEXT NOT NULL,
+    thread_ref TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    session_id TEXT,
+    session_reason TEXT,
+    session_sequence INTEGER,
+    slot INTEGER,
+    slot_bound_at TEXT,
+    slot_sequence INTEGER,
+    PRIMARY KEY (workspace_id, thread_ref, member_id)
+);
+CREATE INDEX IF NOT EXISTS idx_team_thread_bindings_member ON team_thread_bindings(workspace_id, member_id);
+
 `;

@@ -214,9 +214,17 @@ async function main(): Promise<void> {
   }
   // The one and only open. A request never constructs a repository.
   const store = await TursoRepository.open(env.stateDir, env.dbPath);
+  const team = new TeamRoomStore(store.teamDb(), env.dbPath, env.backupDir);
+  // Fold operations stored before schema v7 into the read models (once; marker in meta).
+  const backfill = await team.backfillProjections();
+  console.error(
+    backfill.skipped
+      ? "fleet-backend: team read models already backfilled"
+      : `fleet-backend: team read models backfilled from ${backfill.projected} stored operations`,
+  );
   const daemon = await startDaemon({
     store,
-    team: new TeamRoomStore(store.teamDb(), env.dbPath, env.backupDir),
+    team,
     host: env.host,
     port: env.port,
     log: (message) => console.error(message),

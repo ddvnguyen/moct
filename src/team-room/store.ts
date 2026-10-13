@@ -12,6 +12,7 @@ import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import type { TeamDb } from "../store/team-db.js";
 import { utcnowIso } from "../domain/models.js";
+import { PROJECTION_META_KEY, projectOperation } from "./projection.js";
 
 export type OperationRecord = Record<string, unknown> & {
   sequence: number;
@@ -53,6 +54,44 @@ export interface SummaryRow {
   model: string;
   at: string;
 }
+
+export interface UsageQuery {
+  workspaceId: string;
+  groupBy: "member" | "day" | "session" | "total";
+  memberId?: string;
+  since?: string;
+  until?: string;
+}
+
+export interface UsageRow {
+  key: string;
+  turns: number;
+  toolCalls: number;
+  runMs: number;
+  uncachedInputTokens: number;
+  unknownInputTurns: number;
+  outputTokens: number;
+  unknownOutputTurns: number;
+  cacheReadTokens: number;
+  unknownCacheReadTurns: number;
+  cacheWriteTokens: number;
+  unknownCacheWriteTurns: number;
+  reasoningTokens: number;
+  unknownReasoningTurns: number;
+  firstEndedAt: string;
+  lastEndedAt: string;
+}
+
+export interface BindingRecord {
+  threadRef: string;
+  memberId: string;
+  sessionId: string | null;
+  sessionReason: string | null;
+  slot: number | null;
+  slotBoundAt: string | null;
+}
+
+const MAX_BACKFILL_PAGE = 1000;
 
 export type SummaryOutcome =
   | { status: "stored" }
@@ -124,8 +163,132 @@ export class TeamRoomStore {
         JSON.stringify(record),
         occurredAt,
       );
+      await projectOperation(this.db, workspaceId, record);
       return { status: "stored" } as const;
     });
+  }
+
+  /**
+   * One-time fold of operations stored before schema v7 into the read models.
+   * The marker is written in the same transaction, so a failed backfill leaves no
+   * marker and the next start tries again. Projection is idempotent, so a retry
+   * after a partial run changes nothing it already wrote.
+   */
+  async backfillProjections(): Promise<{ projected: number; skipped: boolean }> {
+    return this.db.transaction(async () => {
+      const done = await this.db.get("SELECT value FROM meta WHERE key = ?", PROJECTION_META_KEY);
+      if (done !== undefined) return { projected: 0, skipped: true };
+      const workspaces = await this.db.all("SELECT DISTINCT workspace_id FROM team_operations ORDER BY workspace_id");
+      let projected = 0;
+      for (const row of workspaces) {
+        const workspaceId = String(row["workspace_id"]);
+        let after = 0;
+        for (;;) {
+          const page = await this.page(workspaceId, after, MAX_BACKFILL_PAGE);
+          for (const record of page.operations) {
+            await projectOperation(this.db, workspaceId, record);
+            projected += 1;
+          }
+          const last = page.operations[page.operations.length - 1];
+          if (!page.hasMore || last === undefined) break;
+          after = last.sequence;
+        }
+      }
+      await this.db.run("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)", PROJECTION_META_KEY, utcnowIso());
+      return { projected, skipped: false };
+    });
+  }
+
+  /**
+   * Token and Turn totals from team_turns. A figure a Turn did not report is NULL,
+   * so `unknown*Turns` says how many Turns a sum does not cover. since/until are
+   * ISO instants compared against the Turn's endedAt (inclusive / exclusive).
+   */
+  async usage(query: UsageQuery): Promise<UsageRow[]> {
+    const keyExpr =
+      query.groupBy === "day"
+        ? "substr(ended_at, 1, 10)"
+        : query.groupBy === "session"
+          ? "session_id"
+          : query.groupBy === "total"
+            ? "'total'"
+            : "member_id";
+    const where = ["workspace_id = ?"];
+    const params: unknown[] = [query.workspaceId];
+    if (query.memberId !== undefined) {
+      where.push("member_id = ?");
+      params.push(query.memberId);
+    }
+    if (query.since !== undefined) {
+      where.push("ended_at >= ?");
+      params.push(query.since);
+    }
+    if (query.until !== undefined) {
+      where.push("ended_at < ?");
+      params.push(query.until);
+    }
+    const rows = await this.db.all(
+      `SELECT ${keyExpr} AS key,
+         COUNT(*) AS turns,
+         COALESCE(SUM(tool_calls), 0) AS tool_calls,
+         COALESCE(SUM(run_ms), 0) AS run_ms,
+         COALESCE(SUM(uncached_input_tokens), 0) AS uncached_input_tokens,
+         COUNT(*) - COUNT(uncached_input_tokens) AS unknown_input_turns,
+         COALESCE(SUM(output_tokens), 0) AS output_tokens,
+         COUNT(*) - COUNT(output_tokens) AS unknown_output_turns,
+         COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+         COUNT(*) - COUNT(cache_read_tokens) AS unknown_cache_read_turns,
+         COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+         COUNT(*) - COUNT(cache_write_tokens) AS unknown_cache_write_turns,
+         COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+         COUNT(*) - COUNT(reasoning_tokens) AS unknown_reasoning_turns,
+         MIN(ended_at) AS first_ended_at,
+         MAX(ended_at) AS last_ended_at
+       FROM team_turns WHERE ${where.join(" AND ")} GROUP BY ${keyExpr} ORDER BY ${keyExpr}`,
+      ...params,
+    );
+    return rows.map((row) => ({
+      key: String(row["key"]),
+      turns: Number(row["turns"]),
+      toolCalls: Number(row["tool_calls"]),
+      runMs: Number(row["run_ms"]),
+      uncachedInputTokens: Number(row["uncached_input_tokens"]),
+      unknownInputTurns: Number(row["unknown_input_turns"]),
+      outputTokens: Number(row["output_tokens"]),
+      unknownOutputTurns: Number(row["unknown_output_turns"]),
+      cacheReadTokens: Number(row["cache_read_tokens"]),
+      unknownCacheReadTurns: Number(row["unknown_cache_read_turns"]),
+      cacheWriteTokens: Number(row["cache_write_tokens"]),
+      unknownCacheWriteTurns: Number(row["unknown_cache_write_turns"]),
+      reasoningTokens: Number(row["reasoning_tokens"]),
+      unknownReasoningTurns: Number(row["unknown_reasoning_turns"]),
+      firstEndedAt: String(row["first_ended_at"]),
+      lastEndedAt: String(row["last_ended_at"]),
+    }));
+  }
+
+  /** Current Thread -> Session and Thread -> slot bindings, for one Thread or one Member. */
+  async bindings(workspaceId: string, by: { threadRef: string } | { memberId: string }): Promise<BindingRecord[]> {
+    const rows =
+      "threadRef" in by
+        ? await this.db.all(
+            "SELECT * FROM team_thread_bindings WHERE workspace_id = ? AND thread_ref = ? ORDER BY member_id",
+            workspaceId,
+            by.threadRef,
+          )
+        : await this.db.all(
+            "SELECT * FROM team_thread_bindings WHERE workspace_id = ? AND member_id = ? ORDER BY thread_ref",
+            workspaceId,
+            by.memberId,
+          );
+    return rows.map((row) => ({
+      threadRef: String(row["thread_ref"]),
+      memberId: String(row["member_id"]),
+      sessionId: row["session_id"] == null ? null : String(row["session_id"]),
+      sessionReason: row["session_reason"] == null ? null : String(row["session_reason"]),
+      slot: row["slot"] == null ? null : Number(row["slot"]),
+      slotBoundAt: row["slot_bound_at"] == null ? null : String(row["slot_bound_at"]),
+    }));
   }
 
   /** One replay page, ordered by sequence. Reads one row past the limit to report hasMore. */

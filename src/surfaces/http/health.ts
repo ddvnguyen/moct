@@ -22,7 +22,7 @@ import { sendJson } from "./responses.js";
  * actually serving /health, and a probe that reports the Python version would
  * misattribute the running process. Shape and key set are identical.
  */
-export const BACKEND_VERSION = "0.9.2";
+export const BACKEND_VERSION = "0.10.0";
 
 /** build_info.py's source-checkout fallback; CI rewrites those three literals. */
 export const BUILD_INFO: Record<string, unknown> = {

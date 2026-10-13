@@ -204,6 +204,16 @@ async function dispatch(
     return getSessionRuns(res, team, url.searchParams);
   }
 
+  if (path === "/usage") {
+    if (method !== "GET") return methodNotAllowed(res);
+    return getUsage(res, team, url.searchParams);
+  }
+
+  if (path === "/bindings") {
+    if (method !== "GET") return methodNotAllowed(res);
+    return getBindings(res, team, url.searchParams);
+  }
+
   if (path.startsWith("/thread-summaries/")) {
     const threadRef = decodeURIComponent(path.slice("/thread-summaries/".length));
     if (threadRef.length === 0 || threadRef.includes("/")) return notFound(res);
@@ -310,6 +320,47 @@ async function getSessionRuns(res: ServerResponse, team: TeamRoomStore, query: U
   const runs =
     memberId !== null ? await team.sessionRunsForMember(memberId) : await team.sessionRunsForThread(threadRef as string);
   return sendJson(res, 200, { runs });
+}
+
+const USAGE_GROUPS = ["member", "day", "session", "total"] as const;
+
+/** An ISO instant, so the comparison against endedAt is a string compare that means the same thing. */
+function isoInstant(value: string | null, field: string): string | undefined {
+  if (value === null || value === "") return undefined;
+  if (!/^\d{4}-\d{2}-\d{2}(T[\d:.]+Z?)?$/.test(value) || Number.isNaN(Date.parse(value))) {
+    throw new BadRequest(`${field} must be an ISO date or instant`);
+  }
+  return value;
+}
+
+async function getUsage(res: ServerResponse, team: TeamRoomStore, query: URLSearchParams): Promise<void> {
+  const workspaceId = requireString(query.get("workspaceId"), "workspaceId");
+  const groupBy = query.get("groupBy") ?? "member";
+  if (!(USAGE_GROUPS as readonly string[]).includes(groupBy)) {
+    throw new BadRequest(`groupBy must be one of ${USAGE_GROUPS.join(", ")}`);
+  }
+  const memberId = query.get("memberId");
+  const since = isoInstant(query.get("since"), "since");
+  const until = isoInstant(query.get("until"), "until");
+  const rows = await team.usage({
+    workspaceId,
+    groupBy: groupBy as (typeof USAGE_GROUPS)[number],
+    ...(memberId !== null && memberId !== "" ? { memberId } : {}),
+    ...(since !== undefined ? { since } : {}),
+    ...(until !== undefined ? { until } : {}),
+  });
+  return sendJson(res, 200, { workspaceId, groupBy, rows });
+}
+
+async function getBindings(res: ServerResponse, team: TeamRoomStore, query: URLSearchParams): Promise<void> {
+  const workspaceId = requireString(query.get("workspaceId"), "workspaceId");
+  const memberId = query.get("memberId");
+  const threadRef = query.get("threadRef");
+  if ((memberId === null) === (threadRef === null)) {
+    throw new BadRequest("pass exactly one of memberId or threadRef");
+  }
+  const bindings = await team.bindings(workspaceId, threadRef !== null ? { threadRef } : { memberId: memberId as string });
+  return sendJson(res, 200, { workspaceId, bindings });
 }
 
 async function putSummary(req: IncomingMessage, res: ServerResponse, team: TeamRoomStore, threadRef: string): Promise<void> {
