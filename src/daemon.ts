@@ -224,6 +224,15 @@ async function main(): Promise<void> {
       ? "fleet-backend: team read models already backfilled"
       : `fleet-backend: team read models backfilled from ${backfill.projected} stored operations`,
   );
+  // Fold thread summaries committed before the projection existed. This pass keeps its
+  // own marker: the marker above is already set in every live database, so reusing it
+  // would make this a no-op there and leave committed summaries unread.
+  const summaries = await team.backfillThreadSummaries();
+  console.error(
+    summaries.skipped
+      ? "fleet-backend: thread summary projection already backfilled"
+      : `fleet-backend: thread summaries backfilled from ${summaries.projected} stored operations`,
+  );
   // Expire idle unpinned memory: once now, then hourly. The sweep never deletes.
   const sweepMemory = (): void => {
     team.memory.sweep().then(

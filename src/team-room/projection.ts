@@ -13,8 +13,12 @@
  * operation (backfill, replay) changes nothing. A figure the operation does not
  * report is stored NULL, never 0, so a sum can say how many Turns it did not cover.
  */
+import { utcnowIso } from "../domain/models.js";
 import type { TeamDb } from "../store/team-db.js";
 import type { OperationRecord } from "./store.js";
+
+/** One replay page, the shape TeamRoomStore.page returns. */
+export type PageReader = (workspaceId: string, afterSequence: number) => Promise<{ operations: OperationRecord[]; hasMore: boolean }>;
 
 export const KIND_TURN_RECORDED = "team/session-turn-recorded";
 export const KIND_SESSION_BOUND = "team/thread-session-bound";
@@ -23,6 +27,15 @@ export const KIND_SUMMARY_COMMITTED = "team/thread-summary-committed";
 
 /** meta key that records the one-time backfill of operations stored before v7. */
 export const PROJECTION_META_KEY = "team_projection:1";
+
+/**
+ * meta key for the one-time fold of thread summaries stored before the projection
+ * existed. It is deliberately NOT PROJECTION_META_KEY: the shared marker already
+sits in every live DB (it was written by the v7 backfill on 2026-10-13), so reusing
+it would make the summary fold a no-op on every existing database and leave every
+already-committed summary unread.
+ */
+export const SUMMARY_PROJECTION_META_KEY = "team_projection:summaries:1";
 
 type Json = Record<string, unknown>;
 
@@ -39,6 +52,7 @@ function count(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+/** Fold one stored operation into every read model it has a projector for. */
 export async function projectOperation(db: TeamDb, workspaceId: string, record: OperationRecord): Promise<void> {
   const data = record["data"];
   if (!isObject(data)) return;
@@ -224,4 +238,40 @@ function summaryModel(value: unknown): string {
   if (provider === null) return model ?? "";
   if (model === null) return provider;
   return provider + "/" + model;
+}
+
+/**
+ * One-time fold of the summary operations a database already stored. The pass has its
+ * own marker because the shared v7 marker is already set on every live DB, so reusing
+ * it would skip this fold there and leave committed summaries unread.
+ *
+ * Pages by sequence so the pass is bounded by memory, and INSERT OR IGNORE means a
+ * fresh database that already projected these operations in the append transaction is
+ * left untouched.
+ */
+export async function backfillSummaryProjection(db: TeamDb, page: PageReader): Promise<{ projected: number; skipped: boolean }> {
+  return db.transaction(async () => {
+    const done = await db.get("SELECT value FROM meta WHERE key = ?", SUMMARY_PROJECTION_META_KEY);
+    if (done !== undefined) return { projected: 0, skipped: true };
+    const workspaces = await db.all("SELECT DISTINCT workspace_id FROM team_operations ORDER BY workspace_id");
+    let projected = 0;
+    for (const row of workspaces) {
+      const workspaceId = String(row["workspace_id"]);
+      let after = 0;
+      for (;;) {
+        const batch = await page(workspaceId, after);
+        if (batch.operations.length === 0) break;
+        for (const record of batch.operations) {
+          if (record.kind !== KIND_SUMMARY_COMMITTED) continue;
+          await projectOperation(db, workspaceId, record);
+          projected += 1;
+        }
+        const last = batch.operations[batch.operations.length - 1]!;
+        if (!batch.hasMore) break;
+        after = last.sequence;
+      }
+    }
+    await db.run("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)", SUMMARY_PROJECTION_META_KEY, utcnowIso());
+    return { projected, skipped: false };
+  });
 }

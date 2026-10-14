@@ -447,4 +447,48 @@ describe("team room read models — summaries", () => {
     expect((await team.backfillProjections()).skipped).toBe(true);
     await repo.close();
   });
+
+  it("backfills summaries on a database whose shared backfill marker is already set", async () => {
+    // The blocker this pass exists for: the v7 marker is already written in every live
+    // database (on TEST it dates from 2026-10-13), so a summary fold that reuses it is a
+    // no-op there and committed summaries stay unread.
+    const { root, dbPath } = scratch();
+    const repo = await TursoRepository.open(root, dbPath);
+    const team = new TeamRoomStore(repo.teamDb());
+    await team.backfillProjections();
+    expect((await team.backfillProjections()).skipped).toBe(true);
+    await storeSummaryUnprojected(repo, summaryOp(7));
+    expect(await team.latestSummary("thread:a")).toBeUndefined();
+
+    const first = await team.backfillThreadSummaries();
+    expect(first).toEqual({ projected: 1, skipped: false });
+    expect(await team.latestSummary("thread:a")).toMatchObject({
+      generation: 1,
+      tokens: 1521,
+      model: "dsh-opencode-go/mimo-v2.6-flash",
+      coversThroughSequence: 40,
+    });
+
+    // One-time: the second start skips, and the fold does not disturb the v7 pass.
+    const second = await team.backfillThreadSummaries();
+    expect(second).toEqual({ projected: 0, skipped: true });
+    expect((await team.backfillProjections()).skipped).toBe(true);
+    expect(await team.latestSummary("thread:a")).toMatchObject({ tokens: 1521 });
+    await repo.close();
+  });
+
+  it("is a no-op when the summaries are already projected, on a fresh database", async () => {
+    // The append transaction already folded them, so the backfill must leave the rows alone.
+    const { root, dbPath } = scratch();
+    const repo = await TursoRepository.open(root, dbPath);
+    const team = new TeamRoomStore(repo.teamDb());
+    expect(await team.append(WS, summaryOp(1))).toEqual({ status: "stored" });
+    const before = await team.latestSummary("thread:a");
+    expect(before?.tokens).toBe(1521);
+
+    const pass = await team.backfillThreadSummaries();
+    expect(pass).toEqual({ projected: 1, skipped: false });
+    expect(await team.latestSummary("thread:a")).toEqual(before);
+    await repo.close();
+  });
 });
