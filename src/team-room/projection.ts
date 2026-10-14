@@ -1,11 +1,12 @@
 /**
- * Team Room read models (schema v7). The ledger log (team_operations) stays the
- * source of truth; this file folds two operation kinds into tables the backend can
- * query without replaying the log:
+ * Team Room read models. The ledger log (team_operations) stays the source of
+ * truth; this file folds operation kinds into tables the backend can query without
+ * replaying the log:
  *
- *   team/session-turn-recorded -> team_turns          (usage per Turn)
- *   team/thread-session-bound  -> team_thread_bindings (Thread -> Session)
- *   team/thread-instance-bound -> team_thread_bindings (Thread -> Instance slot)
+ *   team/session-turn-recorded  -> team_turns           (usage per Turn)
+ *   team/thread-session-bound   -> team_thread_bindings (Thread -> Session)
+ *   team/thread-instance-bound  -> team_thread_bindings (Thread -> Instance slot)
+ *   team/thread-summary-committed -> team_thread_summaries (summary generation)
  *
  * Projection runs inside the append transaction, so a stored operation and its
  * read-model row commit together. Every write is idempotent: re-projecting an
@@ -18,6 +19,7 @@ import type { OperationRecord } from "./store.js";
 export const KIND_TURN_RECORDED = "team/session-turn-recorded";
 export const KIND_SESSION_BOUND = "team/thread-session-bound";
 export const KIND_INSTANCE_BOUND = "team/thread-instance-bound";
+export const KIND_SUMMARY_COMMITTED = "team/thread-summary-committed";
 
 /** meta key that records the one-time backfill of operations stored before v7. */
 export const PROJECTION_META_KEY = "team_projection:1";
@@ -47,6 +49,8 @@ export async function projectOperation(db: TeamDb, workspaceId: string, record: 
       return projectSessionBound(db, workspaceId, record, data);
     case KIND_INSTANCE_BOUND:
       return projectInstanceBound(db, workspaceId, record, data);
+    case KIND_SUMMARY_COMMITTED:
+      return projectSummaryCommitted(db, record, data);
     default:
       return;
   }
@@ -160,4 +164,64 @@ async function projectInstanceBound(db: TeamDb, workspaceId: string, record: Ope
     threadRef,
     memberId,
   );
+}
+
+/**
+ * team/thread-summary-committed -> team_thread_summaries.
+ *
+ * The v6 table is the read model of a summary generation and is keyed
+ * (thread_ref, generation); the ledger is where a summary is written, so this
+ * projection exists only to make the ledger's summaries readable through
+ * GET /team/v1/thread-summaries/... without replaying the log.
+ *
+ * Field mapping, and why: the operation's transcriptTokens is the summary's token
+ * count and lands in the table's tokens column (the operation calls it
+ * transcriptTokens, the column calls it tokens). The operation carries model as a
+ * {provider, model} object where the table has one TEXT column, so it is stored as
+ * provider/model, which round-trips without guessing which half a bare name meant.
+ * The operation also carries usage, which has no column: it is not projected, and
+ * adding a column to a v6 table is a schema change this projection does not make.
+ *
+ * Idempotence follows the table's own rule: a (thread_ref, generation) row that is
+ * already stored with the same content is a replay and changes nothing; a different
+ * body under a stored generation is also left alone, because the ledger validated
+ * the summary's own monotonicity on commit and a second writer for the same
+ * generation is a conflict this must not paper over. Nothing here reads
+ * latestSummary, so a backfilled generation never hides an earlier one.
+ */
+async function projectSummaryCommitted(db: TeamDb, record: OperationRecord, data: Json): Promise<void> {
+  const threadRef = text(data["threadRef"]);
+  const generation = count(data["generation"]);
+  const trigger = data["trigger"];
+  const body = text(data["text"]);
+  if (threadRef === null || generation === null || generation < 1) return;
+  if (trigger !== "rolling" && trigger !== "wrapup") return;
+  if (body === null) return;
+  const coversThroughSequence = count(data["coversThroughSequence"]) ?? 0;
+  const tokens = count(data["transcriptTokens"]) ?? 0;
+  const at = text(data["at"]) ?? text(record["occurredAt"]) ?? "";
+  const model = summaryModel(data["model"]);
+  await db.run(
+    "INSERT OR IGNORE INTO team_thread_summaries(thread_ref, generation, trigger, text, covers_through_sequence, tokens, model, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    threadRef,
+    generation,
+    trigger,
+    body,
+    coversThroughSequence,
+    tokens,
+    model,
+    at,
+  );
+}
+
+/** A {provider, model} object on the wire becomes provider/model in the one text column. */
+function summaryModel(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!isObject(value)) return "";
+  const provider = text(value["provider"]);
+  const model = text(value["model"]);
+  if (provider === null && model === null) return "";
+  if (provider === null) return model ?? "";
+  if (model === null) return provider;
+  return provider + "/" + model;
 }
