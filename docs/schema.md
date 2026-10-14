@@ -56,6 +56,39 @@ They can be dropped and rebuilt from the log.
 Operations stored before v7 are folded once at daemon start. The marker is
 `meta` key `team_projection:1`, written in the same transaction as the backfill. To
 rebuild a read model: delete its rows and that `meta` key, then restart.
+### Summary generations are projected from the ledger
+
+`team/thread-summary-committed` is folded into `team_thread_summaries`, so a summary the
+ledger committed is readable through the v6 route below without replaying the log. The
+operation calls the token count `transcriptTokens`; the column calls it `tokens`, and that
+is where it lands. The operation carries `model` as `{provider, model}` and the table has
+one `TEXT` column, so it is stored as `provider/model`. `usage` has no column and is not
+carried.
+
+Idempotent, like every projection here: appending the same operation twice stores one row.
+An operation that cannot be projected (no `threadRef`, a `trigger` that is not
+`rolling`/`wrapup`, a fractional `generation`, no `text`) stays a plain log entry and is
+read as no summary, never as a zeroed one.
+
+**This fold has its own marker**, `meta` key `team_projection:summaries:1`, and runs as a
+second one-time pass at daemon start. It cannot share the marker above: that marker is
+already set in every live database, so a fold that reused it would be a no-op there and
+every summary committed before the restart would stay unread. To rebuild this read model:
+`DELETE FROM team_thread_summaries; DELETE FROM meta WHERE key='team_projection:summaries:1';`
+and restart.
+### Summary generations are projected from the ledger
+
+`team/thread-summary-committed` is folded into `team_thread_summaries`, so a summary the
+ledger committed is readable through the v6 route below without replaying the log. The
+operation calls the token count `transcriptTokens`; the column calls it `tokens`, and that
+is where it lands. The operation carries `model` as `{provider, model}` and the table has
+one `TEXT` column, so it is stored as `provider/model`. `usage` has no column and is not
+carried.
+
+Idempotent, like every projection here: appending the same operation twice stores one row.
+An operation that cannot be projected (no `threadRef`, a `trigger` that is not
+`rolling`/`wrapup`, a fractional `generation`, no `text`) stays a plain log entry and is
+read as no summary, never as a zeroed one.
 
 New routes (read-only, loopback, additive):
 

@@ -308,3 +308,187 @@ describe("team room read models — backfill of operations stored before v7", ()
     await repo.close();
   });
 });
+
+const summaryOp = (
+  sequence: number,
+  overrides: Record<string, unknown> = {},
+  data: Record<string, unknown> = {},
+) => ({
+  sequence,
+  operationId: `op-${sequence}`,
+  kind: "team/thread-summary-committed",
+  data: {
+    workspaceId: WS,
+    threadRef: "thread:a",
+    generation: 1,
+    trigger: "rolling",
+    text: "## Conversation Summary\n\nHeadline.",
+    coversThroughSequence: 40,
+    transcriptTokens: 1521,
+    model: { provider: "dsh-opencode-go", model: "mimo-v2.6-flash" },
+    usage: { inputTokens: 4772, outputTokens: 1666 },
+    at: "2026-10-13T12:00:00.000Z",
+    ...data,
+  },
+  ...overrides,
+});
+
+describe("team room read models — summaries", () => {
+  function scratch(): { root: string; dbPath: string } {
+    const root = mkdtempSync(path.join(tmpdir(), "moct-team-sm-"));
+    dirs.push(root);
+    return { root, dbPath: path.join(root, "fleet.db") };
+  }
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** An operation as an older build stored it: in the log, with no summary row. */
+  async function storeSummaryUnprojected(
+    repo: TursoRepository,
+    record: { sequence: number; operationId: string; kind: string },
+  ): Promise<void> {
+    await repo
+      .teamDb()
+      .run(
+        "INSERT INTO team_operations(workspace_id, sequence, operation_id, kind, record_json, occurred_at) VALUES (?, ?, ?, ?, ?, ?)",
+        WS,
+        record.sequence,
+        record.operationId,
+        record.kind,
+        JSON.stringify(record),
+        "2026-10-13T12:00:00.000Z",
+      );
+  }
+  it("projects team/thread-summary-committed into the readable summary", async () => {
+    const h = await startHarness();
+    // The real shape of op 385 from the TEST ledger: transcriptTokens, a model object, usage.
+    expect(await append(h, summaryOp(1))).toBe(201);
+
+    const res = await h.get("/team/v1/thread-summaries/thread:a");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      threadRef: "thread:a",
+      generation: 1,
+      trigger: "rolling",
+      text: "## Conversation Summary\n\nHeadline.",
+      // transcriptTokens is the table's tokens column.
+      coversThroughSequence: 40,
+      tokens: 1521,
+      model: "dsh-opencode-go/mimo-v2.6-flash",
+      at: "2026-10-13T12:00:00.000Z",
+    });
+  });
+
+  it("projects each generation and serves the latest", async () => {
+    const h = await startHarness();
+    await append(h, summaryOp(1));
+    await append(h, summaryOp(2, {}, { generation: 2, trigger: "wrapup", text: "wrap up", at: "2026-10-13T13:00:00.000Z" }));
+    await append(h, summaryOp(3, {}, { generation: 3, trigger: "rolling", text: "third", at: "2026-10-13T14:00:00.000Z" }));
+
+    const latest = await (await h.get("/team/v1/thread-summaries/thread:a")).json();
+    expect(latest.generation).toBe(3);
+    expect(latest.text).toBe("third");
+    expect(await (await h.get("/team/v1/thread-summaries/thread:other")).status).toBe(404);
+  });
+
+  it("is idempotent: appending the same operation again changes nothing", async () => {
+    const h = await startHarness();
+    expect(await append(h, summaryOp(1))).toBe(201);
+    expect(await append(h, summaryOp(1))).toBe(200); // replay of the same operation_id
+    const after = await (await h.get("/team/v1/thread-summaries/thread:a")).json();
+    expect(after.tokens).toBe(1521);
+  });
+
+  it("does not let a re-sent generation with different text overwrite the stored one", async () => {
+    const h = await startHarness();
+    await append(h, summaryOp(1));
+    // A different operation_id, same generation, different text: the ledger guards this,
+    // but the projection must not be the place where the guard is missing.
+    await append(h, summaryOp(2, { operationId: "op-other" }, { text: "rewritten" }));
+    const latest = await (await h.get("/team/v1/thread-summaries/thread:a")).json();
+    expect(latest.generation).toBe(1);
+    expect(latest.text).toBe("## Conversation Summary\n\nHeadline.");
+  });
+
+  it("leaves an operation it cannot project stored and unread, never a zeroed summary", async () => {
+    const h = await startHarness();
+    // No threadRef, a bad trigger, a fractional generation, no text: all stay plain log entries.
+    for (const [index, bad] of [
+      { threadRef: undefined },
+      { trigger: "daily" },
+      { generation: 1.5 },
+      { text: undefined },
+    ].entries()) {
+      expect(await append(h, summaryOp(index + 1, {}, bad))).toBe(201);
+    }
+    expect(await (await h.get("/team/v1/thread-summaries/thread:a")).status).toBe(404);
+  });
+
+  it("backfills a summary committed before this build, from the operation log", async () => {
+    const { root, dbPath } = scratch();
+    const repo = await TursoRepository.open(root, dbPath);
+    // As an older build stored it: in the log, with no summary row.
+    await storeSummaryUnprojected(repo, summaryOp(1));
+    const team = new TeamRoomStore(repo.teamDb());
+    expect(await team.latestSummary("thread:a")).toBeUndefined();
+
+    const first = await team.backfillProjections();
+    expect(first.skipped).toBe(false);
+    expect(first.projected).toBe(1);
+    expect(await team.latestSummary("thread:a")).toMatchObject({
+      generation: 1,
+      tokens: 1521,
+      model: "dsh-opencode-go/mimo-v2.6-flash",
+    });
+
+    // Second start projects nothing again.
+    expect((await team.backfillProjections()).skipped).toBe(true);
+    await repo.close();
+  });
+
+  it("backfills summaries on a database whose shared backfill marker is already set", async () => {
+    // The blocker this pass exists for: the v7 marker is already written in every live
+    // database (on TEST it dates from 2026-10-13), so a summary fold that reuses it is a
+    // no-op there and committed summaries stay unread.
+    const { root, dbPath } = scratch();
+    const repo = await TursoRepository.open(root, dbPath);
+    const team = new TeamRoomStore(repo.teamDb());
+    await team.backfillProjections();
+    expect((await team.backfillProjections()).skipped).toBe(true);
+    await storeSummaryUnprojected(repo, summaryOp(7));
+    expect(await team.latestSummary("thread:a")).toBeUndefined();
+
+    const first = await team.backfillThreadSummaries();
+    expect(first).toEqual({ projected: 1, skipped: false });
+    expect(await team.latestSummary("thread:a")).toMatchObject({
+      generation: 1,
+      tokens: 1521,
+      model: "dsh-opencode-go/mimo-v2.6-flash",
+      coversThroughSequence: 40,
+    });
+
+    // One-time: the second start skips, and the fold does not disturb the v7 pass.
+    const second = await team.backfillThreadSummaries();
+    expect(second).toEqual({ projected: 0, skipped: true });
+    expect((await team.backfillProjections()).skipped).toBe(true);
+    expect(await team.latestSummary("thread:a")).toMatchObject({ tokens: 1521 });
+    await repo.close();
+  });
+
+  it("is a no-op when the summaries are already projected, on a fresh database", async () => {
+    // The append transaction already folded them, so the backfill must leave the rows alone.
+    const { root, dbPath } = scratch();
+    const repo = await TursoRepository.open(root, dbPath);
+    const team = new TeamRoomStore(repo.teamDb());
+    expect(await team.append(WS, summaryOp(1))).toEqual({ status: "stored" });
+    const before = await team.latestSummary("thread:a");
+    expect(before?.tokens).toBe(1521);
+
+    const pass = await team.backfillThreadSummaries();
+    expect(pass).toEqual({ projected: 1, skipped: false });
+    expect(await team.latestSummary("thread:a")).toEqual(before);
+    await repo.close();
+  });
+});

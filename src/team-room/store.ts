@@ -12,7 +12,7 @@ import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import type { TeamDb } from "../store/team-db.js";
 import { utcnowIso } from "../domain/models.js";
-import { PROJECTION_META_KEY, projectOperation } from "./projection.js";
+import { PROJECTION_META_KEY, backfillSummaryProjection, projectOperation, type PageReader } from "./projection.js";
 import { TeamMemoryStore } from "./memory.js";
 
 export type OperationRecord = Record<string, unknown> & {
@@ -206,6 +206,16 @@ export class TeamRoomStore {
     });
   }
 
+  /**
+   * One-time fold of thread summaries stored before the projection existed. This is a
+ * second pass with its own marker, because the v7 marker is already set in every live
+ * database: reusing it would silently skip this fold and leave committed summaries
+ * unread.
+   */
+  async backfillThreadSummaries(): Promise<{ projected: number; skipped: boolean }> {
+    const page: PageReader = (workspaceId, afterSequence) => this.page(workspaceId, afterSequence, MAX_BACKFILL_PAGE);
+    return backfillSummaryProjection(this.db, page);
+  }
   /**
    * Token and Turn totals from team_turns. A figure a Turn did not report is NULL,
    * so `unknown*Turns` says how many Turns a sum does not cover. since/until are
