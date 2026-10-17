@@ -1,0 +1,86 @@
+# Pipeline 3 (SKELETON): ddvnguyen/moct -> DSH-Z PROD.
+#
+# This workflow cannot act on PROD yet. Five independent things stop it:
+#   1. on: workflow_dispatch ONLY - no push, no pull_request, no schedule. A merge
+#      never starts it; only a human pressing the button does.
+#   2. the job runs only when github.actor is the human account (ddvnguyen). No agent
+#      or teammate account can produce a run that does anything; theirs is skipped.
+#   3. inputs.confirm must be the literal PROD_DEPLOY_ACK, typed at dispatch time.
+#   4. runs-on carries a `prod` label that NO runner advertises yet, so even an armed
+#      run cannot execute on any host. Change this label when - and only when - the
+#      PROD runner is registered.
+#   5. the PROD deploy script does not exist, and the deploy step dies with an explicit
+#      message while it is missing.
+#
+# environment: prod-z exists (created 2026-10-17) so deployments are recorded against
+# it. It is NOT the gate: a required-reviewer protection rule needs a paid plan and the
+# API refuses it on this repo (PUT /environments/prod-z -> 422 "Please ensure the billing
+# plan supports the required reviewers protection rule"). When the plan allows it, one
+# call adds the human as the only required reviewer and gate 2 becomes redundant.
+#
+# Deliberately absent: the PROD port, the PROD clouds root and any PROD database path.
+# Those are the human's call and are not guessed here, so nothing in this file could
+# reach :3080 or PROD data by accident.
+name: moct-prod-deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit sha to deploy (must already be merged to main)'
+        required: true
+        type: string
+      confirm:
+        description: 'Type PROD_DEPLOY_ACK to arm the deploy step'
+        required: true
+        default: ''
+        type: string
+
+concurrency:
+  group: moct-prod-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prod-deploy:
+    # Gate 2: only the human's own account can produce a run that does anything.
+    if: github.actor == 'ddvnguyen'
+    environment: prod-z
+    # Gate 4: no runner carries the `prod` label, so an armed run queues forever
+    # instead of landing on a host that serves live data.
+    runs-on: [self-hosted, linux, x64, prod]
+    timeout-minutes: 20
+    env:
+      CLOUDS_ROOT: /mnt/workspace/clouds
+      PNPM_STORE_DIR: /mnt/workspace/pnpm-store
+      npm_config_store_dir: /mnt/workspace/pnpm-store
+      npm_config_package_import_method: hardlink
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 1
+
+      - name: Plan - what this run would do
+        run: |
+          set -euo pipefail
+          echo "PROD deploy plan for sha $(git rev-parse HEAD)"
+          echo "  dispatched by : ${{ github.actor }}"
+          echo "  recorded on   : environment prod-z"
+          echo "  target        : NOT DEFINED - the PROD clouds root, unit and port are undecided"
+          echo "  status        : skeleton; no PROD action is possible from this run"
+
+      - name: Deploy to PROD
+        if: inputs.confirm == 'PROD_DEPLOY_ACK'
+        run: |
+          set -euo pipefail
+          SCRIPT="$GITHUB_WORKSPACE/scripts/deploy/moct-prod-deploy.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::error::PROD deploy script $SCRIPT does not exist yet - Pipeline 3 stays a skeleton and nothing was touched."
+            exit 1
+          fi
+          echo "::error::$SCRIPT exists but the PROD target is still undefined; refusing to run it."
+          exit 1
