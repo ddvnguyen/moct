@@ -34,6 +34,7 @@ import type { AddressInfo } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { isEntrypoint } from "./entrypoint.js";
 import { stateRoot } from "./domain/config.js";
 import { forbiddenDbPaths, wireShutdown, type ShutdownDeps } from "./mcp.js";
 import { TeamRoomStore } from "./team-room/store.js";
@@ -257,8 +258,10 @@ async function main(): Promise<void> {
 }
 
 // Run only when this module IS the entrypoint. Importing it (tests, harnesses)
-// must not open fleet.db or grab a port as a side effect.
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// must not open fleet.db or grab a port as a side effect. isEntrypoint compares
+// the realpath: the unit starts this file through the `current` symlink, and a
+// literal argv[1] comparison is false there, which silently skipped main().
+if (isEntrypoint(import.meta.url, process.argv[1])) {
   main().catch((exc) => {
     console.error(`fleet-backend: fatal: ${(exc as Error).message}`);
     process.exit(1);
