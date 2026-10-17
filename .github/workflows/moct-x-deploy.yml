@@ -1,0 +1,81 @@
+# Pipeline 1: ddvnguyen/moct -> MOCT-X (/mnt/workspace/clouds/moct-x, port 8210).
+#
+# Runs on the self-hosted runner ddvnguyen-moct.moct-clouds (labels
+# self-hosted,linux,x64,clouds). No secrets are read by this workflow: the
+# backend is loopback-only and unauthenticated by human decision, and the
+# registration token never reaches a job.
+#
+# Gates: install from the shared pnpm store, build, rewrite BUILD_INFO to the
+# serving sha, run the backend test suite. Then scripts/deploy/moct-x-deploy.sh
+# does the release packaging, the migration rehearsal on a copy, the backup, the
+# switch, the restart and the smoke, and rolls back on failure.
+name: moct-x-deploy
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'tests/**', 'package.json', 'package-lock.json', 'scripts/deploy/**']
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit sha to deploy (default: the ref you run from)'
+        required: false
+        type: string
+
+concurrency:
+  group: moct-x-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, x64, clouds]
+    timeout-minutes: 20
+    env:
+      CLOUDS_ROOT: /mnt/workspace/clouds
+      # One global store, same device as every node_modules on this runner.
+      PNPM_STORE_DIR: /mnt/workspace/pnpm-store
+      npm_config_store_dir: /mnt/workspace/pnpm-store
+      npm_config_package_import_method: hardlink
+      SERVICE: moct-x
+      PORT: '8210'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Resolve the sha being deployed
+        id: sha
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "deploying $SHA on $(hostname) as $(whoami)"
+          test "$(stat -c '%d' "$GITHUB_WORKSPACE")" = "$(stat -c '%d' "$PNPM_STORE_DIR")" \
+            && echo "store and workspace share a device — hardlinks will be used"
+
+      - name: Install from the shared pnpm store
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Deploy to MOCT-X
+        env:
+          RELEASE_SHA: ${{ steps.sha.outputs.sha }}
+          REPO_ROOT: ${{ github.workspace }}
+        run: ./scripts/deploy/moct-x-deploy.sh
+
+      - name: Post-deploy read
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "current -> $(readlink "$CLOUDS_ROOT/$SERVICE/current")"
+          curl -fsS "http://127.0.0.1:$PORT/health" \
+            | node -e 'const h=JSON.parse(require("node:fs").readFileSync(0,"utf8"));console.log("version",h.version,"sha",h.build.git_sha,"counts",JSON.stringify(h.counts))' \
+            || echo "MOCT-X did not answer /health (see the logs step)"
+          systemctl --user is-active "$SERVICE" || true
