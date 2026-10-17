@@ -80,7 +80,15 @@ rollback() {
       log "ROLLBACK: restored db from $LATEST"
     fi
   fi
-  systemctl --user restart "$SERVICE" 2>/dev/null || systemctl --user start "$SERVICE" 2>/dev/null || true
+  # Bring the unit back ONLY when there is a release to serve. Restarting on a
+  # first-deploy rollback starts the unit against an empty `current`, which with
+  # Restart=on-failure is a crash loop: run 39010151404 reached restart counter
+  # 89 on "Cannot find module .../current/dist/daemon.js" before it was stopped.
+  if [ -n "$PREV_RELEASE" ] && [ -d "$PREV_RELEASE" ]; then
+    systemctl --user restart "$SERVICE" 2>/dev/null || systemctl --user start "$SERVICE" 2>/dev/null || true
+  else
+    log "ROLLBACK: no previous release; leaving $SERVICE stopped"
+  fi
   log "ROLLBACK: done"
 }
 cleanup() { [ -n "$PREMIG_PID" ] && kill "$PREMIG_PID" 2>/dev/null; rm -rf "$SCRATCH"; return 0; }
@@ -171,17 +179,26 @@ if [ -f "$DB" ]; then
 else
   log "no live db yet — rehearsal will create a fresh one"
 fi
+# Boot the rehearsal the way the unit boots the release: through a `current`
+# symlink, with an absolute path. A relative `node dist/daemon.js` resolves to the
+# same string for argv[1] and import.meta.url, so it cannot see an entrypoint
+# guard that breaks on the unit's symlinked path - which is exactly how the silent
+# no-listener failure of run 39010151404 got past this rehearsal.
+ln -sfn "$RELDIR" "$SCRATCH/current"
 PREMIG_PORT="$(free_port)"
 (
-  cd "$RELDIR"
+  cd "$SCRATCH"
   ORCHESTRATION_BIND=127.0.0.1 ORCHESTRATION_PORT="$PREMIG_PORT" \
     FLEET_DB_PATH="$SCRATCH/moct.db" MCP_ORCH_STATE_DIR="$SCRATCH/state" \
-    MOCT_BACKUP_DIR="$SCRATCH/backups" exec node dist/daemon.js
+    MOCT_BACKUP_DIR="$SCRATCH/backups" exec node "$SCRATCH/current/dist/daemon.js"
 ) >"$LOGDIR/premig-$RELEASE_SHA.log" 2>&1 &
 PREMIG_PID=$!
 if ! wait_health "http://127.0.0.1:$PREMIG_PORT" 60; then
   kill "$PREMIG_PID" 2>/dev/null || true
-  die "migration rehearsal failed to boot; see $LOGDIR/premig-$RELEASE_SHA.log"
+  # The daemon's own last words are the only evidence for a silent exit: an
+  # entrypoint that ran nothing exits 0 and logs nothing at all.
+  tail -n 20 "$LOGDIR/premig-$RELEASE_SHA.log" >&2 || true
+  die "migration rehearsal failed to boot (see $LOGDIR/premig-$RELEASE_SHA.log)"
 fi
 check_health "$(curl -fsS "http://127.0.0.1:$PREMIG_PORT/health")" "$PKG_VERSION" "$RELEASE_SHA" \
   || { kill "$PREMIG_PID" 2>/dev/null || true; die "migration rehearsal health mismatch"; }
@@ -232,8 +249,22 @@ mv -T "$CURRENT.new" "$CURRENT"
 SWITCHED=1
 log "restarting $SERVICE"
 systemctl --user restart "$SERVICE"
+# Fail fast with the unit's own output. A daemon that exits immediately (bad
+# entrypoint, missing module, bad env) leaves the unit inactive, and waiting out
+# the full wait_health budget only produces "did not answer /health" with no
+# evidence: run 39010151404 burned 30s on exactly that, and the cause was only
+# visible in the unit's journal - which nothing dumped.
+for _ in 1 2 3 4 5 6; do
+  systemctl --user is-active --quiet "$SERVICE" && break
+  sleep 0.5
+done
+if ! systemctl --user is-active --quiet "$SERVICE"; then
+  journalctl --user -u "$SERVICE" -n 40 --no-pager >&2 || true
+  die "unit $SERVICE is not running after the restart (journal above)"
+fi
 if ! wait_health "$BASE_URL" 60; then
-  die "service did not answer /health after restart (see $LOGDIR)"
+  journalctl --user -u "$SERVICE" -n 40 --no-pager >&2 || true
+  die "service did not answer /health after restart (journal above; logs in $LOGDIR)"
 fi
 
 # --- 5. smoke ---------------------------------------------------------------

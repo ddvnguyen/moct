@@ -17,6 +17,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { pathToFileURL } from "node:url";
 import * as path from "node:path";
+import { isEntrypoint } from "./entrypoint.js";
 import { stateRoot } from "./domain/config.js";
 import { createFleetMcpServer } from "./surfaces/mcp/server.js";
 import { TursoRepository } from "./store/turso-repository.js";
@@ -101,7 +102,8 @@ async function main(): Promise<void> {
 
 // Run only when this module IS the entrypoint. Importing it (tests, harnesses)
 // must not open fleet.db, grab stdio, or install process handlers as a side effect.
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Same symlink caveat as daemon.ts: see entrypoint.ts.
+if (isEntrypoint(import.meta.url, process.argv[1])) {
   main().catch((exc) => {
     console.error(`fleet-backend: fatal: ${(exc as Error).message}`);
     process.exit(1);
