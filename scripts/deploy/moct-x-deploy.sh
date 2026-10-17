@@ -40,7 +40,17 @@ BASE_URL="http://127.0.0.1:$PORT"
 UNIT_FILE="/home/ddv/.config/systemd/user/$SERVICE.service"
 
 PKG_VERSION="$(node -p "require('$REPO_ROOT/package.json').version")"
-PREV_RELEASE="$(readlink -f "$CURRENT" 2>/dev/null || true)"
+# The previous release only counts when `current` is a symlink INTO releases/.
+# A pre-created empty placeholder directory resolves to itself under
+# `readlink -f`, and rolling back onto it fabricates a release path that never
+# existed (proved on the scratch root: `current -> releases/current`, dangling).
+PREV_RELEASE=""
+if [ -L "$CURRENT" ]; then
+  RESOLVED="$(readlink -f "$CURRENT" 2>/dev/null || true)"
+  case "$RESOLVED" in "$CLOUDS_ROOT/$SERVICE/releases/"*) PREV_RELEASE="$RESOLVED";; esac
+fi
+HAD_PLACEHOLDER=0
+[ -d "$CURRENT" ] && [ ! -L "$CURRENT" ] && HAD_PLACEHOLDER=1
 TOOK_BACKUP=0
 SWITCHED=0
 PREMIG_PID=""
@@ -55,6 +65,12 @@ rollback() {
     ln -sfn "releases/$(basename "$PREV_RELEASE")" "$CURRENT.new"
     mv -T "$CURRENT.new" "$CURRENT"
     log "ROLLBACK: current -> $PREV_RELEASE"
+  elif [ "$SWITCHED" = "1" ]; then
+    # First deploy: no previous release exists, so undo the switch instead of
+    # inventing one. Drop the symlink and put the empty placeholder back.
+    rm -f "$CURRENT"
+    [ "$HAD_PLACEHOLDER" = "1" ] && mkdir -p "$CURRENT"
+    log "ROLLBACK: no previous release; undid the switch and left current empty"
   fi
   if [ "$TOOK_BACKUP" = "1" ]; then
     LATEST="$(ls -1t "$BACKUPS"/moct-*.db 2>/dev/null | head -1 || true)"
@@ -199,6 +215,18 @@ fi
 
 # --- 4. switch current + restart -------------------------------------------
 log "switching current -> releases/$RELEASE_SHA"
+# The layout pre-creates `current` as an empty real directory, and `mv -T` of a
+# symlink onto a directory fails (first live run, 2026-10-17: "cannot overwrite
+# directory ... with non-directory"). rmdir only removes an EMPTY directory, so a
+# `current` holding real content aborts here with a FATAL and is never deleted.
+rm -f "$CURRENT.new"
+if [ -d "$CURRENT" ] && [ ! -L "$CURRENT" ]; then
+  if [ -n "$(ls -A "$CURRENT" 2>/dev/null)" ]; then
+    die "current is a non-empty directory; refusing to replace it: $CURRENT"
+  fi
+  rmdir "$CURRENT" || die "could not rmdir the empty placeholder $CURRENT"
+  log "removed the empty placeholder directory at $CURRENT"
+fi
 ln -sfn "releases/$RELEASE_SHA" "$CURRENT.new"
 mv -T "$CURRENT.new" "$CURRENT"
 SWITCHED=1
@@ -212,7 +240,10 @@ fi
 log "smoke on $BASE_URL"
 check_health "$(curl -fsS "$BASE_URL/health")" "$PKG_VERSION" "$RELEASE_SHA" || die "smoke: /health mismatch"
 curl -fsS "$BASE_URL/schema" | node -e 'const s=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(!s.ok||!s.tools.length) throw new Error("bad /schema payload"); process.stdout.write("[deploy] /schema tools: "+s.tools.length+"\n")' || die "smoke: /schema failed"
-curl -fsS "$BASE_URL/team/v1/operations/head" >/dev/null || die "smoke: /team/v1/operations/head failed"
+# workspaceId is required by the route (requireString -> 400 without it), and
+# TeamRoomStore.head returns 0 for a workspace with no operations, so any id
+# works: the smoke only proves the Team Room surface answers.
+curl -fsS "$BASE_URL/team/v1/operations/head?workspaceId=smoke" >/dev/null || die "smoke: /team/v1/operations/head failed"
 log "smoke green: version $PKG_VERSION, git_sha $RELEASE_SHA"
 
 # --- 6. prune ---------------------------------------------------------------
@@ -221,5 +252,10 @@ ls -1t "$CLOUDS_ROOT/$SERVICE/releases" | tail -n +"$((KEEP_RELEASES + 1))" | wh
   [ "$r" = "$CUR_NAME" ] && continue
   rm -rf "$CLOUDS_ROOT/$SERVICE/releases/$r"; log "pruned release $r"
 done
-ls -1t "$BACKUPS"/moct-*.db 2>/dev/null | tail -n +"$((KEEP_BACKUPS + 1))" | xargs -r rm --
+# Guard the glob: with no moct-*.db present (a first deploy takes no backup)
+# `ls` exits 2, and pipefail would turn this harmless line into a failed run
+# AFTER a green smoke, which then rolls back a healthy deploy.
+if ls -1t "$BACKUPS"/moct-*.db >/dev/null 2>&1; then
+  ls -1t "$BACKUPS"/moct-*.db | tail -n +"$((KEEP_BACKUPS + 1))" | xargs -r rm --
+fi
 log "deploy complete: $RELEASE_SHA live on $BASE_URL"
