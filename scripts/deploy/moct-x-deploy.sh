@@ -20,8 +20,10 @@
 # smoke -> roll back on failure -> prune.
 set -euo pipefail
 
-RELEASE_SHA="${RELEASE_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+# REPO_ROOT is defaulted first: RELEASE_SHA falls back to the checkout's HEAD,
+# so under `set -u` it must not read REPO_ROOT before the default exists.
 REPO_ROOT="${REPO_ROOT:-$PWD}"
+RELEASE_SHA="${RELEASE_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
 CLOUDS_ROOT="${CLOUDS_ROOT:-/mnt/workspace/clouds}"
 SERVICE="${SERVICE:-moct-x}"
 PORT="${PORT:-8210}"
@@ -65,21 +67,28 @@ rollback() {
   systemctl --user restart "$SERVICE" 2>/dev/null || systemctl --user start "$SERVICE" 2>/dev/null || true
   log "ROLLBACK: done"
 }
-on_error() {
+cleanup() { [ -n "$PREMIG_PID" ] && kill "$PREMIG_PID" 2>/dev/null; rm -rf "$SCRATCH"; return 0; }
+
+# Rollback runs on EVERY failing exit path, not just the ones an ERR trap can see.
+# die() calls `exit 1`, and bash never runs an ERR trap for `exit`, so an ERR-only
+# trap misses every post-switch failure: the wait_health timeout after the restart,
+# the /health mismatch, /schema and /team/v1/operations/head. The EXIT trap fires
+# on all exit paths, so the rollback decision (and nothing else) lives here. A
+# clean exit 0 skips the rollback entirely and only runs cleanup.
+on_exit() {
   rc=$?
   set +e
-  if [ "$SWITCHED" = "1" ]; then
-    rollback
-    log "deploy failed (exit $rc) and was rolled back; run marked failed"
-  else
-    log "deploy failed (exit $rc) before the switch; nothing live was changed"
+  if [ "$rc" -ne 0 ]; then
+    if [ "$SWITCHED" = "1" ]; then
+      rollback
+      log "deploy failed (exit $rc) and was rolled back; run marked failed"
+    else
+      log "deploy failed (exit $rc) before the switch; nothing live was changed"
+    fi
   fi
-  exit $rc
+  cleanup
 }
-trap on_error ERR
-
-cleanup() { [ -n "$PREMIG_PID" ] && kill "$PREMIG_PID" 2>/dev/null; rm -rf "$SCRATCH"; return 0; }
-trap cleanup EXIT
+trap on_exit EXIT
 
 free_port() {
   node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{const p=s.address().port;s.close(()=>process.stdout.write(String(p)))})'

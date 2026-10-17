@@ -14,7 +14,7 @@ name: moct-x-deploy
 on:
   push:
     branches: [main]
-    paths: ['src/**', 'tests/**', 'package.json', 'package-lock.json', 'scripts/deploy/**']
+    paths: ['src/**', 'tests/**', 'package.json', 'pnpm-lock.yaml', 'scripts/deploy/**']
   workflow_dispatch:
     inputs:
       sha:
@@ -56,7 +56,8 @@ jobs:
             && echo "store and workspace share a device — hardlinks will be used"
 
       - name: Install from the shared pnpm store
-        run: pnpm install --no-frozen-lockfile
+        # Frozen: the lockfile is committed, so a deploy always resolves the same tree.
+        run: pnpm install --frozen-lockfile
 
       - name: Build
         run: pnpm run build
