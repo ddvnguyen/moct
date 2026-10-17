@@ -89,10 +89,20 @@ journalctl --user -u moct-x -n 40 --no-pager
 - **Pipeline 1 - MOCT-X (:8210)**: live. See above.
 - **Pipeline 2 - fork to DSH-X (:3181)**: separate lane, owned by @DevWorker#03.
 - **Pipeline 3 - DSH-Z PROD**: skeleton only, `.github/workflows/moct-prod-deploy.yml`.
-  Dispatch-only; the job is skipped for any actor other than the human account; the deploy
-  step needs the typed `PROD_DEPLOY_ACK`; the `prod` runner label is advertised by no runner,
-  so an armed run cannot execute on any host; and the PROD script does not exist, so the step
-  dies with an explicit message. The `prod-z` environment exists (created 2026-10-17) but
-  carries no protection rule: required reviewers need a paid plan and the API refuses them on
-  this repo (422). Nothing can act on PROD until the human dispatches, and even then the run
-  has nowhere to land.
+  Dispatch-only, and the deploy step needs the typed `PROD_DEPLOY_ACK`. The barriers that
+  actually hold: the `prod` runner label is advertised by no runner, so even an armed run
+  queues forever and cannot execute on any host; and the PROD script does not exist, so the
+  step dies with an explicit message. The `github.actor == 'ddvnguyen'` check is NOT a gate -
+  `gh` on this host authenticates as `ddvnguyen`, the same account as the human, so any seat
+  here passes it; it only filters other GitHub accounts.
+
+  A true required-reviewer gate is not available on this repo: required-reviewer protection
+  rules need a paid plan (`PUT /environments/prod-z` -> 422) and branch protection on `main`
+  is refused the same way (403). The `prod-z` environment exists (created 2026-10-17) with no
+  protection rule, so deployments are recorded against it and one call adds the human as the
+  only required reviewer once the plan allows it. Paying for a plan or making the repo public
+  is the human's call.
+
+  Registering a `prod`-labelled runner, or adding `scripts/deploy/moct-prod-deploy.sh`, must
+  each be a separate, human-approved change: either one alone turns this skeleton into
+  something that can reach a live host.

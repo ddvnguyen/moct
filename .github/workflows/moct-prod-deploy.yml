@@ -1,22 +1,30 @@
 # Pipeline 3 (SKELETON): ddvnguyen/moct -> DSH-Z PROD.
 #
-# This workflow cannot act on PROD yet. Five independent things stop it:
-#   1. on: workflow_dispatch ONLY - no push, no pull_request, no schedule. A merge
-#      never starts it; only a human pressing the button does.
-#   2. the job runs only when github.actor is the human account (ddvnguyen). No agent
-#      or teammate account can produce a run that does anything; theirs is skipped.
-#   3. inputs.confirm must be the literal PROD_DEPLOY_ACK, typed at dispatch time.
-#   4. runs-on carries a `prod` label that NO runner advertises yet, so even an armed
-#      run cannot execute on any host. Change this label when - and only when - the
-#      PROD runner is registered.
-#   5. the PROD deploy script does not exist, and the deploy step dies with an explicit
+# This workflow cannot act on PROD yet. What actually stops it:
+#   1. on: workflow_dispatch ONLY - no push, no pull_request, no schedule. A merge never
+#      starts it; only a human pressing the button does.
+#   2. inputs.confirm must be the literal PROD_DEPLOY_ACK, typed at dispatch time.
+#   3. runs-on carries a `prod` label that NO runner advertises, so even an armed run
+#      cannot execute on any host - it queues forever. This is the strongest barrier:
+#      an approved dispatch still has nowhere to land.
+#   4. the PROD deploy script does not exist, and the deploy step dies with an explicit
 #      message while it is missing.
 #
-# environment: prod-z exists (created 2026-10-17) so deployments are recorded against
-# it. It is NOT the gate: a required-reviewer protection rule needs a paid plan and the
-# API refuses it on this repo (PUT /environments/prod-z -> 422 "Please ensure the billing
-# plan supports the required reviewers protection rule"). When the plan allows it, one
-# call adds the human as the only required reviewer and gate 2 becomes redundant.
+# The actor check below is NOT a security gate and must not be read as one: `gh` on this
+# host authenticates as ddvnguyen, the same account as the human, so any seat using this
+# host's gh passes `github.actor == 'ddvnguyen'`. It only filters OTHER GitHub accounts.
+#
+# A true required-reviewer gate is NOT available on this repo: a required-reviewer
+# protection rule needs a paid plan (PUT /environments/prod-z -> 422 "Please ensure the
+# billing plan supports the required reviewers protection rule"), and branch protection
+# on main is refused the same way (403 "Upgrade to GitHub Pro or make this repository
+# public"). Paying for a plan or making the repo public is the human's call. environment:
+# prod-z exists (created 2026-10-17) so deployments are recorded against it, and one call
+# adds the human as the only required reviewer once the plan allows it.
+#
+# Registering a `prod`-labelled runner, or adding scripts/deploy/moct-prod-deploy.sh, must
+# each be a SEPARATE, HUMAN-APPROVED change. Either one on its own turns this skeleton
+# into something that can reach a live host, so neither belongs in a routine PR.
 #
 # Deliberately absent: the PROD port, the PROD clouds root and any PROD database path.
 # Those are the human's call and are not guessed here, so nothing in this file could
@@ -45,11 +53,11 @@ permissions:
 
 jobs:
   prod-deploy:
-    # Gate 2: only the human's own account can produce a run that does anything.
+    # Not a gate: gh here authenticates as ddvnguyen, so this only filters other accounts.
     if: github.actor == 'ddvnguyen'
     environment: prod-z
-    # Gate 4: no runner carries the `prod` label, so an armed run queues forever
-    # instead of landing on a host that serves live data.
+    # The real barrier: no runner carries the `prod` label, so an armed run queues
+    # forever instead of landing on a host that serves live data.
     runs-on: [self-hosted, linux, x64, prod]
     timeout-minutes: 20
     env:
