@@ -1,0 +1,94 @@
+# Pipeline 3 (SKELETON): ddvnguyen/moct -> DSH-Z PROD.
+#
+# This workflow cannot act on PROD yet. What actually stops it:
+#   1. on: workflow_dispatch ONLY - no push, no pull_request, no schedule. A merge never
+#      starts it; only a human pressing the button does.
+#   2. inputs.confirm must be the literal PROD_DEPLOY_ACK, typed at dispatch time.
+#   3. runs-on carries a `prod` label that NO runner advertises, so even an armed run
+#      cannot execute on any host - it queues forever. This is the strongest barrier:
+#      an approved dispatch still has nowhere to land.
+#   4. the PROD deploy script does not exist, and the deploy step dies with an explicit
+#      message while it is missing.
+#
+# The actor check below is NOT a security gate and must not be read as one: `gh` on this
+# host authenticates as ddvnguyen, the same account as the human, so any seat using this
+# host's gh passes `github.actor == 'ddvnguyen'`. It only filters OTHER GitHub accounts.
+#
+# A true required-reviewer gate is NOT available on this repo: a required-reviewer
+# protection rule needs a paid plan (PUT /environments/prod-z -> 422 "Please ensure the
+# billing plan supports the required reviewers protection rule"), and branch protection
+# on main is refused the same way (403 "Upgrade to GitHub Pro or make this repository
+# public"). Paying for a plan or making the repo public is the human's call. environment:
+# prod-z exists (created 2026-10-17) so deployments are recorded against it, and one call
+# adds the human as the only required reviewer once the plan allows it.
+#
+# Registering a `prod`-labelled runner, or adding scripts/deploy/moct-prod-deploy.sh, must
+# each be a SEPARATE, HUMAN-APPROVED change. Either one on its own turns this skeleton
+# into something that can reach a live host, so neither belongs in a routine PR.
+#
+# Deliberately absent: the PROD port, the PROD clouds root and any PROD database path.
+# Those are the human's call and are not guessed here, so nothing in this file could
+# reach :3080 or PROD data by accident.
+name: moct-prod-deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit sha to deploy (must already be merged to main)'
+        required: true
+        type: string
+      confirm:
+        description: 'Type PROD_DEPLOY_ACK to arm the deploy step'
+        required: true
+        default: ''
+        type: string
+
+concurrency:
+  group: moct-prod-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prod-deploy:
+    # Not a gate: gh here authenticates as ddvnguyen, so this only filters other accounts.
+    if: github.actor == 'ddvnguyen'
+    environment: prod-z
+    # The real barrier: no runner carries the `prod` label, so an armed run queues
+    # forever instead of landing on a host that serves live data.
+    runs-on: [self-hosted, linux, x64, prod]
+    timeout-minutes: 20
+    env:
+      CLOUDS_ROOT: /mnt/workspace/clouds
+      PNPM_STORE_DIR: /mnt/workspace/pnpm-store
+      npm_config_store_dir: /mnt/workspace/pnpm-store
+      npm_config_package_import_method: hardlink
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 1
+
+      - name: Plan - what this run would do
+        run: |
+          set -euo pipefail
+          echo "PROD deploy plan for sha $(git rev-parse HEAD)"
+          echo "  dispatched by : ${{ github.actor }}"
+          echo "  recorded on   : environment prod-z"
+          echo "  target        : NOT DEFINED - the PROD clouds root, unit and port are undecided"
+          echo "  status        : skeleton; no PROD action is possible from this run"
+
+      - name: Deploy to PROD
+        if: inputs.confirm == 'PROD_DEPLOY_ACK'
+        run: |
+          set -euo pipefail
+          SCRIPT="$GITHUB_WORKSPACE/scripts/deploy/moct-prod-deploy.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::error::PROD deploy script $SCRIPT does not exist yet - Pipeline 3 stays a skeleton and nothing was touched."
+            exit 1
+          fi
+          echo "::error::$SCRIPT exists but the PROD target is still undefined; refusing to run it."
+          exit 1
