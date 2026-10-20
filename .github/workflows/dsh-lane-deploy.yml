@@ -233,5 +233,14 @@ jobs:
               if (version === "MISSING") bad++;
               console.log(`${p.name}  installed=${version}  spec=${spec}`);
             }
-            if (bad) { console.error(`${bad} expected package(s) are not installed`); process.exit(1); }
+            // The @ddvnguyen scope must be exactly the manifest set: an extra
+            // entry is an obsolete package left in the profile.
+            const wanted = new Set(packages.map(p => p.name));
+            for (const name of Object.keys(deps)) {
+              if (!name.startsWith("@ddvnguyen/")) continue;
+              if (wanted.has(name)) continue;
+              console.error(`OBSOLETE ${name} is still in the profile`);
+              bad++;
+            }
+            if (bad) { console.error(`${bad} problem(s) with the installed package set`); process.exit(1); }
           ' "$PROFILE_DIR"
