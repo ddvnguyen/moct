@@ -218,7 +218,17 @@ jobs:
         run: |
           set -euo pipefail
           echo "--- lane root"
-          curl -fsS -o /dev/null -w 'GET / -> %{http_code}\n' "http://127.0.0.1:$PORT/"
+          # The lane serves its UI behind the session token it publishes in its
+          # own journal ("dsh web: http://0.0.0.0:<port>/?token=..."), so a
+          # bare GET / answers 401. Read the token this boot published.
+          TOKEN="$(journalctl --user -u "dsh-${{ inputs.lane }}.service" -n 300 --no-pager \
+            | grep -o 'token=[A-Za-z0-9_-]*' | tail -n 1 | cut -d= -f2 || true)"
+          if [ -n "$TOKEN" ]; then
+            curl -fsS -o /dev/null -w "GET / -> %{http_code}\n" "http://127.0.0.1:$PORT/?token=$TOKEN"
+          else
+            echo "the lane published no session token in its journal - checking the listener only"
+            curl -sS -o /dev/null -w "GET / -> %{http_code}\n" "http://127.0.0.1:$PORT/" || true
+          fi
           echo "--- installed packages"
           node -e '
             const fs = require("node:fs");
