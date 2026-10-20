@@ -21,6 +21,10 @@ on:
         description: 'Commit sha to deploy (default: the ref you run from)'
         required: false
         type: string
+      ref:
+        description: 'Branch or tag to deploy (e.g. integration, snapshot/20Oct26). Default: the ref you run from.'
+        required: false
+        type: string
 
 concurrency:
   group: moct-x-deploy
@@ -42,7 +46,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.sha || github.sha }}
+          # `ref` pins the deploy to a branch or a snapshot tag; `sha` stays
+          # for the sha-only dispatch; the default is the ref the run is from.
+          ref: ${{ inputs.ref || inputs.sha || github.sha }}
           fetch-depth: 1
 
       - name: Resolve the sha being deployed

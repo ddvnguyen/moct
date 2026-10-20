@@ -1,0 +1,232 @@
+# DSH lane deploy — driven from the train owner (this repo).
+#
+# One dispatch installs one lane. The lane root is
+# /mnt/workspace/clouds/dsh-<lane>; the lane profile is
+# <lane-root>/data/home/profiles/web.
+#
+# The deploy code NEVER comes from the dispatched product sha:
+#   product/        the fork at the resolved product sha (the thing being served)
+#   deploy-scripts/ the fork's REVIEWED integration branch (the deploy code)
+#   harness-pin/    the fork at the pinned harness sha (the fork script's
+#                   HARNESS_ROOT; its HEAD must equal HARNESS_SHA_EXPECT)
+#   plugins/        the plugins repo at the resolved plugins sha
+#
+# Order: resolve the shas -> check out -> build the product -> install the DSH
+# customizations into the lane profile (packages + codex-ui patch) -> run the
+# fork's release deploy (which switches, restarts and smokes the lane) ->
+# verify the lane answers and the expected package versions are installed.
+#
+# No sudo, no secrets: the lane is loopback-only and the token used here is
+# the built-in GITHUB_TOKEN.
+name: dsh-lane-deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'Lane to deploy'
+        required: true
+        type: choice
+        default: 'x'
+        options: [x, z]
+      ref:
+        description: 'Logical ref to deploy: integration (alpha), stable (released) or snapshot (with the date input)'
+        required: true
+        type: choice
+        default: 'integration'
+        options: [integration, stable, snapshot]
+      date:
+        description: 'Snapshot date token (ddMMyy, e.g. 20Oct26). Only used when ref = snapshot.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Rehearse only: print the plan, change nothing'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: dsh-lane-deploy-${{ inputs.lane }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: dsh-lane-deploy
+    runs-on: [self-hosted, linux, x64, clouds]
+    timeout-minutes: 180
+    env:
+      LANE: ${{ inputs.lane }}
+      GH_TOKEN: ${{ github.token }}
+      CLOUDS_ROOT: /mnt/workspace/clouds
+      # The pinned harness generation the fork script records in the release
+      # manifest (see the fork's .github/workflows/deploy-dsh.yml).
+      HARNESS_SHA: 19caaf271abf0d380f48d125b1d9548a53be8793
+    steps:
+      - name: Checkout the train owner (this repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.28.5
+
+      - name: Resolve the logical ref to shas
+        id: resolve
+        run: |
+          set -euo pipefail
+          REF="${{ inputs.ref }}"
+          DATE="${{ inputs.date }}"
+          case "$REF" in
+            integration|stable) : ;;
+            snapshot) : ;;
+            *) echo "unknown ref '$REF'" >&2; exit 2 ;;
+          esac
+          if [ "$REF" = "snapshot" ]; then
+            if ! printf '%s' "$DATE" | grep -Eq '^[0-9]{2}[A-Z][a-z]{2}[0-9]{2}$'; then
+              echo "ref=snapshot needs a date input in the ddMMyy shape (20Oct26), got '${DATE:-unset}'" >&2
+              exit 2
+            fi
+            TOKEN="$DATE"
+          else
+            TOKEN=""
+          fi
+          # The branch each released/integration ref maps to comes from
+          # deploy/train-repos.json, the train's single source of truth.
+          BRANCHES="$(node -e '
+            const fs = require("node:fs");
+            const m = JSON.parse(fs.readFileSync("deploy/train-repos.json", "utf8"));
+            const logical = process.argv[1];
+            const branch = (e) => logical === "stable" ? e.stable : e.integration;
+            process.stdout.write([branch(m.repos.dsh), branch(m.repos.plugins)].join(" "));
+          ' "$REF")"
+          FORK_BRANCH="${BRANCHES%% *}"
+          PLUGINS_BRANCH="${BRANCHES##* }"
+          resolve_sha() { # $1 = repo, $2 = branch, $3 = tag ("" for a branch)
+            local repo="$1" branch="$2" tag="$3" out=""
+            if [ -n "$tag" ]; then
+              out="$(git ls-remote "https://github.com/$repo" "refs/tags/$tag^{}" 2>/dev/null | head -n 1 | cut -f1 || true)"
+              [ -n "$out" ] || out="$(git ls-remote "https://github.com/$repo" "refs/tags/$tag" 2>/dev/null | head -n 1 | cut -f1 || true)"
+            else
+              out="$(git ls-remote "https://github.com/$repo" "refs/heads/$branch" 2>/dev/null | head -n 1 | cut -f1 || true)"
+            fi
+            if [ -z "$out" ]; then
+              echo "ref '${tag:-$branch}' not found in $repo" >&2
+              exit 3
+            fi
+            printf '%s' "$out"
+          }
+          FORK_SHA="$(resolve_sha ddvnguyen/deepseek-harness "$FORK_BRANCH" "$TOKEN")"
+          PLUGINS_SHA="$(resolve_sha ddvnguyen/moct-dsh-team-room "$PLUGINS_BRANCH" "$TOKEN")"
+          echo "ref=$REF"
+          echo "fork branch=$FORK_BRANCH sha=$FORK_SHA"
+          echo "plugins branch=$PLUGINS_BRANCH sha=$PLUGINS_SHA"
+          echo "fork_sha=$FORK_SHA" >> "$GITHUB_OUTPUT"
+          echo "plugins_sha=$PLUGINS_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the fork at the product sha
+        uses: actions/checkout@v4
+        with:
+          repository: ddvnguyen/deepseek-harness
+          ref: ${{ steps.resolve.outputs.fork_sha }}
+          path: product
+          persist-credentials: false
+
+      - name: Checkout the reviewed fork ref (the deploy code)
+        uses: actions/checkout@v4
+        with:
+          repository: ddvnguyen/deepseek-harness
+          ref: integration
+          path: deploy-scripts
+          persist-credentials: false
+
+      - name: Checkout the pinned harness generation
+        uses: actions/checkout@v4
+        with:
+          repository: ddvnguyen/deepseek-harness
+          ref: ${{ env.HARNESS_SHA }}
+          path: harness-pin
+          persist-credentials: false
+
+      - name: Checkout the plugins repo at the plugins sha
+        uses: actions/checkout@v4
+        with:
+          repository: ddvnguyen/moct-dsh-team-room
+          ref: ${{ steps.resolve.outputs.plugins_sha }}
+          path: plugins
+          persist-credentials: false
+
+      - name: Build the product
+        working-directory: product
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Install the DSH customizations into the lane profile
+        env:
+          PLUGINS_ROOT: ${{ github.workspace }}/plugins
+          PATCH_SCRIPT: ${{ github.workspace }}/deploy-scripts/scripts/deploy/codex-ui-sidebar-patch/apply.mjs
+          DSH_ROOT: /mnt/workspace/clouds/dsh-${{ inputs.lane }}
+          PROFILE_DIR: /mnt/workspace/clouds/dsh-${{ inputs.lane }}/data/home/profiles/web
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          # The plugins repo resolves its harness sibling by that name; the
+          # product checkout IS the harness, so it is linked under that name.
+          DSH_HARNESS_DIR: deepseek-harness
+        run: |
+          set -euo pipefail
+          ln -sfn "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/deepseek-harness"
+          ./scripts/deploy/dsh-customizations-deploy.sh
+
+      - name: Deploy the lane (release switch, restart, smoke)
+        working-directory: ${{ github.workspace }}
+        env:
+          TARGET: ${{ inputs.lane }}
+          REPO_ROOT: ${{ github.workspace }}/product
+          HARNESS_ROOT: ${{ github.workspace }}/harness-pin
+          HARNESS_SHA_EXPECT: ${{ env.HARNESS_SHA }}
+          TRUSTED_HOST: dsh-${{ inputs.lane }}.ddvnguyen.com
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          CLOUDS_ROOT: ${{ env.CLOUDS_ROOT }}
+          SERVICE: dsh-${{ inputs.lane }}
+          PORT: ${{ inputs.lane == 'x' && '3181' || '3180' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          bash deploy-scripts/scripts/deploy/dsh-deploy.sh
+
+      - name: Verify the lane and the installed package versions
+        if: ${{ !inputs.dry_run }}
+        env:
+          PORT: ${{ inputs.lane == 'x' && '3181' || '3180' }}
+          PROFILE_DIR: /mnt/workspace/clouds/dsh-${{ inputs.lane }}/data/home/profiles/web
+        run: |
+          set -euo pipefail
+          echo "--- lane root"
+          curl -fsS -o /dev/null -w 'GET / -> %{http_code}\n' "http://127.0.0.1:$PORT/"
+          echo "--- installed packages"
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const profile = process.argv[1];
+            const manifest = JSON.parse(fs.readFileSync("deploy/dsh-customizations.json", "utf8"));
+            const pkg = JSON.parse(fs.readFileSync(path.join(profile, "package.json"), "utf8"));
+            const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies);
+            const packages = manifest.repos[0].packages;
+            let bad = 0;
+            for (const p of packages) {
+              const installedPath = path.join(profile, "node_modules", p.name, "package.json");
+              const version = fs.existsSync(installedPath)
+                ? JSON.parse(fs.readFileSync(installedPath, "utf8")).version
+                : "MISSING";
+              const spec = deps[p.name] || "MISSING";
+              if (version === "MISSING") bad++;
+              console.log(`${p.name}  installed=${version}  spec=${spec}`);
+            }
+            if (bad) { console.error(`${bad} expected package(s) are not installed`); process.exit(1); }
+          ' "$PROFILE_DIR"
