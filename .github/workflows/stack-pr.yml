@@ -175,7 +175,7 @@ jobs:
         run: |
           set -euo pipefail
           PR="${{ steps.pr.outputs.number }}"
-          STACK="$(gh pr list --base "$HEAD_BRANCH" --state all --limit 50 --json number,title,state,mergedAt,reviewDecision,statusCheckRollup)"
+          STACK="$(gh pr list --base "$HEAD_BRANCH" --state open --limit 50 --json number,title,state,mergedAt,reviewDecision,statusCheckRollup)"
           RESULT="$(printf '%s' "$STACK" | node -e '
             let s = "";
             process.stdin.on("data", d => s += d).on("end", () => {
