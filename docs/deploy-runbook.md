@@ -81,24 +81,30 @@ name is the required status check on `main` and on `integration`. It runs
 concurrency group that cancels superseded runs on the same ref.
 
 The review round: a feature PR goes to `integration`, the `ci` check must be
-green and one approving review is required. The stack PR then carries the
-whole reviewed set to the released branch.
+green, and the Lead or the Architect agent reviews it. The stack PR then
+carries the whole reviewed set to the released branch.
 
-**The reviewer's identity is part of the gate.** GitHub refuses an approving
-review when the reviewer is the PR's author. The human and the agents share
-the `ddvnguyen` account here, so an agent that pushes under that account
-would make the PR unreviewable by anyone. An implementing agent therefore
-commits under an identity that is *not* the account, for example:
+**One account, so the review is a process rule, not a GitHub gate.** The
+human and every agent share the `ddvnguyen` account here, and GitHub refuses
+an approving review from the PR's author — `POST /pulls/{n}/reviews` with
+`event=APPROVE` answers `422 "Review Can not approve your own pull request"`.
+With one account that refusal applies to the human's own PR as well, so a
+required-review rule would leave **every** PR unmergeable, with no path to
+green. The protection rules therefore require the `ci` check, no direct push,
+no force push and no branch deletion, and the review is enforced by process:
 
-```sh
-git config --worktree user.name "Multica Agent"
-git config --worktree user.email "agent@multica.local"
-```
+- the implementing agent asks for review by mentioning the Lead or the
+  Architect agent (an agent mention enqueues the review round; a member
+  mention notifies nobody);
+- the reviewer posts the verdict as a PR comment and a summary in the Multica
+  thread — a comment, not a GitHub approval, because an approval is refused;
+- the process rule on top: an implementer never reviews its own PR.
 
-With that identity the commits are unlinked on GitHub, and the `ddvnguyen`
-account (the human, or the reviewing agent) can approve the PR. The process
-rule on top of it: an implementer never approves its own PR — only the Lead
-or the Architect agent is asked.
+**What a second account changes.** With a second GitHub account (or a GitHub
+App token) the review becomes a platform gate again: one `PUT` adds
+`required_pull_request_reviews` to the two branches, the reviewer approves
+normally, and the stack guard's auto-merge path below opens. Until then the
+owner merges the stack PR by hand.
 
 The **stack guard** in `stack-pr.yml` decides whether the stack PR is
 auto-mergeable: every implementation PR in the stack must be merged, or must
@@ -106,7 +112,9 @@ carry an approving review **and** a green `ci` check. Otherwise the blocking
 PRs are listed in the job output and a human merges. The workflow then asks
 for auto-merge with `gh pr merge --auto`; if GitHub refuses, the job **fails
 loudly** with that reason instead of pretending the merge is queued.
-`allow_auto_merge` is enabled on the three repositories of the train.
+`allow_auto_merge` is enabled on the three repositories of the train, but the
+guard will not pass while no PR can carry an approving review — so the
+expected path today is: the guard lists the blocking PRs, the owner merges.
 
 ## The lane map
 
@@ -376,9 +384,11 @@ every post-switch failure (the health timeout, the `/health` mismatch,
   It only filters other GitHub accounts.
 - Required-reviewer protection is available on this repo (the repository is
   public, so a protection `PUT` succeeds) and the integrator applies it: the
-  released branch and `integration` require one approving review plus the CI
-  check, no direct push, no force push and no branch deletion. The API accepts
+  released branch and `integration` require the CI check, and refuse direct
+  pushes, force pushes and branch deletions. Two things are **not** enforced
+  here and must not be relied on: a required approving review (one shared
+  account — GitHub refuses the approval, so the rule would block every PR) and
+  conversation resolution (the API accepts
   `required_conversation_resolution_enabled` on this repository and answers
   `200`, but the resulting rule still reports
-  `required_conversation_resolution.enabled = false` — so conversation
-  resolution is **not** enforced here and must not be relied on.
+  `required_conversation_resolution.enabled = false`).
