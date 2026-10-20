@@ -5,7 +5,10 @@
 # <lane-root>/data/home/profiles/web.
 #
 # The deploy code NEVER comes from the dispatched product sha:
-#   product/        the fork at the resolved product sha (the thing being served)
+#   deepseek-harness/ the fork at the resolved product sha (the thing being
+#                   served AND the plugins repo's harness sibling: the plugins
+#                   compile against its sources, so it must be a real
+#                   directory next to the plugins checkout)
 #   deploy-scripts/ the fork's REVIEWED integration branch (the release deploy
 #                   script, scripts/deploy/dsh-deploy.sh)
 #   harness-pin/    the fork at the pinned harness sha (the fork script's
@@ -132,12 +135,12 @@ jobs:
           echo "fork_sha=$FORK_SHA" >> "$GITHUB_OUTPUT"
           echo "plugins_sha=$PLUGINS_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the fork at the product sha
+      - name: Checkout the fork at the product sha (real directory, named like the plugins repo's harness sibling)
         uses: actions/checkout@v4
         with:
           repository: ddvnguyen/deepseek-harness
           ref: ${{ steps.resolve.outputs.fork_sha }}
-          path: product
+          path: deepseek-harness
           persist-credentials: false
 
       - name: Checkout the reviewed fork ref (the deploy code)
@@ -165,7 +168,7 @@ jobs:
           persist-credentials: false
 
       - name: Build the product
-        working-directory: product
+        working-directory: deepseek-harness
         run: |
           set -euo pipefail
           pnpm install --frozen-lockfile
@@ -178,11 +181,13 @@ jobs:
           PROFILE_DIR: /mnt/workspace/clouds/dsh-${{ inputs.lane }}/data/home/profiles/web
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           # The plugins repo resolves its harness sibling by that name; the
-          # product checkout IS the harness, so it is linked under that name.
+          # product checkout IS the harness and lives next to the plugins
+          # checkout under that name. It must be a real directory, not a
+          # symlink: the tsconfig facades resolve to the sibling's real path
+          # and a symlink makes the TypeScript rootDir check fail.
           DSH_HARNESS_DIR: deepseek-harness
         run: |
           set -euo pipefail
-          ln -sfn "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/deepseek-harness"
           # The codex-ui applier comes from the plugins checkout (the manifest
           # names its path); the deploy-scripts checkout only carries the
           # fork's release deploy script.
@@ -192,7 +197,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         env:
           TARGET: ${{ inputs.lane }}
-          REPO_ROOT: ${{ github.workspace }}/product
+          REPO_ROOT: ${{ github.workspace }}/deepseek-harness
           HARNESS_ROOT: ${{ github.workspace }}/harness-pin
           HARNESS_SHA_EXPECT: ${{ env.HARNESS_SHA }}
           TRUSTED_HOST: dsh-${{ inputs.lane }}.ddvnguyen.com

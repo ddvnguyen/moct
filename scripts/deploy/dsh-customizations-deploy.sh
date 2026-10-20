@@ -14,8 +14,12 @@
 #   ARTIFACTS_DIR tarball dir                default: $DSH_ROOT/artifacts
 #   DRY_RUN       1 = print the plan, change nothing   default: 0
 #
-# DSH_HARNESS_DIR is passed through untouched: the plugins repo resolves its
-# sibling harness checkout (type facades, tsdown) through that variable.
+#   DSH_HARNESS_DIR name of the plugins repo's harness sibling checkout
+#                 default: deepseek-harness, next to the plugins checkout
+#
+# The plugins repo resolves its sibling harness checkout through that name (the
+# type facades point at the sibling's sources). The sibling must be a real
+# directory — see harness_sibling() below.
 #
 # The manifest (deploy/dsh-customizations.json) is the single source of truth:
 # it lists the packages, the patch target and the patch script. The codex-ui
@@ -121,11 +125,47 @@ install_deps() {
   ( cd "$PLUGINS_ROOT" && pnpm install --frozen-lockfile ) || die "pnpm install failed in $PLUGINS_ROOT"
 }
 
+# The plugins repo compiles against a sibling `deepseek-harness` checkout: its
+# tsconfig facades point at that sibling's sources, and the sibling must be a
+# REAL directory. A symlink to the product checkout resolves to its real path
+# and the TypeScript rootDir check then fails with TS6059 ("file is not under
+# rootDir"), because the facades and the program disagree about the root.
+# The lane deploy therefore checks the product out as a real directory named
+# `deepseek-harness`, next to the plugins checkout.
+harness_sibling() {
+  local name="${DSH_HARNESS_DIR:-deepseek-harness}"
+  local dir
+  dir="$(cd "$PLUGINS_ROOT/.." && pwd)/$name"
+  [ -d "$dir" ] || die "the plugins repo needs its harness sibling '$name' at $dir (the lane deploy checks the product out there); it is missing"
+  printf '%s' "$dir"
+}
+
+# The plugins repo's own build recipe, in the order its CI uses it: link the
+# harness packages into the repo, regenerate the tsconfig facades against the
+# sibling, then build.
+prepare_plugins_repo() {
+  local repo="$PLUGINS_ROOT"
+  if [ -f "$repo/scripts/link-harness-packages.mjs" ]; then
+    log "linking the harness packages into the plugins repo"
+    ( cd "$repo" && node scripts/link-harness-packages.mjs ) || die "link-harness-packages.mjs failed"
+  fi
+  if [ -f "$repo/scripts/sync-paths.mjs" ]; then
+    log "regenerating the tsconfig path facades against the harness sibling"
+    ( cd "$repo" && node scripts/sync-paths.mjs ) || die "sync-paths.mjs failed"
+  fi
+}
+
 build_and_pack() { # $1 = manifest dir, $2 = package name -> "<name>\t<version>\t<tarball>"
   local dir="$1" name="$2" pkg_dir="$PLUGINS_ROOT/$1" version tarball packed
   [ -d "$pkg_dir" ] || die "package directory not found: $pkg_dir (for $name)"
   [ -f "$pkg_dir/package.json" ] || die "no package.json in $pkg_dir (for $name)"
   version="$(node -p "require('$pkg_dir/package.json').version")" || die "cannot read the version of $name"
+  # The repo root package builds the workspace (its own build script compiles
+  # every workspace package, the Team Room bundle and the sidebar plugin), so
+  # it runs the repo's recipe first.
+  if [ "$dir" = "." ]; then
+    prepare_plugins_repo
+  fi
   if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$pkg_dir/package.json"; then
     log "building $name ($dir)"
     ( cd "$pkg_dir" && npm run build ) || die "build failed for $name in $pkg_dir"
