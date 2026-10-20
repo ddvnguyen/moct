@@ -315,6 +315,32 @@ rewrite_deps() {
         console.log("removed obsolete dependency " + name + " from " + field);
       }
     }
+    // The profile also lists its bundles: `dsh.profile.bundles` names the
+    // packages the DSH loads at boot. An obsolete entry there is not a
+    // warning-free leftover - the boot logs "skipping profile bundle" for it
+    // and the plugin never loads. The bundle list is pruned with the
+    // dependencies.
+    const bundles = pkg.dsh && pkg.dsh.profile && pkg.dsh.profile.bundles;
+    if (Array.isArray(bundles)) {
+      const kept = bundles.filter((name) => {
+        if (!name.startsWith("@ddvnguyen/")) return true;
+        if (wanted.has(name)) return true;
+        removed++;
+        console.log("removed obsolete profile bundle " + name);
+        return false;
+      });
+      // Every package of the manifest must also be listed as a bundle: the
+      // DSH loads a plugin row from that list, and a package that is
+      // installed but not listed never loads.
+      for (const name of wanted) {
+        if (!kept.includes(name)) {
+          kept.push(name);
+          changed++;
+          console.log("added profile bundle " + name);
+        }
+      }
+      pkg.dsh.profile.bundles = kept;
+    }
     fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
     console.log("rewrote " + changed + " dependency entries, removed " + removed + " obsolete ones");
   ' "$PROFILE_DIR/package.json" "$(printf '%s\n' "$PACKED" | node -e '
@@ -381,6 +407,21 @@ verify() {
     for (const name of extra) {
       console.log("OBSOLETE  " + name + " is still in the profile and is not in the manifest");
       bad++;
+    }
+    // The bundle list names the packages the DSH loads at boot: an obsolete
+    // entry there boots as "skipping profile bundle" and never loads.
+    const bundles = (pkg.dsh && pkg.dsh.profile && pkg.dsh.profile.bundles) || [];
+    for (const name of bundles) {
+      if (!name.startsWith("@ddvnguyen/")) continue;
+      if (wanted.has(name)) continue;
+      console.log("OBSOLETE BUNDLE  " + name + " is still in dsh.profile.bundles and is not in the manifest");
+      bad++;
+    }
+    for (const [name] of pairs) {
+      if (!bundles.includes(name)) {
+        console.log("MISSING BUNDLE  " + name + " is installed but not listed in dsh.profile.bundles");
+        bad++;
+      }
     }
     process.exit(bad ? 1 : 0);
   ' "$PROFILE_DIR" "$(printf '%s\n' "$PACKED" | node -e '
