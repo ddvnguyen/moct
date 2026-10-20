@@ -219,16 +219,25 @@ jobs:
           set -euo pipefail
           echo "--- lane root"
           # The lane serves its UI behind the session token it publishes in its
-          # own journal ("dsh web: http://0.0.0.0:<port>/?token=..."), so a
-          # bare GET / answers 401. Read the token this boot published.
-          TOKEN="$(journalctl --user -u "dsh-${{ inputs.lane }}.service" -n 300 --no-pager \
-            | grep -o 'token=[A-Za-z0-9_-]*' | tail -n 1 | cut -d= -f2 || true)"
-          if [ -n "$TOKEN" ]; then
-            curl -fsS -o /dev/null -w "GET / -> %{http_code}\n" "http://127.0.0.1:$PORT/?token=$TOKEN"
-          else
-            echo "the lane published no session token in its journal - checking the listener only"
-            curl -sS -o /dev/null -w "GET / -> %{http_code}\n" "http://127.0.0.1:$PORT/" || true
+          # own journal, and it binds the address its unit names (the harness
+          # refuses a wildcard bind, so the unit pins one concrete address).
+          # Take the URL the lane published for THIS boot; fall back to the
+          # unit's --host address.
+          URL="$(journalctl --user -u "dsh-${{ inputs.lane }}.service" -n 300 --no-pager \
+            | grep -o 'http://[0-9A-Za-z._:/?=&-]*' | tail -n 1 || true)"
+          if [ -z "$URL" ]; then
+            UNIT="/home/ddv/.config/systemd/user/dsh-${{ inputs.lane }}.service"
+            HOST="$(sed -n 's/.*--host \([^ ]*\) .*/\1/p' "$UNIT" 2>/dev/null | head -1 || true)"
+            [ -n "$HOST" ] || HOST=127.0.0.1
+            URL="http://$HOST:$PORT/"
           fi
+          echo "lane url: $URL"
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' "$URL" || true)"
+          echo "GET / -> $CODE"
+          case "$CODE" in
+            200|303) : ;;
+            *) echo "the lane did not answer $URL with a success code (got $CODE)" >&2; exit 1 ;;
+          esac
           echo "--- installed packages"
           node -e '
             const fs = require("node:fs");
