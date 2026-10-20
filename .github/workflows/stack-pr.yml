@@ -48,20 +48,30 @@ jobs:
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           git fetch --no-tags origin "$BASE" "$HEAD_BRANCH"
           AHEAD="$(git rev-list --count "origin/$BASE..origin/$HEAD_BRANCH")"
+          # The rule is CONTENT, not the commit count. A merge commit on the
+          # released branch makes `rev-list --count base..head` differ even
+          # when both trees are identical, and a count-based rule would then
+          # open a stack PR for an empty diff on every run.
+          if git diff --quiet "origin/$BASE" "origin/$HEAD_BRANCH"; then
+            SAME=1
+          else
+            SAME=0
+          fi
           echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
-          echo "base=$BASE ahead=$AHEAD"
-          if [ "$AHEAD" -eq 0 ]; then
-            echo "no new commit since $BASE - no PR is created and no PR is touched"
+          echo "same=$SAME" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE ahead=$AHEAD same_tree=$SAME"
+          if [ "$SAME" -eq 1 ]; then
+            echo "nothing to promote: $BASE and $HEAD_BRANCH hold the same tree - no PR is created and no PR is touched"
           fi
 
       - name: Skip when there is nothing to stack
-        if: steps.resolve.outputs.ahead == '0'
+        if: steps.resolve.outputs.same == '1'
         run: |
           set -euo pipefail
-          echo "no new commit since ${{ steps.resolve.outputs.base }} - nothing to do"
+          echo "nothing to promote: ${{ steps.resolve.outputs.base }} and integration hold the same tree"
 
       - name: Build the stack body
-        if: steps.resolve.outputs.ahead != '0'
+        if: steps.resolve.outputs.same != '1'
         id: body
         run: |
           set -euo pipefail
@@ -139,7 +149,7 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Create or refresh the stack PR
-        if: steps.resolve.outputs.ahead != '0'
+        if: steps.resolve.outputs.same != '1'
         id: pr
         run: |
           set -euo pipefail
@@ -170,7 +180,7 @@ jobs:
           echo "created=true" >> "$GITHUB_OUTPUT"
 
       - name: Stack guard
-        if: steps.resolve.outputs.ahead != '0'
+        if: steps.resolve.outputs.same != '1'
         id: guard
         run: |
           set -euo pipefail
@@ -205,7 +215,7 @@ jobs:
           fi
 
       - name: Request auto-merge
-        if: steps.resolve.outputs.ahead != '0' && steps.guard.outputs.mergeable == 'true'
+        if: steps.resolve.outputs.same != '1' && steps.guard.outputs.mergeable == 'true'
         run: |
           set -euo pipefail
           PR="${{ steps.pr.outputs.number }}"
