@@ -80,6 +80,15 @@ require_path "$PLUGINS_ROOT" "PLUGINS_ROOT"
 require_path "$MANIFEST" "manifest"
 require_path "$PROFILE_DIR/package.json" "lane profile package.json"
 
+# The profile carries its own pnpm settings in `pnpm-workspace.yaml`
+# (nodeLinker, storeDir, autoInstallPeers, allowBuilds, minimumReleaseAge-
+# Exclude). pnpm reads them from there, so a profile without that file
+# resolves with different settings than the lockfile was written with and the
+# install dies with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH or
+# ERR_PNPM_IGNORED_BUILDS. A lane profile that was not bootstrapped is a
+# setup error, not a deploy error: fail before anything is written.
+require_path "$PROFILE_DIR/pnpm-workspace.yaml" "the lane profile's pnpm settings (pnpm-workspace.yaml)"
+
 # --- read the manifest ------------------------------------------------------
 # The manifest is the single source of truth for what gets installed. It is
 # read with node (no jq dependency on the deploy host).
