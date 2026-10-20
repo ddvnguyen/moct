@@ -1,0 +1,7 @@
+{
+  "repos": {
+    "moct":    { "repo": "ddvnguyen/moct",               "stable": "main",   "integration": "integration" },
+    "dsh":     { "repo": "ddvnguyen/deepseek-harness",   "stable": "master", "integration": "integration" },
+    "plugins": { "repo": "ddvnguyen/moct-dsh-team-room", "stable": "master", "integration": "integration" }
+  }
+}

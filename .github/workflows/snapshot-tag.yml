@@ -1,0 +1,85 @@
+# Cuts the daily ANNOTATED snapshot tag `snapshot/<ddMMyy>` on the head of
+# `integration`.
+#
+# The tag is the audit + rollback anchor of the release train: it names one
+# exact tree of `integration` (the product) and one exact tree of the sibling
+# repos (their own snapshot tags are cut by the same script). Tags are never
+# deleted and never moved.
+#
+# The date token is computed from UTC, never typed by hand. A manually
+# supplied token is accepted only in the exact `ddMMyy` shape (20Oct26).
+name: snapshot-tag
+
+on:
+  schedule:
+    - cron: '5 0 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Snapshot date token (ddMMyy, e.g. 20Oct26). Default: today (UTC).'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snapshot-tag-${{ inputs.date || 'today' }}
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    name: cut-snapshot-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BRANCH: integration
+      INPUT_DATE: ${{ inputs.date }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure the tagger identity
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve the date token and the tag head
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_DATE:-}" ]; then
+            TOKEN="$INPUT_DATE"
+            if ! printf '%s' "$TOKEN" | grep -Eq '^[0-9]{2}[A-Z][a-z]{2}[0-9]{2}$'; then
+              echo "date input must look like ddMMyy (20Oct26), got: $TOKEN" >&2
+              exit 2
+            fi
+            echo "using the supplied date token: $TOKEN"
+          else
+            TOKEN="$(date -u +%d%b%y)"
+            echo "using today's UTC date token: $TOKEN"
+          fi
+          git fetch --no-tags origin "$BRANCH"
+          SHA="$(git rev-parse "origin/$BRANCH")"
+          TAG="snapshot/$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Cut the annotated tag
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.tag }}"
+          SHA="${{ steps.resolve.outputs.sha }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already exists - nothing to do"
+            git ls-remote --tags origin "refs/tags/$TAG"
+            exit 0
+          fi
+          git fetch --tags --force origin
+          git tag -a "$TAG" "$SHA" -m "Snapshot $TAG (integration @ $SHA)"
+          git push origin "refs/tags/$TAG"
+          echo "cut $TAG -> $SHA"
