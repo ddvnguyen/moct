@@ -134,6 +134,67 @@ install_deps() {
   ( cd "$PLUGINS_ROOT" && pnpm install --frozen-lockfile ) || die "pnpm install failed in $PLUGINS_ROOT"
 }
 
+# The profile's lockfile pins the integrity of every installed tarball. A
+# tarball is rebuilt on every deploy, so its content — and therefore its
+# checksum — changes, and the stale entry makes pnpm refuse the install with
+# ERR_PNPM_TARBALL_INTEGRITY ("the downloaded tarball does not match the
+# integrity recorded in the lockfile"). The entries of the manifest's
+# packages are therefore removed from the lockfile before the install, so pnpm
+# resolves them again and records the checksum of the tarball it just built.
+# The rest of the lockfile is untouched: every other dependency stays pinned.
+strip_lock_entries() { # $1 = lockfile path
+  node -e '
+    const fs = require("node:fs");
+    const [lockPath, namesJson] = process.argv.slice(1);
+    const names = new Set(JSON.parse(namesJson));
+    const lines = fs.readFileSync(lockPath, "utf8").split("\n");
+    const out = [];
+    let dropIndent = null;
+    let removed = 0;
+    for (const line of lines) {
+      if (dropIndent !== null) {
+        const indent = line.length - line.trimStart().length;
+        if (line.trim() === "") { dropIndent = null; out.push(line); continue; }
+        if (indent > dropIndent) continue; // the body of the dropped entry
+        dropIndent = null;
+      }
+      const trimmed = line.trim();
+      let key = null;
+      if (trimmed.startsWith("'\''@ddvnguyen/")) {
+        const first = trimmed.indexOf("'\''");
+        const last = trimmed.lastIndexOf("'\''");
+        if (last > first) key = trimmed.slice(first + 1, last);
+      } else if (trimmed.startsWith("@ddvnguyen/")) {
+        const m = trimmed.match(/^(@ddvnguyen\/[^:]+):/);
+        if (m) key = m[1];
+      }
+      if (key !== null) {
+        const base = key.split("@file:")[0];
+        if (names.has(base)) {
+          const indent = line.length - line.trimStart().length;
+          const inline = trimmed.endsWith(":") || trimmed.endsWith(": {}") || trimmed.endsWith(":[]");
+          dropIndent = inline ? null : indent;
+          removed++;
+          console.log("removed the stale lockfile entry " + key);
+          continue;
+        }
+      }
+      out.push(line);
+    }
+    fs.writeFileSync(lockPath, out.join("\n"));
+    console.log("removed " + removed + " stale lockfile entries");
+  ' "$1" "$(printf '%s\n' "$PACKED" | node -e '
+    let s = "";
+    process.stdin.on("data", d => s += d).on("end", () => {
+      const out = [];
+      for (const line of s.trim().split("\n")) {
+        const [name] = line.split("\t");
+        if (name) out.push(name);
+      }
+      process.stdout.write(JSON.stringify(out));
+    });')"
+}
+
 # The plugins repo compiles against a sibling `deepseek-harness` checkout: its
 # tsconfig facades point at that sibling's sources, and the sibling must be a
 # REAL directory. A symlink to the product checkout resolves to its real path
@@ -245,6 +306,17 @@ rollback() {
   ROLLED_BACK=1
   log "ROLLING BACK: restoring package.json and pnpm-lock.yaml from $BACKUP_DIR"
   cp "$BACKUP_DIR/package.json" "$PROFILE_DIR/package.json" || log "FATAL: could not restore package.json"
+  # The tarballs go back first: the restored manifest points at them by path
+  # and the restored lockfile pins their checksum, so an install that sees the
+  # new tarball under the old name would fail the integrity check.
+  if [ -f "$BACKUP_DIR/tarballs.tsv" ]; then
+    while IFS=$'\t' read -r pkg_name tarball_path; do
+      [ -n "${tarball_path:-}" ] || continue
+      saved="$BACKUP_DIR/artifacts/$(basename "$tarball_path")"
+      [ -f "$saved" ] || continue
+      cp "$saved" "$tarball_path" || log "FATAL: could not restore the tarball $tarball_path"
+    done < "$BACKUP_DIR/tarballs.tsv"
+  fi
   # The patch target may have been touched by a failed patch run: it is
   # removed here and reinstalled from the restored lockfile, so the profile
   # carries the unpatched package again.
@@ -355,8 +427,46 @@ rewrite_deps() {
     });')"
 }
 
+# --- 3. snapshot the profile ------------------------------------------------
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+BACKUP_DIR="$DSH_ROOT/data/backups/customizations-$TS"
+mkdir -p "$BACKUP_DIR" || die "cannot create the backup dir: $BACKUP_DIR"
+cp "$PROFILE_DIR/package.json" "$BACKUP_DIR/package.json" || die "cannot snapshot package.json"
+if [ -f "$PROFILE_DIR/pnpm-lock.yaml" ]; then
+  cp "$PROFILE_DIR/pnpm-lock.yaml" "$BACKUP_DIR/pnpm-lock.yaml" || die "cannot snapshot pnpm-lock.yaml"
+fi
+# The tarballs themselves are part of the profile: the manifest points at
+# them by path, the build overwrites them with the same file name, and the
+# restored lockfile pins their checksum. Without a copy, the rollback would
+# restore a manifest whose tarball no longer exists (and whose checksum no
+# longer matches) — the profile would be unrepairable.
+mkdir -p "$BACKUP_DIR/artifacts"
+: > "$BACKUP_DIR/tarballs.tsv"
+node -e '
+  const fs = require("node:fs");
+  const [pkgPath, listPath] = process.argv.slice(1);
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies);
+  const out = [];
+  for (const [name, spec] of Object.entries(deps)) {
+    if (typeof spec !== "string" || !spec.startsWith("file:")) continue;
+    out.push(name + "\t" + spec.slice("file:".length));
+  }
+  fs.writeFileSync(listPath, out.join("\n") + (out.length ? "\n" : ""));
+' "$PROFILE_DIR/package.json" "$BACKUP_DIR/tarballs.tsv"
+while IFS=$'\t' read -r pkg_name tarball_path; do
+  [ -n "${tarball_path:-}" ] || continue
+  [ -f "$tarball_path" ] || continue
+  cp "$tarball_path" "$BACKUP_DIR/artifacts/$(basename "$tarball_path")" \
+    || die "cannot snapshot the tarball $tarball_path"
+done < "$BACKUP_DIR/tarballs.tsv"
+log "snapshot of the profile in $BACKUP_DIR"
 log "rewriting the file: dependency entries in $PROFILE_DIR/package.json"
 rewrite_deps || die "could not rewrite the profile dependencies"
+if [ -f "$PROFILE_DIR/pnpm-lock.yaml" ]; then
+  log "dropping the stale lockfile entries of the manifest's packages"
+  strip_lock_entries "$PROFILE_DIR/pnpm-lock.yaml" || die "could not strip the stale lockfile entries"
+fi
 INSTALLED=1
 log "installing the profile"
 ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) || die "pnpm install failed in $PROFILE_DIR"
