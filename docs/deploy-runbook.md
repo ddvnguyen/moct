@@ -232,7 +232,18 @@ The path, in order:
 
 1. `scripts/deploy/dsh-customizations-deploy.sh` builds every package of the
    manifest from the plugins checkout with the repo's own build script and
-   packs it with `npm pack` into `<lane-root>/artifacts/`.
+   packs it with `npm pack` into `<lane-root>/artifacts/`. The plugins repo
+   compiles against a sibling `deepseek-harness` checkout (its tsconfig
+   facades point at that sibling's sources) and that sibling must be a **real
+   directory**: a symlink resolves to its real path and the TypeScript
+   rootDir check fails with TS6059.
+   The lane profile must also carry its own pnpm settings in
+   `pnpm-workspace.yaml` (`nodeLinker`, `storeDir`, `autoInstallPeers`,
+   `allowBuilds`, `minimumReleaseAgeExclude`). pnpm reads the settings from
+   there, so a profile without that file resolves with different settings
+   than its lockfile was written with, and the install dies with
+   `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` or `ERR_PNPM_IGNORED_BUILDS`. The
+   script checks it before it writes anything.
 2. The lane profile's `package.json` and `pnpm-lock.yaml` are snapshotted into
    `<lane-root>/data/backups/customizations-<UTC timestamp>/`.
 3. The profile's `file:` dependency entries for those packages are rewritten
