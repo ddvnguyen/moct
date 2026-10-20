@@ -1,10 +1,287 @@
-# MOCT-X deploy and rollback runbook
+# Release-train deploy and rollback runbook
 
-Pipeline 1: `ddvnguyen/moct` -> MOCT-X at `/mnt/workspace/clouds/moct-x`, port 8210, user unit
-`moct-x.service`. The backend is loopback-only and unauthenticated by human decision, so no
-secret is read, printed or logged anywhere in the pipeline.
+This repo (`ddvnguyen/moct`) is the **train owner**: it holds the train map
+(`deploy/train-repos.json`), the customization manifest
+(`deploy/dsh-customizations.json`), the lane deploy workflow and the snapshot
+cutter. The sibling repos of the train (`ddvnguyen/deepseek-harness`,
+`ddvnguyen/moct-dsh-team-room`) carry the same branch and tag model, but they
+do not own the train.
 
-## Where things live
+## The branch model
+
+```
+feature PR  ->  integration  ->  released branch
+                              (stack PR)
+```
+
+- One rolling `integration` branch per repo. It is created from the released
+  branch by `.github/workflows/integration-branch.yml` (daily, `5 0 * * *`, plus
+  manual dispatch) and is **never** force-updated and **never** deleted.
+- The released branch is `main` here, `master` in the two sibling repos.
+- The stack PR is `integration` -> the released branch. It is maintained by
+  `.github/workflows/stack-pr.yml`.
+- There are **no per-day branches**. A day is a *point in time*, not a branch:
+  the snapshot tag names that point, and one rolling branch keeps the review
+  round short. Per-day branches would multiply the review surface, make the
+  stack PR unreadable and break the "what is live" question, because nothing
+  would ever merge anything.
+
+## The daily snapshot tag
+
+`snapshot/<ddMMyy>` — for example `snapshot/20Oct26` — is an **annotated** tag
+cut on the head of `integration` by `.github/workflows/snapshot-tag.yml`
+(daily, `5 0 * * *`, plus manual dispatch with an optional `date` input in the
+`ddMMyy` shape).
+
+The date token is always computed from UTC; a manually supplied token is
+accepted only in that exact shape. If the tag already exists, the workflow
+logs it and exits 0 — tags are never moved and never deleted.
+
+What the tag is for:
+
+- **audit** — one name for "what was on `integration` at 00:05 UTC today",
+  across all three repos of the train.
+- **rollback** — the anchor a deploy is pinned to, so a lane can be put back
+  on a known tree.
+- **pinning a deploy** — every deploy workflow takes a `ref`; a snapshot tag
+  is the reproducible choice ("deploy exactly today's tree").
+
+The tag does not release anything. Releasing is the stack PR.
+
+One GitHub fact that shapes the rollout: a workflow file is **activated** when
+it reaches the default branch (a scheduled or dispatchable workflow is only
+read from the default branch). A workflow that lives on `integration` alone
+is inert — it is listed by `gh workflow list` only once the stack PR merged
+it. That is why the first day of the train has no scheduled runs.
+
+## The stack PR and its skip rule
+
+`.github/workflows/stack-pr.yml` runs on a schedule (every 30 minutes) and on
+manual dispatch. It:
+
+1. resolves the released branch and `integration`;
+2. **skips** when `git rev-list --count main..integration` is 0 — no new
+   commit, no PR, no PR edit, exit 0;
+3. **refreshes** the open stack PR for the same head/base instead of opening a
+   second one;
+4. otherwise opens the stack PR with a body that lists the implementation PRs
+   of the stack (`gh pr list --base integration`), the commits
+   (`git log main..integration`), the diffstat and the deploy evidence line
+   for the head sha.
+
+The skip rule is why the workflow is safe to run on a timer: on a quiet day it
+does nothing at all.
+
+## The review round and the CI gate
+
+`.github/workflows/ci.yml` is the PR gate. The job is named `ci` — that exact
+name is the required status check on `main` and on `integration`. It runs
+`pnpm install --frozen-lockfile` -> `pnpm run typecheck` -> `pnpm run build`
+-> `pnpm run test` on node 24, with `permissions: contents: read` and a
+concurrency group that cancels superseded runs on the same ref.
+
+The review round: a feature PR goes to `integration`, the `ci` check must be
+green, one approving review is required, and conversations must be resolved.
+The stack PR then carries the whole reviewed set to the released branch.
+
+The **stack guard** in `stack-pr.yml` decides whether the stack PR is
+auto-mergeable: every implementation PR in the stack must be merged, or must
+carry an approving review **and** a green `ci` check. Otherwise the blocking
+PRs are listed in the job output and a human merges. The workflow then asks
+for auto-merge with `gh pr merge --auto`; if GitHub refuses (the repository
+currently has `allow_auto_merge=false`), the job **fails loudly** with that
+reason instead of pretending the merge is queued. The integrator enables
+auto-merge in the repository settings.
+
+## The lane map
+
+| lane | unit | root | port | role |
+|---|---|---|---|---|
+| MOCT-X | `moct-x.service` | `/mnt/workspace/clouds/moct-x` | 8210 | **data of record** (`FLEET_DB_PATH=/mnt/workspace/clouds/moct-x/data/moct.db`) |
+| DSH lane x | `dsh-x.service` | `/mnt/workspace/clouds/dsh-x` | 3181 | rotating alpha lane |
+| DSH lane z | `dsh-z.service` | `/mnt/workspace/clouds/dsh-z` | 3180 | rotating alpha lane |
+
+Both DSH lanes run with `DSH_HOME=<lane-root>/data/home` and
+`MOCT_TEAM_URL=http://127.0.0.1:8210` — the lanes talk to MOCT-X, which holds
+the data of record.
+
+## The rotation rule
+
+Lane x and lane z rotate between `integration` (alpha) and `stable`
+(released). The rotation is **always an explicit dispatch** of
+`.github/workflows/dsh-lane-deploy.yml` with a `lane` and a `ref`. It is never
+automatic, never time-based, and never triggered by a push: a lane changes
+only when a human says so, and the dispatch input is the audit trail.
+
+`ref` takes one of:
+
+- `integration` — the alpha head of the sibling repos;
+- `stable` — the released branch of the sibling repos;
+- `snapshot` — the `snapshot/<ddMMyy>` tag, with the `date` input.
+
+The workflow resolves every requested ref to a sha with `git ls-remote`
+(a branch to its head, a tag to its **peeled** sha) and fails loudly, naming
+the repo and the ref, when it is missing.
+
+## The shared DSH state
+
+```
+/mnt/workspace/clouds/dsh-shared/
+  sessions/     shared
+  storages/     shared
+  agent-team/   shared
+  task-board/   shared
+  cache/        shared
+```
+
+Each lane symlinks those five directories out of `dsh-shared` into
+`<lane-root>/data/home/<name>`. `profiles/` and `logs/` stay **per lane**:
+the profile is the lane's own writable plugin tree, the logs are the lane's
+own history. Conversation history is `sessions/` + `storages/`.
+
+**One writer per session.** The shared tree is shared *between lanes*, not
+between processes: a session is owned by the lane that created it. Two lanes
+writing the same session file corrupt it, and there is no lock that makes that
+safe. Rotate the lane, do not run both lanes against one session.
+
+The symlink rule for `MOCT-X` also applies here: the unit `ExecStart` points
+**through** a symlink (`current -> releases/<sha>`), so anything that resolves
+its own path must resolve the symlink too.
+
+## The customization delivery path
+
+The DSH plugins are not part of the harness release: they are installed into
+the lane's own profile. The manifest `deploy/dsh-customizations.json` is the
+single source of truth:
+
+```json
+{
+  "repos": [
+    { "repo": "ddvnguyen/moct-dsh-team-room",
+      "packages": [
+        { "name": "@ddvnguyen/moct-dsh-team-room", "dir": "." },
+        { "name": "@ddvnguyen/dsh-sidebar", "dir": "packages/sidebar" }
+      ] }
+  ],
+  "patch": { "target": "@michengai/dsh-codex-ui",
+             "script": "scripts/codex-ui-sidebar-patch/apply.mjs" }
+}
+```
+
+One authority per script:
+
+- the **plugins repo** (`ddvnguyen/moct-dsh-team-room`) owns the DSH packages
+  **and** the codex-ui patch applier
+  (`scripts/codex-ui-sidebar-patch/apply.mjs`); the manifest path is relative
+  to the plugins checkout;
+- the **fork** (`ddvnguyen/deepseek-harness`) owns the release deploy script
+  (`scripts/deploy/dsh-deploy.sh`), which is always run from the reviewed
+  fork ref.
+
+The path, in order:
+
+1. `scripts/deploy/dsh-customizations-deploy.sh` builds every package of the
+   manifest from the plugins checkout with the repo's own build script and
+   packs it with `npm pack` into `<lane-root>/artifacts/`.
+2. The lane profile's `package.json` and `pnpm-lock.yaml` are snapshotted into
+   `<lane-root>/data/backups/customizations-<UTC timestamp>/`.
+3. The profile's `file:` dependency entries for those packages are rewritten
+   to the new tarball paths, the **obsolete** `@ddvnguyen/*` entries that the
+   manifest does not list (`@ddvnguyen/dsh-side-menu`,
+   `@ddvnguyen/dsh-hide-im-assistant`) are **removed**, and `pnpm install`
+   runs in the profile so their `node_modules` entries go away with them. A
+   `@ddvnguyen/*` package left in the profile that the manifest does not list
+   is a deploy failure, not a leftover.
+4. The codex-ui patch is applied:
+   `node <plugins>/scripts/codex-ui-sidebar-patch/apply.mjs
+   <profile>/node_modules/@michengai/dsh-codex-ui`. The applier is
+   anchor-based: a moved anchor is a **non-zero exit**, and the script fails
+   with that message.
+5. Every package of the manifest is verified: present in the profile
+   `package.json` **and** resolvable in the profile's `node_modules` at the
+   expected version, and no obsolete `@ddvnguyen/*` entry left. The script
+   prints the package -> version table.
+6. On any failure after step 3, the snapshot is restored, `pnpm install` runs
+   again and the script exits non-zero. The rollback is wired to the **EXIT
+   trap**, not ERR: `die()` calls `exit 1` and bash never runs an ERR trap for
+   `exit`, so an ERR-only rollback would miss every failure after the install
+   step. The rollback happens before the script returns.
+
+`DRY_RUN=1` prints the plan and changes nothing on disk.
+
+The patch applier takes the codex-ui package directory as its argument and
+also accepts `--check`, which reports and writes nothing.
+
+## Rollback
+
+### Lane rollback
+
+The fork's `scripts/deploy/dsh-deploy.sh` rolls back on any failure after the
+release switch: the `current` symlink goes back to the previous release, the
+live state is restored from the newest snapshot under
+`<lane-root>/data/backups/`, the unit is restarted and the run is marked
+failed. On a **first** deploy there is no previous release: the switch is
+undone, the state snapshot is restored and the unit is left **stopped**.
+Restarting against an empty `current` with `Restart=on-failure` is a crash
+loop.
+
+To roll back by hand, on the deploy host:
+
+```sh
+systemctl --user is-active dsh-x
+readlink /mnt/workspace/clouds/dsh-x/current
+ls -1t /mnt/workspace/clouds/dsh-x/releases
+curl -fsS http://127.0.0.1:3181/
+journalctl --user -u dsh-x -n 40 --no-pager
+```
+
+Point `current` back at the wanted `releases/<sha>`, restore the state
+snapshot if the state changed, restart the unit and read `/` again.
+
+### Snapshot rollback
+
+A snapshot tag is an anchor, not an automatic undo. To roll a lane back onto
+a snapshot tree:
+
+1. find the sha: `gh api repos/ddvnguyen/deepseek-harness/git/ref/tags/snapshot/20Oct26`
+   (the ref sha is the annotated tag object; the peeled commit sha is in
+   `repos/<repo>/git/tags/<tag-sha>.object.sha`);
+2. dispatch the lane deploy with `ref=snapshot` and `date=20Oct26` — the
+   workflow resolves the tag to the same shas on every run, so the lane lands
+   on exactly that tree;
+3. for MOCT-X: dispatch `.github/workflows/moct-x-deploy.yml` with
+   `ref=snapshot/20Oct26`.
+
+## Verify by hand
+
+MOCT-X:
+
+```sh
+systemctl --user is-active moct-x
+systemctl --user show moct-x -p NRestarts --value      # expect 0 on a healthy deploy
+readlink /mnt/workspace/clouds/moct-x/current
+curl -fsS http://127.0.0.1:8210/health
+journalctl --user -u moct-x -n 40 --no-pager
+```
+
+DSH lane:
+
+```sh
+systemctl --user is-active dsh-x
+readlink /mnt/workspace/clouds/dsh-x/current
+curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3181/
+node -p "require('/mnt/workspace/clouds/dsh-x/data/home/profiles/web/node_modules/@ddvnguyen/moct-dsh-team-room/package.json').version"
+journalctl --user -u dsh-x -n 40 --no-pager
+```
+
+## Protected ports
+
+`3080`, `3081`, `8099`, `8110`, `18081`, `18789`, `4097` and `8210` are
+refused by every deploy script. `3080` is PROD, `3081`/`8110` are the TEST
+fleet, `8210` is MOCT-X (the data of record). `3181` (lane x) and `3180`
+(lane z) belong to the DSH lanes and to nothing else.
+
+## MOCT-X specifics
 
 ```
 /mnt/workspace/clouds/moct-x/
@@ -15,94 +292,34 @@ secret is read, printed or logged anywhere in the pipeline.
   .scratch/<sha>/ rehearsal copy: moct.db, state/, backups/, and its own `current` symlink
 ```
 
-Two releases are kept (`KEEP_RELEASES=2`), three db backups (`KEEP_BACKUPS=3`); the live
-release is never pruned.
+Two releases are kept (`KEEP_RELEASES=2`), three db backups
+(`KEEP_BACKUPS=3`); the live release is never pruned. The backend is
+loopback-only and unauthenticated by human decision, so no secret is read,
+printed or logged anywhere in the pipeline.
 
-## What triggers a deploy
+The rollback of MOCT-X is wired to the **EXIT trap**, not ERR — the same
+reason as the lane script: `die()` calls `exit 1`, and an ERR-only trap misses
+every post-switch failure (the health timeout, the `/health` mismatch,
+`/schema`, `/team/v1/operations/head`).
 
-`.github/workflows/moct-x-deploy.yml` runs on a push to `main` touching
-`src/**`, `tests/**`, `package.json`, `pnpm-lock.yaml` or `scripts/deploy/**`, or on
-`workflow_dispatch` with an explicit `sha`. It runs on the self-hosted clouds runner and
-installs from the shared pnpm store at `/mnt/workspace/pnpm-store` (hardlinked, same device).
+## The honest limits
 
-## What the deploy does, in order
-
-1. **Preflight** - unit file present, `dist/` built, protected ports (3080, 3081, 8099, 8110,
-   18081, 18789, 4097) refused.
-2. **Package** - `releases/<sha>/` gets `dist/`, `package.json`, a hardlinked `node_modules`,
-   and `BUILD_INFO` rewritten to the serving sha so the smoke can prove which sha answers.
-3. **Rehearsal** - boot the NEW release against a COPY of the live db on an ephemeral port,
-   through a `current` symlink with an absolute path (the unit shape; see the symlink rule
-   below), then verify the migrated copy through a daemon-written snapshot:
-   `PRAGMA integrity_check` = ok and `schema_version:8` present.
-4. **Backup** - only when the service is active; a first deploy takes no backup.
-5. **Switch** - `current -> releases/<sha>`. An empty placeholder directory is `rmdir`d; a
-   **non-empty** `current` aborts with a FATAL and is never deleted.
-6. **Restart** - then fail fast: a 6 x 0.5s `is-active` loop, and if the unit is not active,
-   dump `journalctl -n 40` and die. A daemon that exits immediately leaves the unit inactive,
-   and waiting out the health budget only produces "did not answer /health" with no evidence.
-7. **Smoke** - `/health` identity (version + git_sha), `/schema`, and
-   `/team/v1/operations/head?workspaceId=smoke` (the route requires `workspaceId`).
-8. **Prune** - old releases and db backups, guarded so an unmatched glob cannot fail a run
-   after a green smoke.
-
-## Rollback
-
-Rollback is wired to the **EXIT trap**, not ERR: `die()` calls `exit 1` and bash never runs an
-ERR trap for `exit`, so an ERR-only trap misses every post-switch failure (the health timeout,
-the `/health` mismatch, `/schema`, `/team/v1/operations/head`). A clean exit 0 skips rollback.
-
-- **A previous release exists** (`current` was a symlink INTO `releases/`): stop the unit,
-  point `current` back at it, restore the db from the newest backup, restart.
-- **First deploy, no previous release**: stop the unit, undo the switch (`rm` the symlink and
-  put the empty placeholder back if there was one), restore the db snapshot, and **leave the
-  unit stopped**. Restarting against an empty `current` with `Restart=on-failure` is a crash
-  loop: run 39010151404 reached restart counter 89 on
-  `Cannot find module '/mnt/workspace/clouds/moct-x/current/dist/daemon.js'` before it was
-  stopped by hand.
-
-## The symlink rule
-
-The unit ExecStart is `node /mnt/workspace/clouds/moct-x/current/dist/daemon.js` and `current`
-is a symlink to the release directory. Node resolves that symlink when it builds
-`import.meta.url`, so `argv[1]` (the link path) and `import.meta.url` (the real path) differ:
-a literal comparison is false, the module runs nothing and the process exits 0 silently - no
-listener, no log line. `src/entrypoint.ts` (`isEntrypoint`) compares the realpath with a
-literal fallback, and both entrypoints (`daemon.ts`, `mcp.ts`) share that one guard.
-
-Corollary for tests, harnesses and rehearsals: boot the daemon through a symlink with an
-**absolute** path. `cd <release> && node dist/daemon.js` resolves to the same string on both
-sides of the comparison and cannot see this class of bug.
-
-## Verify by hand
-
-```sh
-systemctl --user is-active moct-x
-systemctl --user show moct-x -p NRestarts --value      # expect 0 on a healthy deploy
-readlink /mnt/workspace/clouds/moct-x/current
-curl -fsS http://127.0.0.1:8210/health
-journalctl --user -u moct-x -n 40 --no-pager
-```
-
-## Pipelines
-
-- **Pipeline 1 - MOCT-X (:8210)**: live. See above.
-- **Pipeline 2 - fork to DSH-X (:3181)**: separate lane, owned by @DevWorker#03.
-- **Pipeline 3 - DSH-Z PROD**: skeleton only, `.github/workflows/moct-prod-deploy.yml`.
-  Dispatch-only, and the deploy step needs the typed `PROD_DEPLOY_ACK`. The barriers that
-  actually hold: the `prod` runner label is advertised by no runner, so even an armed run
-  queues forever and cannot execute on any host; and the PROD script does not exist, so the
-  step dies with an explicit message. The `github.actor == 'ddvnguyen'` check is NOT a gate -
-  `gh` on this host authenticates as `ddvnguyen`, the same account as the human, so any seat
-  here passes it; it only filters other GitHub accounts.
-
-  A true required-reviewer gate is not available on this repo: required-reviewer protection
-  rules need a paid plan (`PUT /environments/prod-z` -> 422) and branch protection on `main`
-  is refused the same way (403). The `prod-z` environment exists (created 2026-10-17) with no
-  protection rule, so deployments are recorded against it and one call adds the human as the
-  only required reviewer once the plan allows it. Paying for a plan or making the repo public
-  is the human's call.
-
-  Registering a `prod`-labelled runner, or adding `scripts/deploy/moct-prod-deploy.sh`, must
-  each be a separate, human-approved change: either one alone turns this skeleton into
-  something that can reach a live host.
+- **PROD is not a pipeline lane.** `dsh-prod.service` on `:3080` is the
+  stock upstream harness with a personal profile. It is not deployed by any
+  workflow in this train, no script in this repo writes to it, and no deploy
+  script accepts it as a target (they refuse a service matching `*prod*` and
+  the ports `3080`/`3081`/`8110`/`8210`).
+- **The `prod` runner label stays unarmed.** No runner advertises it, so a
+  job that asks for it queues forever and never reaches a host. The skeleton
+  in `.github/workflows/moct-prod-deploy.yml` stays dispatch-only.
+- **The deploy code always comes from a reviewed ref, never from the
+  dispatched sha.** In the lane deploy, the product tree is the dispatched
+  sha and the deploy scripts are the fork's reviewed `integration` branch. A
+  dispatched sha can therefore never run unreviewed deploy code.
+- The `github.actor` check is **not** a security gate: `gh` on the deploy host
+  authenticates as the same account as the human, so any seat here passes it.
+  It only filters other GitHub accounts.
+- Required-reviewer protection is available on this repo (the repository is
+  public, so a protection `PUT` succeeds) and the integrator applies it: the
+  released branch and `integration` require one approving review plus the CI
+  check, no direct push, no force push, and conversation resolution.

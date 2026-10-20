@@ -1,0 +1,50 @@
+# Keeps ONE rolling `integration` branch alive in this repo.
+#
+# Rules this workflow enforces:
+#   - `integration` is created from the default branch the first time it is
+#     missing; it is never force-updated and never deleted afterwards.
+#   - A second run on the same day finds the branch and exits 0.
+#   - The branch is the target of every feature PR of the release train.
+name: integration-branch
+
+on:
+  schedule:
+    - cron: '5 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: integration-branch
+  cancel-in-progress: false
+
+jobs:
+  ensure:
+    name: ensure-integration-branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      BRANCH: integration
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure the integration branch exists
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "branch $BRANCH already exists - nothing to do"
+            git ls-remote --heads origin "$BRANCH"
+            exit 0
+          fi
+          echo "branch $BRANCH is missing - creating it from $DEFAULT_BRANCH"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          # A plain push (never --force, never a delete): if the branch
+          # appeared in the meantime, the push is refused and the run fails
+          # loudly instead of rewriting it.
+          git push origin "FETCH_HEAD:refs/heads/$BRANCH"
+          echo "created $BRANCH from $DEFAULT_BRANCH"
