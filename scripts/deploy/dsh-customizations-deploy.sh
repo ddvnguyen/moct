@@ -6,10 +6,9 @@
 # backups. The script never touches another lane, never touches the PROD unit
 # (dsh-prod.service on :3080) and never writes outside $DSH_ROOT.
 #
-# Env (all optional except LANE / PLUGINS_ROOT / PATCH_SCRIPT):
+# Env (all optional except LANE / PLUGINS_ROOT):
 #   LANE          x | z                      required: which lane to install into
 #   PLUGINS_ROOT  checkout of the plugins repo   required: where the packages are built from
-#   PATCH_SCRIPT  path to the codex-ui applier    required: scripts/deploy/codex-ui-sidebar-patch/apply.mjs
 #   DSH_ROOT      lane root                  default: /mnt/workspace/clouds/dsh-$LANE
 #   PROFILE_DIR   lane profile dir           default: $DSH_ROOT/data/home/profiles/web
 #   ARTIFACTS_DIR tarball dir                default: $DSH_ROOT/artifacts
@@ -18,10 +17,14 @@
 # DSH_HARNESS_DIR is passed through untouched: the plugins repo resolves its
 # sibling harness checkout (type facades, tsdown) through that variable.
 #
-# The manifest (deploy/dsh-customizations.json) lists the packages and the
-# patch target. The installed version of each package is the version of the
-# tarball that was just built, and the profile is restored from the snapshot
-# whenever anything fails after the install step.
+# The manifest (deploy/dsh-customizations.json) is the single source of truth:
+# it lists the packages, the patch target and the patch script. The codex-ui
+# applier is owned by the PLUGINS repo (scripts/codex-ui-sidebar-patch/
+# apply.mjs) and its path is resolved against $PLUGINS_ROOT.
+#
+# The installed version of each package is the version of the tarball that was
+# just built, and the profile is restored from the snapshot whenever anything
+# fails after the install step.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,8 +51,6 @@ esac
 
 PLUGINS_ROOT="${PLUGINS_ROOT:-}"
 [ -n "$PLUGINS_ROOT" ] || die "PLUGINS_ROOT is required (checkout of the plugins repo)"
-PATCH_SCRIPT="${PATCH_SCRIPT:-}"
-[ -n "$PATCH_SCRIPT" ] || die "PATCH_SCRIPT is required (the codex-ui applier)"
 
 DSH_ROOT="${DSH_ROOT:-/mnt/workspace/clouds/dsh-$LANE}"
 PROFILE_DIR="${PROFILE_DIR:-$DSH_ROOT/data/home/profiles/web}"
@@ -72,7 +73,6 @@ require_path() { # $1 = path, $2 = what it is
   fi
 }
 require_path "$PLUGINS_ROOT" "PLUGINS_ROOT"
-require_path "$PATCH_SCRIPT" "PATCH_SCRIPT"
 require_path "$MANIFEST" "manifest"
 require_path "$PROFILE_DIR/package.json" "lane profile package.json"
 
@@ -88,14 +88,20 @@ read_manifest() {
     for (const p of repo.packages || []) console.log(`${p.name}\t${p.dir}`);
     const patch = m.patch || {};
     console.log(`#PATCH\t${patch.target || "@michengai/dsh-codex-ui"}`);
+    console.log(`#PATCHSCRIPT\t${patch.script || ""}`);
   ' "$MANIFEST"
 }
 
 MANIFEST_LINES="$(read_manifest)" || die "manifest is unreadable: $MANIFEST"
 PATCH_TARGET="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCH"{print $2}')"
 PATCH_TARGET="${PATCH_TARGET:-@michengai/dsh-codex-ui}"
-PKG_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1!="#PATCH" && NF==2')"
+PATCH_SCRIPT="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCHSCRIPT"{print $2}')"
+PKG_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1!="#PATCH" && $1!="#PATCHSCRIPT" && NF==2')"
 [ -n "$PKG_LINES" ] || die "manifest lists no packages"
+[ -n "$PATCH_SCRIPT" ] || die "the manifest names no patch script"
+# The applier is owned by the plugins repo; its path is relative to that
+# checkout.
+PATCH_APPLIER="$PLUGINS_ROOT/$PATCH_SCRIPT"
 
 log "lane $LANE (service $SERVICE, port $PORT)"
 log "plugins root: $PLUGINS_ROOT"
@@ -103,6 +109,7 @@ log "profile: $PROFILE_DIR"
 log "artifacts: $ARTIFACTS_DIR"
 log "packages: $(printf '%s\n' "$PKG_LINES" | cut -f1 | tr '\n' ' ')"
 log "patch target: $PATCH_TARGET"
+log "patch script: $PATCH_APPLIER"
 
 # --- 2. build and pack ------------------------------------------------------
 # The plugins repo is a pnpm workspace whose root build script compiles the
@@ -149,8 +156,9 @@ if [ "$DRY_RUN" = "1" ]; then
   done <<< "$PKG_LINES"
   log "would snapshot $PROFILE_DIR/package.json and pnpm-lock.yaml into $DSH_ROOT/data/backups/customizations-<timestamp>/"
   log "would rewrite the file: dependencies of: $(printf '%s\n' "$PKG_LINES" | cut -f1 | tr '\n' ' ')"
+  log "would REMOVE the obsolete @ddvnguyen/* profile dependencies that the manifest does not list"
   log "would run pnpm install in $PROFILE_DIR"
-  log "would apply $PATCH_SCRIPT to $PROFILE_DIR/node_modules/$PATCH_TARGET"
+  log "would apply $PATCH_APPLIER to $PROFILE_DIR/node_modules/$PATCH_TARGET"
   log "would verify every package version and print the package -> version table"
   exit 0
 fi
@@ -220,14 +228,19 @@ trap on_exit EXIT
 
 # --- 4. rewrite the file: dependencies and install --------------------------
 # The profile pins the plugins as file: tarballs; the rewrite points them at
-# the tarballs that were just built.
+# the tarballs that were just built. A @ddvnguyen/* dependency the manifest
+# does not list is obsolete (the old @ddvnguyen/dsh-side-menu and
+# @ddvnguyen/dsh-hide-im-assistant entries) and is REMOVED: the profile must
+# carry exactly the manifest's package set.
 rewrite_deps() {
   node -e '
     const fs = require("node:fs");
     const [pkgPath, pairsJson] = process.argv.slice(1);
     const pairs = Object.entries(JSON.parse(pairsJson));
     const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    const wanted = new Set(pairs.map(([name]) => name));
     let changed = 0;
+    let removed = 0;
     for (const [name, tarball] of pairs) {
       let hit = false;
       for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
@@ -243,8 +256,18 @@ rewrite_deps() {
         changed++;
       }
     }
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
+      if (!pkg[field]) continue;
+      for (const name of Object.keys(pkg[field])) {
+        if (!name.startsWith("@ddvnguyen/")) continue;
+        if (wanted.has(name)) continue;
+        delete pkg[field][name];
+        removed++;
+        console.log("removed obsolete dependency " + name + " from " + field);
+      }
+    }
     fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
-    console.log("rewrote " + changed + " dependency entries");
+    console.log("rewrote " + changed + " dependency entries, removed " + removed + " obsolete ones");
   ' "$PROFILE_DIR/package.json" "$(printf '%s\n' "$PACKED" | node -e '
     let s = "";
     process.stdin.on("data", d => s += d).on("end", () => {
@@ -266,16 +289,18 @@ log "installing the profile"
 # --- 5. apply the codex-ui patch -------------------------------------------
 PATCH_DIR="$PROFILE_DIR/node_modules/$PATCH_TARGET"
 [ -d "$PATCH_DIR" ] || die "patch target not installed: $PATCH_DIR"
-log "applying the codex-ui patch: $PATCH_SCRIPT $PATCH_DIR"
-case "$PATCH_SCRIPT" in
-  *.mjs|*.js) node "$PATCH_SCRIPT" "$PATCH_DIR" || die "the codex-ui patch failed (moved anchor?) - the profile was restored to its previous state" ;;
-  *) "$PATCH_SCRIPT" "$PATCH_DIR" || die "the codex-ui patch failed (moved anchor?) - the profile was restored to its previous state" ;;
+require_path "$PATCH_APPLIER" "the codex-ui patch applier"
+log "applying the codex-ui patch: $PATCH_APPLIER $PATCH_DIR"
+case "$PATCH_APPLIER" in
+  *.mjs|*.js) node "$PATCH_APPLIER" "$PATCH_DIR" || die "the codex-ui patch failed (moved anchor?) - the profile was restored to its previous state" ;;
+  *) "$PATCH_APPLIER" "$PATCH_DIR" || die "the codex-ui patch failed (moved anchor?) - the profile was restored to its previous state" ;;
 esac
 log "codex-ui patch applied"
 
 # --- 6. verify --------------------------------------------------------------
 # Every package of the manifest must be in the profile package.json AND
-# resolvable in the profile's node_modules at the expected version.
+# resolvable in the profile's node_modules at the expected version, and the
+# profile must carry NO @ddvnguyen/* dependency outside the manifest.
 verify() {
   node -e '
     const fs = require("node:fs");
@@ -300,6 +325,14 @@ verify() {
     console.log(fmt(["package", "expected", "installed", "spec", "state"]));
     console.log(w.map(n => "-".repeat(n)).join("  "));
     for (const r of rows) console.log(fmt(r));
+    // The @ddvnguyen scope must match the manifest exactly: an extra entry is
+    // an obsolete package left in the profile, and that is a deploy failure.
+    const wanted = new Set(pairs.map(([name]) => name));
+    const extra = Object.keys(deps).filter(n => n.startsWith("@ddvnguyen/") && !wanted.has(n));
+    for (const name of extra) {
+      console.log("OBSOLETE  " + name + " is still in the profile and is not in the manifest");
+      bad++;
+    }
     process.exit(bad ? 1 : 0);
   ' "$PROFILE_DIR" "$(printf '%s\n' "$PACKED" | node -e '
     let s = "";
@@ -313,6 +346,6 @@ verify() {
     });')"
 }
 
-verify || die "verification failed: not every package is installed at the expected version"
+verify || die "verification failed: not every manifest package is installed at the expected version, or an obsolete @ddvnguyen package is still in the profile"
 log "every manifest package is installed at the expected version"
 log "customizations deploy complete for lane $LANE"

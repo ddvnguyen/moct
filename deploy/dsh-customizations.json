@@ -8,5 +8,5 @@
       ]
     }
   ],
-  "patch": { "target": "@michengai/dsh-codex-ui", "script": "scripts/deploy/codex-ui-sidebar-patch/apply.mjs" }
+  "patch": { "target": "@michengai/dsh-codex-ui", "script": "scripts/codex-ui-sidebar-patch/apply.mjs" }
 }

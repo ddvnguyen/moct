@@ -158,9 +158,19 @@ single source of truth:
       ] }
   ],
   "patch": { "target": "@michengai/dsh-codex-ui",
-             "script": "scripts/deploy/codex-ui-sidebar-patch/apply.mjs" }
+             "script": "scripts/codex-ui-sidebar-patch/apply.mjs" }
 }
 ```
+
+One authority per script:
+
+- the **plugins repo** (`ddvnguyen/moct-dsh-team-room`) owns the DSH packages
+  **and** the codex-ui patch applier
+  (`scripts/codex-ui-sidebar-patch/apply.mjs`); the manifest path is relative
+  to the plugins checkout;
+- the **fork** (`ddvnguyen/deepseek-harness`) owns the release deploy script
+  (`scripts/deploy/dsh-deploy.sh`), which is always run from the reviewed
+  fork ref.
 
 The path, in order:
 
@@ -170,14 +180,21 @@ The path, in order:
 2. The lane profile's `package.json` and `pnpm-lock.yaml` are snapshotted into
    `<lane-root>/data/backups/customizations-<UTC timestamp>/`.
 3. The profile's `file:` dependency entries for those packages are rewritten
-   to the new tarball paths and `pnpm install` runs in the profile.
+   to the new tarball paths, the **obsolete** `@ddvnguyen/*` entries that the
+   manifest does not list (`@ddvnguyen/dsh-side-menu`,
+   `@ddvnguyen/dsh-hide-im-assistant`) are **removed**, and `pnpm install`
+   runs in the profile so their `node_modules` entries go away with them. A
+   `@ddvnguyen/*` package left in the profile that the manifest does not list
+   is a deploy failure, not a leftover.
 4. The codex-ui patch is applied:
-   `node <applier> <profile>/node_modules/@michengai/dsh-codex-ui`. The applier
-   is anchor-based: a moved anchor is a **non-zero exit**, and the script
-   fails with that message.
+   `node <plugins>/scripts/codex-ui-sidebar-patch/apply.mjs
+   <profile>/node_modules/@michengai/dsh-codex-ui`. The applier is
+   anchor-based: a moved anchor is a **non-zero exit**, and the script fails
+   with that message.
 5. Every package of the manifest is verified: present in the profile
    `package.json` **and** resolvable in the profile's `node_modules` at the
-   expected version. The script prints the package -> version table.
+   expected version, and no obsolete `@ddvnguyen/*` entry left. The script
+   prints the package -> version table.
 6. On any failure after step 3, the snapshot is restored, `pnpm install` runs
    again and the script exits non-zero. The rollback is wired to the **EXIT
    trap**, not ERR: `die()` calls `exit 1` and bash never runs an ERR trap for
@@ -186,10 +203,8 @@ The path, in order:
 
 `DRY_RUN=1` prints the plan and changes nothing on disk.
 
-The patch applier itself lives in the fork, at
-`scripts/deploy/codex-ui-sidebar-patch/apply.mjs`, and takes the codex-ui
-package directory as its argument. It also accepts `--check`, which reports
-and writes nothing.
+The patch applier takes the codex-ui package directory as its argument and
+also accepts `--check`, which reports and writes nothing.
 
 ## Rollback
 

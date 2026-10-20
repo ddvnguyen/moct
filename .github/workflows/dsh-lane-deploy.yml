@@ -6,10 +6,12 @@
 #
 # The deploy code NEVER comes from the dispatched product sha:
 #   product/        the fork at the resolved product sha (the thing being served)
-#   deploy-scripts/ the fork's REVIEWED integration branch (the deploy code)
+#   deploy-scripts/ the fork's REVIEWED integration branch (the release deploy
+#                   script, scripts/deploy/dsh-deploy.sh)
 #   harness-pin/    the fork at the pinned harness sha (the fork script's
 #                   HARNESS_ROOT; its HEAD must equal HARNESS_SHA_EXPECT)
-#   plugins/        the plugins repo at the resolved plugins sha
+#   plugins/        the plugins repo at the resolved plugins sha (the DSH
+#                   packages AND the codex-ui patch applier)
 #
 # Order: resolve the shas -> check out -> build the product -> install the DSH
 # customizations into the lane profile (packages + codex-ui patch) -> run the
@@ -172,7 +174,6 @@ jobs:
       - name: Install the DSH customizations into the lane profile
         env:
           PLUGINS_ROOT: ${{ github.workspace }}/plugins
-          PATCH_SCRIPT: ${{ github.workspace }}/deploy-scripts/scripts/deploy/codex-ui-sidebar-patch/apply.mjs
           DSH_ROOT: /mnt/workspace/clouds/dsh-${{ inputs.lane }}
           PROFILE_DIR: /mnt/workspace/clouds/dsh-${{ inputs.lane }}/data/home/profiles/web
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
@@ -182,6 +183,9 @@ jobs:
         run: |
           set -euo pipefail
           ln -sfn "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/deepseek-harness"
+          # The codex-ui applier comes from the plugins checkout (the manifest
+          # names its path); the deploy-scripts checkout only carries the
+          # fork's release deploy script.
           ./scripts/deploy/dsh-customizations-deploy.sh
 
       - name: Deploy the lane (release switch, restart, smoke)
