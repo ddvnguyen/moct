@@ -298,7 +298,7 @@ every post-switch failure (the health timeout, the `/health` mismatch,
 - The `github.actor` check is **not** a security gate: `gh` on the deploy host
   authenticates as the same account as the human, so any seat here passes it.
   It only filters other GitHub accounts.
-- Required-reviewer protection is available on this repo: the repository is
-  public and a protection `PUT` succeeds. The released branch and
-  `integration` require one approving review plus the CI check, no direct
-  push, no force push, and conversation resolution.
+- Required-reviewer protection is available on this repo (the repository is
+  public, so a protection `PUT` succeeds) and the integrator applies it: the
+  released branch and `integration` require one approving review plus the CI
+  check, no direct push, no force push, and conversation resolution.

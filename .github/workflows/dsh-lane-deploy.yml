@@ -110,8 +110,9 @@ jobs:
           resolve_sha() { # $1 = repo, $2 = branch, $3 = tag ("" for a branch)
             local repo="$1" branch="$2" tag="$3" out=""
             if [ -n "$tag" ]; then
+              # A snapshot tag is annotated: the peeled sha ("<ref>^{}") is the
+              # commit the tag points at.
               out="$(git ls-remote "https://github.com/$repo" "refs/tags/$tag^{}" 2>/dev/null | head -n 1 | cut -f1 || true)"
-              [ -n "$out" ] || out="$(git ls-remote "https://github.com/$repo" "refs/tags/$tag" 2>/dev/null | head -n 1 | cut -f1 || true)"
             else
               out="$(git ls-remote "https://github.com/$repo" "refs/heads/$branch" 2>/dev/null | head -n 1 | cut -f1 || true)"
             fi
