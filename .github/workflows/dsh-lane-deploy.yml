@@ -188,8 +188,8 @@ jobs:
           DSH_HARNESS_DIR: deepseek-harness
         run: |
           set -euo pipefail
-          # The codex-ui applier comes from the plugins checkout (the manifest
-          # names its path); the deploy-scripts checkout only carries the
+          # The patch appliers come from the plugins checkout (the manifest
+          # names their paths); the deploy-scripts checkout only carries the
           # fork's release deploy script.
           ./scripts/deploy/dsh-customizations-deploy.sh
 
@@ -209,6 +209,31 @@ jobs:
         run: |
           set -euo pipefail
           bash deploy-scripts/scripts/deploy/dsh-deploy.sh
+
+      - name: Verify every patched package carries its patch
+        if: ${{ !inputs.dry_run }}
+        env:
+          PROFILE_DIR: /mnt/workspace/clouds/dsh-${{ inputs.lane }}/data/home/profiles/web
+          PLUGINS_ROOT: ${{ github.workspace }}/plugins
+        run: |
+          set -euo pipefail
+          # The deploy script verifies each patch right after applying it;
+          # this is the same check after the release deploy, which is the last
+          # thing that ran before the lane was restarted. A package left
+          # half-patched fails here instead of reaching the owner.
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const { execFileSync } = require("node:child_process");
+            const [manifestPath, profile, pluginsRoot] = process.argv.slice(1);
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+            for (const patch of manifest.patches || []) {
+              const script = path.join(pluginsRoot, patch.script);
+              const target = path.join(profile, "node_modules", patch.target);
+              console.log(`verifying ${patch.target} carries its patch`);
+              execFileSync(process.execPath, [script, target, "--verify"], { stdio: "inherit" });
+            }
+          ' deploy/dsh-customizations.json "$PROFILE_DIR" "$PLUGINS_ROOT"
 
       - name: Verify the lane and the installed package versions
         if: ${{ !inputs.dry_run }}

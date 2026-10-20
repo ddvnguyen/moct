@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DSH customizations deploy — installs the DSH plugin packages into ONE lane's
-# web profile and applies the codex-ui sidebar patch.
+# web profile and applies the manifest's patches.
 #
 # One lane per invocation: the lane owns its profile, its artifacts and its
 # backups. The script never touches another lane, never touches the PROD unit
@@ -22,9 +22,15 @@
 # directory — see harness_sibling() below.
 #
 # The manifest (deploy/dsh-customizations.json) is the single source of truth:
-# it lists the packages, the patch target and the patch script. The codex-ui
-# applier is owned by the PLUGINS repo (scripts/codex-ui-sidebar-patch/
-# apply.mjs) and its path is resolved against $PLUGINS_ROOT.
+# it lists the packages and the patches. Each patch names the package it
+# patches and the applier that patches it; the appliers are owned by the
+# PLUGINS repo (scripts/codex-ui-sidebar-patch/apply.mjs,
+# scripts/dsh-market-trusted-host-patch/apply.mjs) and their paths are
+# resolved against $PLUGINS_ROOT.
+#
+# Every patch is applied and then VERIFIED with the applier's --verify mode:
+# a package left half-patched fails the deploy here, instead of reaching the
+# lane.
 #
 # The installed version of each package is the version of the tarball that was
 # just built, and the profile is restored from the snapshot whenever anything
@@ -99,30 +105,34 @@ read_manifest() {
     const repo = (m.repos || [])[0];
     if (!repo) { console.error("manifest has no repos[] entry"); process.exit(2); }
     for (const p of repo.packages || []) console.log(`${p.name}\t${p.dir}`);
-    const patch = m.patch || {};
-    console.log(`#PATCH\t${patch.target || "@michengai/dsh-codex-ui"}`);
-    console.log(`#PATCHSCRIPT\t${patch.script || ""}`);
+    for (const patch of m.patches || []) console.log(`#PATCH\t${patch.target}\t${patch.script}`);
   ' "$MANIFEST"
 }
 
 MANIFEST_LINES="$(read_manifest)" || die "manifest is unreadable: $MANIFEST"
-PATCH_TARGET="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCH"{print $2}')"
-PATCH_TARGET="${PATCH_TARGET:-@michengai/dsh-codex-ui}"
-PATCH_SCRIPT="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCHSCRIPT"{print $2}')"
-PKG_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1!="#PATCH" && $1!="#PATCHSCRIPT" && NF==2')"
+PATCH_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCH" && NF==3 { print $2 "\t" $3 }')"
+PKG_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1!="#PATCH" && NF==2')"
 [ -n "$PKG_LINES" ] || die "manifest lists no packages"
-[ -n "$PATCH_SCRIPT" ] || die "the manifest names no patch script"
-# The applier is owned by the plugins repo; its path is relative to that
-# checkout.
-PATCH_APPLIER="$PLUGINS_ROOT/$PATCH_SCRIPT"
+[ -n "$PATCH_LINES" ] || die "the manifest names no patches"
+# The appliers are owned by the plugins repo; their paths are relative to
+# that checkout.
+PATCH_APPLIERS=""
+while IFS=$'\t' read -r target script; do
+  [ -n "${target:-}" ] || continue
+  PATCH_APPLIERS="${PATCH_APPLIERS}${target}	${PLUGINS_ROOT}/${script}
+"
+done <<< "$PATCH_LINES"
 
 log "lane $LANE (service $SERVICE, port $PORT)"
 log "plugins root: $PLUGINS_ROOT"
 log "profile: $PROFILE_DIR"
 log "artifacts: $ARTIFACTS_DIR"
 log "packages: $(printf '%s\n' "$PKG_LINES" | cut -f1 | tr '\n' ' ')"
-log "patch target: $PATCH_TARGET"
-log "patch script: $PATCH_APPLIER"
+log "patches:"
+while IFS=$'\t' read -r target applier; do
+  [ -n "${target:-}" ] || continue
+  log "  $target <- $applier"
+done <<< "$PATCH_APPLIERS"
 
 # --- 2. build and pack ------------------------------------------------------
 # The plugins repo is a pnpm workspace whose root build script compiles the
@@ -268,7 +278,11 @@ if [ "$DRY_RUN" = "1" ]; then
   log "would rewrite the file: dependencies of: $(printf '%s\n' "$PKG_LINES" | cut -f1 | tr '\n' ' ')"
   log "would REMOVE the obsolete @ddvnguyen/* profile dependencies that the manifest does not list"
   log "would run pnpm install in $PROFILE_DIR"
-  log "would apply $PATCH_APPLIER to $PROFILE_DIR/node_modules/$PATCH_TARGET"
+  while IFS=$'\t' read -r target applier; do
+    [ -n "${target:-}" ] || continue
+    log "would apply $applier to $PROFILE_DIR/node_modules/$target"
+    log "would verify that $PROFILE_DIR/node_modules/$target carries its patch"
+  done <<< "$PATCH_APPLIERS"
   log "would verify every package version and print the package -> version table"
   exit 0
 fi
@@ -317,13 +331,16 @@ rollback() {
       cp "$saved" "$tarball_path" || log "FATAL: could not restore the tarball $tarball_path"
     done < "$BACKUP_DIR/tarballs.tsv"
   fi
-  # The patch target may have been touched by a failed patch run: it is
-  # removed here and reinstalled from the restored lockfile, so the profile
-  # carries the unpatched package again.
-  if [ -d "$PROFILE_DIR/node_modules/$PATCH_TARGET" ]; then
-    rm -rf "$PROFILE_DIR/node_modules/$PATCH_TARGET" \
-      || log "FATAL: could not remove the patched $PATCH_TARGET"
-  fi
+  # A patch target may have been touched by a failed patch run: every one of
+  # them is removed here and reinstalled from the restored lockfile, so the
+  # profile carries the unpatched packages again.
+  while IFS=$'\t' read -r target applier; do
+    [ -n "${target:-}" ] || continue
+    if [ -d "$PROFILE_DIR/node_modules/$target" ]; then
+      rm -rf "$PROFILE_DIR/node_modules/$target" \
+        || log "FATAL: could not remove the patched $target"
+    fi
+  done <<< "$PATCH_APPLIERS"
   if [ -f "$BACKUP_DIR/pnpm-lock.yaml" ]; then
     cp "$BACKUP_DIR/pnpm-lock.yaml" "$PROFILE_DIR/pnpm-lock.yaml" || log "FATAL: could not restore pnpm-lock.yaml"
     ( cd "$PROFILE_DIR" && pnpm install --frozen-lockfile ) \
@@ -471,16 +488,29 @@ INSTALLED=1
 log "installing the profile"
 ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) || die "pnpm install failed in $PROFILE_DIR"
 
-# --- 5. apply the codex-ui patch -------------------------------------------
-PATCH_DIR="$PROFILE_DIR/node_modules/$PATCH_TARGET"
-[ -d "$PATCH_DIR" ] || die "patch target not installed: $PATCH_DIR"
-require_path "$PATCH_APPLIER" "the codex-ui patch applier"
-log "applying the codex-ui patch: $PATCH_APPLIER $PATCH_DIR"
-case "$PATCH_APPLIER" in
-  *.mjs|*.js) node "$PATCH_APPLIER" "$PATCH_DIR" || die "the codex-ui patch failed (moved anchor?) - the profile was restored to its previous state" ;;
-  *) "$PATCH_APPLIER" "$PATCH_DIR" || die "the codex-ui patch failed (moved anchor?) - the profile was restored to its previous state" ;;
-esac
-log "codex-ui patch applied"
+# --- 5. apply the patches ----------------------------------------------------
+# Every patch in the manifest is applied in turn and then VERIFIED: the
+# applier's --verify mode asserts that the installed package carries its
+# patch. A package that was left half-patched - an applier that wrote one
+# file and stopped, a package that was already patched in a way this applier
+# does not recognise - fails the deploy here instead of reaching the lane.
+while IFS=$'\t' read -r target applier; do
+  [ -n "${target:-}" ] || continue
+  patch_dir="$PROFILE_DIR/node_modules/$target"
+  [ -d "$patch_dir" ] || die "patch target not installed: $patch_dir"
+  require_path "$applier" "the patch applier for $target"
+  log "applying the $target patch: $applier $patch_dir"
+  case "$applier" in
+    *.mjs|*.js) node "$applier" "$patch_dir" || die "the $target patch failed (moved anchor?) - the profile was restored to its previous state" ;;
+    *) "$applier" "$patch_dir" || die "the $target patch failed (moved anchor?) - the profile was restored to its previous state" ;;
+  esac
+  log "verifying the $target patch"
+  case "$applier" in
+    *.mjs|*.js) node "$applier" "$patch_dir" --verify || die "the $target patch is not fully applied - the profile was restored to its previous state" ;;
+    *) "$applier" "$patch_dir" --verify || die "the $target patch is not fully applied - the profile was restored to its previous state" ;;
+  esac
+  log "$target patch applied and verified"
+done <<< "$PATCH_APPLIERS"
 
 # --- 6. verify --------------------------------------------------------------
 # Every package of the manifest must be in the profile package.json AND

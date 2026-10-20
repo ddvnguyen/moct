@@ -8,5 +8,14 @@
       ]
     }
   ],
-  "patch": { "target": "@michengai/dsh-codex-ui", "script": "scripts/codex-ui-sidebar-patch/apply.mjs" }
+  "patches": [
+    {
+      "target": "@michengai/dsh-codex-ui",
+      "script": "scripts/codex-ui-sidebar-patch/apply.mjs"
+    },
+    {
+      "target": "dshmarket",
+      "script": "scripts/dsh-market-trusted-host-patch/apply.mjs"
+    }
+  ]
 }
