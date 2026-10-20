@@ -81,17 +81,32 @@ name is the required status check on `main` and on `integration`. It runs
 concurrency group that cancels superseded runs on the same ref.
 
 The review round: a feature PR goes to `integration`, the `ci` check must be
-green, one approving review is required, and conversations must be resolved.
-The stack PR then carries the whole reviewed set to the released branch.
+green and one approving review is required. The stack PR then carries the
+whole reviewed set to the released branch.
+
+**The reviewer's identity is part of the gate.** GitHub refuses an approving
+review when the reviewer is the PR's author. The human and the agents share
+the `ddvnguyen` account here, so an agent that pushes under that account
+would make the PR unreviewable by anyone. An implementing agent therefore
+commits under an identity that is *not* the account, for example:
+
+```sh
+git config --worktree user.name "Multica Agent"
+git config --worktree user.email "agent@multica.local"
+```
+
+With that identity the commits are unlinked on GitHub, and the `ddvnguyen`
+account (the human, or the reviewing agent) can approve the PR. The process
+rule on top of it: an implementer never approves its own PR — only the Lead
+or the Architect agent is asked.
 
 The **stack guard** in `stack-pr.yml` decides whether the stack PR is
 auto-mergeable: every implementation PR in the stack must be merged, or must
 carry an approving review **and** a green `ci` check. Otherwise the blocking
 PRs are listed in the job output and a human merges. The workflow then asks
-for auto-merge with `gh pr merge --auto`; if GitHub refuses (the repository
-currently has `allow_auto_merge=false`), the job **fails loudly** with that
-reason instead of pretending the merge is queued. The integrator enables
-auto-merge in the repository settings.
+for auto-merge with `gh pr merge --auto`; if GitHub refuses, the job **fails
+loudly** with that reason instead of pretending the merge is queued.
+`allow_auto_merge` is enabled on the three repositories of the train.
 
 ## The lane map
 
@@ -123,6 +138,14 @@ The workflow resolves every requested ref to a sha with `git ls-remote`
 (a branch to its head, a tag to its **peeled** sha) and fails loudly, naming
 the repo and the ref, when it is missing.
 
+**The front door.** Because the two lanes share the conversation state, the
+user should keep talking to **one** hostname while the lanes rotate behind
+it. Point the public hostname at the active lane's port and move it during a
+rotation; the history follows the user because it lives in the shared tree.
+The public side of that mapping (DNS and the reverse proxy in front of
+`dsh-x.ddvnguyen.com` / `dsh-z.ddvnguyen.com`) is not on the deploy host —
+it is the one part of the rotation that this repository cannot change.
+
 ## The shared DSH state
 
 ```
@@ -139,10 +162,29 @@ Each lane symlinks those five directories out of `dsh-shared` into
 the profile is the lane's own writable plugin tree, the logs are the lane's
 own history. Conversation history is `sessions/` + `storages/`.
 
-**One writer per session.** The shared tree is shared *between lanes*, not
-between processes: a session is owned by the lane that created it. Two lanes
-writing the same session file corrupt it, and there is no lock that makes that
-safe. Rotate the lane, do not run both lanes against one session.
+**One writer per session.** The harness owns that rule, not this runbook. A
+session directory holds a `session.lock` that the persistence layer takes as a
+non-blocking POSIX `flock(2)` for the whole life of a write handle
+(`packages/session/session-persistence-jsonl/src/lease.ts` in the fork). The
+lock is taken on the inode, the holder verifies the inode is still the file at
+the lock path, and a contender does **not** wait: contention surfaces as
+`SessionAlreadyOwnedError` and the second writer is refused. The kernel
+releases the lock when the holder's descriptor closes, so a crashed holder
+never blocks a successor.
+
+So sharing the state tree is safe in the sense that matters: two lanes can
+read the same conversation history, and a write to the same session from both
+lanes at once is refused loudly instead of corrupting the log. Rotate the
+lane rather than running both lanes against one session.
+
+**One caveat on the shared KV store.** `storages/agent_team.sqlite` is opened
+in WAL mode by the fork's storage layer
+(`packages/storage/storage-sqlite/src/schema.ts`), which sets
+`PRAGMA journal_mode` but **no** `busy_timeout`. WAL is the right journal mode
+for two processes on one file, but without a busy timeout a second writer that
+arrives during a write transaction gets `SQLITE_BUSY` immediately instead of
+waiting. Keep one lane as the active one for the team store, and treat a
+busy error on it as a "the other lane was busy" signal, not as data loss.
 
 The symlink rule for `MOCT-X` also applies here: the unit `ExecStart` points
 **through** a symlink (`current -> releases/<sha>`), so anything that resolves
@@ -274,6 +316,19 @@ node -p "require('/mnt/workspace/clouds/dsh-x/data/home/profiles/web/node_module
 journalctl --user -u dsh-x -n 40 --no-pager
 ```
 
+Both lanes see the same conversation history:
+
+```sh
+for lane in x z; do
+  printf 'lane %s sessions: ' "$lane"
+  find -L "/mnt/workspace/clouds/dsh-$lane/data/home/sessions" -maxdepth 2 -name 'session-*' -type d | wc -l
+done
+stat -c '%i %n' /mnt/workspace/clouds/dsh-shared/storages/agent_team.sqlite \
+  /mnt/workspace/clouds/dsh-x/data/home/storages/agent_team.sqlite \
+  /mnt/workspace/clouds/dsh-z/data/home/storages/agent_team.sqlite
+# the same inode in all three paths: both lanes read and write one store
+```
+
 ## Protected ports
 
 `3080`, `3081`, `8099`, `8110`, `18081`, `18789`, `4097` and `8210` are
@@ -322,4 +377,8 @@ every post-switch failure (the health timeout, the `/health` mismatch,
 - Required-reviewer protection is available on this repo (the repository is
   public, so a protection `PUT` succeeds) and the integrator applies it: the
   released branch and `integration` require one approving review plus the CI
-  check, no direct push, no force push, and conversation resolution.
+  check, no direct push, no force push and no branch deletion. The API accepts
+  `required_conversation_resolution_enabled` on this repository and answers
+  `200`, but the resulting rule still reports
+  `required_conversation_resolution.enabled = false` — so conversation
+  resolution is **not** enforced here and must not be relied on.
