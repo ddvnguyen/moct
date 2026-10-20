@@ -48,6 +48,12 @@ What the tag is for:
 
 The tag does not release anything. Releasing is the stack PR.
 
+One GitHub fact that shapes the rollout: a workflow file is **activated** when
+it reaches the default branch (a scheduled or dispatchable workflow is only
+read from the default branch). A workflow that lives on `integration` alone
+is inert — it is listed by `gh workflow list` only once the stack PR merged
+it. That is why the first day of the train has no scheduled runs.
+
 ## The stack PR and its skip rule
 
 `.github/workflows/stack-pr.yml` runs on a schedule (every 30 minutes) and on
