@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DSH customizations deploy — installs the DSH plugin packages into ONE lane's
-# web profile and applies the codex-ui sidebar patch.
+# web profile and applies the manifest's patches.
 #
 # One lane per invocation: the lane owns its profile, its artifacts and its
 # backups. The script never touches another lane, never touches the PROD unit
@@ -22,9 +22,15 @@
 # directory — see harness_sibling() below.
 #
 # The manifest (deploy/dsh-customizations.json) is the single source of truth:
-# it lists the packages, the patch target and the patch script. The codex-ui
-# applier is owned by the PLUGINS repo (scripts/codex-ui-sidebar-patch/
-# apply.mjs) and its path is resolved against $PLUGINS_ROOT.
+# it lists the packages and the patches. Each patch names the package it
+# patches and the applier that patches it; the appliers are owned by the
+# PLUGINS repo (scripts/codex-ui-sidebar-patch/apply.mjs,
+# scripts/dsh-market-trusted-host-patch/apply.mjs) and their paths are
+# resolved against $PLUGINS_ROOT.
+#
+# Every patch is applied and then VERIFIED with the applier's --verify mode:
+# a package left half-patched fails the deploy here, instead of reaching the
+# lane.
 #
 # The installed version of each package is the version of the tarball that was
 # just built, and the profile is restored from the snapshot whenever anything
@@ -78,6 +84,17 @@ require_path() { # $1 = path, $2 = what it is
 }
 require_path "$PLUGINS_ROOT" "PLUGINS_ROOT"
 require_path "$MANIFEST" "manifest"
+
+# A manifest written before patches[] carries the legacy single 'patch' object.
+# Do not translate it silently: a manifest the script only half-understands is
+# exactly the failure mode this card exists to end. The check runs before
+# read_manifest, so the migration line is the only thing this run prints.
+LEGACY_PATCH="$(node -e '
+  const m = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+  process.stdout.write(m.patch && !m.patches ? "1" : "");
+' "$MANIFEST")" || die "manifest is unreadable: $MANIFEST"
+[ -z "$LEGACY_PATCH" ] || die "manifest uses the legacy single 'patch' key — migrate it to 'patches[]'"
+
 require_path "$PROFILE_DIR/package.json" "lane profile package.json"
 
 # The profile carries its own pnpm settings in `pnpm-workspace.yaml`
@@ -99,30 +116,34 @@ read_manifest() {
     const repo = (m.repos || [])[0];
     if (!repo) { console.error("manifest has no repos[] entry"); process.exit(2); }
     for (const p of repo.packages || []) console.log(`${p.name}\t${p.dir}`);
-    const patch = m.patch || {};
-    console.log(`#PATCH\t${patch.target || "@michengai/dsh-codex-ui"}`);
-    console.log(`#PATCHSCRIPT\t${patch.script || ""}`);
+    for (const patch of m.patches || []) console.log(`#PATCH\t${patch.target}\t${patch.script}`);
   ' "$MANIFEST"
 }
 
 MANIFEST_LINES="$(read_manifest)" || die "manifest is unreadable: $MANIFEST"
-PATCH_TARGET="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCH"{print $2}')"
-PATCH_TARGET="${PATCH_TARGET:-@michengai/dsh-codex-ui}"
-PATCH_SCRIPT="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCHSCRIPT"{print $2}')"
-PKG_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1!="#PATCH" && $1!="#PATCHSCRIPT" && NF==2')"
+PATCH_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCH" && NF==3 { print $2 "\t" $3 }')"
+PKG_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1!="#PATCH" && NF==2')"
 [ -n "$PKG_LINES" ] || die "manifest lists no packages"
-[ -n "$PATCH_SCRIPT" ] || die "the manifest names no patch script"
-# The applier is owned by the plugins repo; its path is relative to that
-# checkout.
-PATCH_APPLIER="$PLUGINS_ROOT/$PATCH_SCRIPT"
+[ -n "$PATCH_LINES" ] || die "the manifest names no patches"
+# The appliers are owned by the plugins repo; their paths are relative to
+# that checkout.
+PATCH_APPLIERS=""
+while IFS=$'\t' read -r target script; do
+  [ -n "${target:-}" ] || continue
+  PATCH_APPLIERS="${PATCH_APPLIERS}${target}	${PLUGINS_ROOT}/${script}
+"
+done <<< "$PATCH_LINES"
 
 log "lane $LANE (service $SERVICE, port $PORT)"
 log "plugins root: $PLUGINS_ROOT"
 log "profile: $PROFILE_DIR"
 log "artifacts: $ARTIFACTS_DIR"
 log "packages: $(printf '%s\n' "$PKG_LINES" | cut -f1 | tr '\n' ' ')"
-log "patch target: $PATCH_TARGET"
-log "patch script: $PATCH_APPLIER"
+log "patches:"
+while IFS=$'\t' read -r target applier; do
+  [ -n "${target:-}" ] || continue
+  log "  $target <- $applier"
+done <<< "$PATCH_APPLIERS"
 
 # --- 2. build and pack ------------------------------------------------------
 # The plugins repo is a pnpm workspace whose root build script compiles the
@@ -268,7 +289,11 @@ if [ "$DRY_RUN" = "1" ]; then
   log "would rewrite the file: dependencies of: $(printf '%s\n' "$PKG_LINES" | cut -f1 | tr '\n' ' ')"
   log "would REMOVE the obsolete @ddvnguyen/* profile dependencies that the manifest does not list"
   log "would run pnpm install in $PROFILE_DIR"
-  log "would apply $PATCH_APPLIER to $PROFILE_DIR/node_modules/$PATCH_TARGET"
+  while IFS=$'\t' read -r target applier; do
+    [ -n "${target:-}" ] || continue
+    log "would apply $applier to $PROFILE_DIR/node_modules/$target"
+    log "would verify that $PROFILE_DIR/node_modules/$target carries its patch"
+  done <<< "$PATCH_APPLIERS"
   log "would verify every package version and print the package -> version table"
   exit 0
 fi
@@ -317,13 +342,16 @@ rollback() {
       cp "$saved" "$tarball_path" || log "FATAL: could not restore the tarball $tarball_path"
     done < "$BACKUP_DIR/tarballs.tsv"
   fi
-  # The patch target may have been touched by a failed patch run: it is
-  # removed here and reinstalled from the restored lockfile, so the profile
-  # carries the unpatched package again.
-  if [ -d "$PROFILE_DIR/node_modules/$PATCH_TARGET" ]; then
-    rm -rf "$PROFILE_DIR/node_modules/$PATCH_TARGET" \
-      || log "FATAL: could not remove the patched $PATCH_TARGET"
-  fi
+  # A patch target may have been touched by a failed patch run: every one of
+  # them is removed here and reinstalled from the restored lockfile, so the
+  # profile carries the unpatched packages again.
+  while IFS=$'\t' read -r target applier; do
+    [ -n "${target:-}" ] || continue
+    if [ -d "$PROFILE_DIR/node_modules/$target" ]; then
+      rm -rf "$PROFILE_DIR/node_modules/$target" \
+        || log "FATAL: could not remove the patched $target"
+    fi
+  done <<< "$PATCH_APPLIERS"
   if [ -f "$BACKUP_DIR/pnpm-lock.yaml" ]; then
     cp "$BACKUP_DIR/pnpm-lock.yaml" "$PROFILE_DIR/pnpm-lock.yaml" || log "FATAL: could not restore pnpm-lock.yaml"
     ( cd "$PROFILE_DIR" && pnpm install --frozen-lockfile ) \
@@ -336,7 +364,46 @@ rollback() {
     ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) \
       || log "FATAL: the rollback install failed - the profile must be repaired by hand"
   fi
-  log "rollback done: the profile is back at the state of $BACKUP_DIR"
+  # The rollback is only as good as what it left behind, so it asserts the
+  # package set it restored instead of assuming the install did it.
+  #
+  # Every patched target must be back in the profile: the rollback removed it
+  # before the restoring install, and a target that was only a transitive
+  # dependency is NOT put back by pnpm - that profile cannot run the lane.
+  RESTORE_OK=1
+  while IFS=$'\t' read -r target applier; do
+    [ -n "${target:-}" ] || continue
+    if [ ! -d "$PROFILE_DIR/node_modules/$target" ]; then
+      log "FATAL: rollback left $target missing from the profile"
+      RESTORE_OK=0
+    fi
+  done <<< "$PATCH_APPLIERS"
+  # dshmarket is pinned exactly by the restored package.json, so the restored
+  # version is a string compare against that pin. A pin that is not an exact
+  # version (a range) cannot be compared with a string, and the check is
+  # skipped for it rather than reporting a mismatch it cannot judge.
+  WANT_DSHMARKET="$(node -e '
+const p = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+const spec = (p.dependencies && p.dependencies.dshmarket) || (p.devDependencies && p.devDependencies.dshmarket) || "";
+process.stdout.write(spec);
+' "$PROFILE_DIR/package.json" 2>/dev/null || true)"
+  if [ -n "$WANT_DSHMARKET" ] && ! printf '%s' "$WANT_DSHMARKET" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+    warn "the profile pins dshmarket as '$WANT_DSHMARKET' - not an exact version, so the restored version is not compared"
+    WANT_DSHMARKET=""
+  fi
+  if [ -n "$WANT_DSHMARKET" ]; then
+    GOT_DSHMARKET="$(node -e '
+const p = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+process.stdout.write(p.version || "");
+' "$PROFILE_DIR/node_modules/dshmarket/package.json" 2>/dev/null || true)"
+    if [ "$GOT_DSHMARKET" != "$WANT_DSHMARKET" ]; then
+      log "FATAL: rollback restored dshmarket ${GOT_DSHMARKET:-<missing>}, package.json pins $WANT_DSHMARKET"
+      RESTORE_OK=0
+    fi
+  fi
+  if [ "$RESTORE_OK" = "1" ]; then
+    log "rollback done: the profile is back at the state of $BACKUP_DIR"
+  fi
 }
 on_exit() {
   local code=$?
@@ -471,16 +538,29 @@ INSTALLED=1
 log "installing the profile"
 ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) || die "pnpm install failed in $PROFILE_DIR"
 
-# --- 5. apply the codex-ui patch -------------------------------------------
-PATCH_DIR="$PROFILE_DIR/node_modules/$PATCH_TARGET"
-[ -d "$PATCH_DIR" ] || die "patch target not installed: $PATCH_DIR"
-require_path "$PATCH_APPLIER" "the codex-ui patch applier"
-log "applying the codex-ui patch: $PATCH_APPLIER $PATCH_DIR"
-case "$PATCH_APPLIER" in
-  *.mjs|*.js) node "$PATCH_APPLIER" "$PATCH_DIR" || die "the codex-ui patch failed (moved anchor?) - the profile was restored to its previous state" ;;
-  *) "$PATCH_APPLIER" "$PATCH_DIR" || die "the codex-ui patch failed (moved anchor?) - the profile was restored to its previous state" ;;
-esac
-log "codex-ui patch applied"
+# --- 5. apply the patches ----------------------------------------------------
+# Every patch in the manifest is applied in turn and then VERIFIED: the
+# applier's --verify mode asserts that the installed package carries its
+# patch. A package that was left half-patched - an applier that wrote one
+# file and stopped, a package that was already patched in a way this applier
+# does not recognise - fails the deploy here instead of reaching the lane.
+while IFS=$'\t' read -r target applier; do
+  [ -n "${target:-}" ] || continue
+  patch_dir="$PROFILE_DIR/node_modules/$target"
+  [ -d "$patch_dir" ] || die "patch target not installed: $patch_dir"
+  require_path "$applier" "the patch applier for $target"
+  log "applying the $target patch: $applier $patch_dir"
+  case "$applier" in
+    *.mjs|*.js) node "$applier" "$patch_dir" || die "the $target patch failed (moved anchor?) - the profile was restored to its previous state" ;;
+    *) "$applier" "$patch_dir" || die "the $target patch failed (moved anchor?) - the profile was restored to its previous state" ;;
+  esac
+  log "verifying the $target patch"
+  case "$applier" in
+    *.mjs|*.js) node "$applier" "$patch_dir" --verify || die "the $target patch is not fully applied - the profile was restored to its previous state" ;;
+    *) "$applier" "$patch_dir" --verify || die "the $target patch is not fully applied - the profile was restored to its previous state" ;;
+  esac
+  log "$target patch applied and verified"
+done <<< "$PATCH_APPLIERS"
 
 # --- 6. verify --------------------------------------------------------------
 # Every package of the manifest must be in the profile package.json AND

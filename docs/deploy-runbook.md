@@ -213,17 +213,22 @@ single source of truth:
         { "name": "@ddvnguyen/dsh-sidebar", "dir": "packages/sidebar" }
       ] }
   ],
-  "patch": { "target": "@michengai/dsh-codex-ui",
-             "script": "scripts/codex-ui-sidebar-patch/apply.mjs" }
+  "patches": [
+    { "target": "@michengai/dsh-codex-ui",
+      "script": "scripts/codex-ui-sidebar-patch/apply.mjs" },
+    { "target": "dshmarket",
+      "script": "scripts/dsh-market-trusted-host-patch/apply.mjs" }
+  ]
 }
 ```
 
 One authority per script:
 
 - the **plugins repo** (`ddvnguyen/moct-dsh-team-room`) owns the DSH packages
-  **and** the codex-ui patch applier
-  (`scripts/codex-ui-sidebar-patch/apply.mjs`); the manifest path is relative
-  to the plugins checkout;
+  **and** the patch appliers
+  (`scripts/codex-ui-sidebar-patch/apply.mjs`,
+  `scripts/dsh-market-trusted-host-patch/apply.mjs`); the manifest path is
+  relative to the plugins checkout;
 - the **fork** (`ddvnguyen/deepseek-harness`) owns the release deploy script
   (`scripts/deploy/dsh-deploy.sh`), which is always run from the reviewed
   fork ref.
@@ -253,11 +258,13 @@ The path, in order:
    runs in the profile so their `node_modules` entries go away with them. A
    `@ddvnguyen/*` package left in the profile that the manifest does not list
    is a deploy failure, not a leftover.
-4. The codex-ui patch is applied:
-   `node <plugins>/scripts/codex-ui-sidebar-patch/apply.mjs
-   <profile>/node_modules/@michengai/dsh-codex-ui`. The applier is
+4. Every patch of the manifest is applied and then **verified**:
+   `node <plugins>/scripts/<patch script> <profile>/node_modules/<target>`,
+   followed by the same command with `--verify`. The appliers are
    anchor-based: a moved anchor is a **non-zero exit**, and the script fails
-   with that message.
+   with that message. The `--verify` pass asserts that the installed package
+   carries its patch, so a package left half-patched fails the deploy here
+   instead of reaching the lane.
 5. Every package of the manifest is verified: present in the profile
    `package.json` **and** resolvable in the profile's `node_modules` at the
    expected version, and no obsolete `@ddvnguyen/*` entry left. The script
@@ -270,8 +277,9 @@ The path, in order:
 
 `DRY_RUN=1` prints the plan and changes nothing on disk.
 
-The patch applier takes the codex-ui package directory as its argument and
-also accepts `--check`, which reports and writes nothing.
+The patch appliers take the package directory as their argument and also
+accept `--check`, which reports and writes nothing, and `--verify`, which
+asserts that the installed package carries its patch.
 
 ## Rollback
 
