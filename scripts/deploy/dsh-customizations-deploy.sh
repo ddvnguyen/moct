@@ -84,6 +84,17 @@ require_path() { # $1 = path, $2 = what it is
 }
 require_path "$PLUGINS_ROOT" "PLUGINS_ROOT"
 require_path "$MANIFEST" "manifest"
+
+# A manifest written before patches[] carries the legacy single 'patch' object.
+# Do not translate it silently: a manifest the script only half-understands is
+# exactly the failure mode this card exists to end. The check runs before
+# read_manifest, so the migration line is the only thing this run prints.
+LEGACY_PATCH="$(node -e '
+  const m = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+  process.stdout.write(m.patch && !m.patches ? "1" : "");
+' "$MANIFEST")" || die "manifest is unreadable: $MANIFEST"
+[ -z "$LEGACY_PATCH" ] || die "manifest uses the legacy single 'patch' key — migrate it to 'patches[]'"
+
 require_path "$PROFILE_DIR/package.json" "lane profile package.json"
 
 # The profile carries its own pnpm settings in `pnpm-workspace.yaml`
@@ -353,7 +364,46 @@ rollback() {
     ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) \
       || log "FATAL: the rollback install failed - the profile must be repaired by hand"
   fi
-  log "rollback done: the profile is back at the state of $BACKUP_DIR"
+  # The rollback is only as good as what it left behind, so it asserts the
+  # package set it restored instead of assuming the install did it.
+  #
+  # Every patched target must be back in the profile: the rollback removed it
+  # before the restoring install, and a target that was only a transitive
+  # dependency is NOT put back by pnpm - that profile cannot run the lane.
+  RESTORE_OK=1
+  while IFS=$'\t' read -r target applier; do
+    [ -n "${target:-}" ] || continue
+    if [ ! -d "$PROFILE_DIR/node_modules/$target" ]; then
+      log "FATAL: rollback left $target missing from the profile"
+      RESTORE_OK=0
+    fi
+  done <<< "$PATCH_APPLIERS"
+  # dshmarket is pinned exactly by the restored package.json, so the restored
+  # version is a string compare against that pin. A pin that is not an exact
+  # version (a range) cannot be compared with a string, and the check is
+  # skipped for it rather than reporting a mismatch it cannot judge.
+  WANT_DSHMARKET="$(node -e '
+const p = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+const spec = (p.dependencies && p.dependencies.dshmarket) || (p.devDependencies && p.devDependencies.dshmarket) || "";
+process.stdout.write(spec);
+' "$PROFILE_DIR/package.json" 2>/dev/null || true)"
+  if [ -n "$WANT_DSHMARKET" ] && ! printf '%s' "$WANT_DSHMARKET" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+    warn "the profile pins dshmarket as '$WANT_DSHMARKET' - not an exact version, so the restored version is not compared"
+    WANT_DSHMARKET=""
+  fi
+  if [ -n "$WANT_DSHMARKET" ]; then
+    GOT_DSHMARKET="$(node -e '
+const p = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+process.stdout.write(p.version || "");
+' "$PROFILE_DIR/node_modules/dshmarket/package.json" 2>/dev/null || true)"
+    if [ "$GOT_DSHMARKET" != "$WANT_DSHMARKET" ]; then
+      log "FATAL: rollback restored dshmarket ${GOT_DSHMARKET:-<missing>}, package.json pins $WANT_DSHMARKET"
+      RESTORE_OK=0
+    fi
+  fi
+  if [ "$RESTORE_OK" = "1" ]; then
+    log "rollback done: the profile is back at the state of $BACKUP_DIR"
+  fi
 }
 on_exit() {
   local code=$?
