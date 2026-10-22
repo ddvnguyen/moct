@@ -134,6 +134,7 @@ jobs:
           echo "plugins branch=$PLUGINS_BRANCH sha=$PLUGINS_SHA"
           echo "fork_sha=$FORK_SHA" >> "$GITHUB_OUTPUT"
           echo "plugins_sha=$PLUGINS_SHA" >> "$GITHUB_OUTPUT"
+          echo "plugins_branch=$PLUGINS_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Checkout the fork at the product sha (real directory, named like the plugins repo's harness sibling)
         uses: actions/checkout@v4
@@ -180,6 +181,11 @@ jobs:
           DSH_ROOT: /mnt/workspace/clouds/dsh-${{ inputs.lane }}
           PROFILE_DIR: /mnt/workspace/clouds/dsh-${{ inputs.lane }}/data/home/profiles/web
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          # The plugins commit this deploy ships. It names the artifact and is
+          # written into the installed package, so the lane can answer "which
+          # plugins commit am I running?" from a file.
+          PLUGINS_SHA: ${{ steps.resolve.outputs.plugins_sha }}
+          PLUGINS_BRANCH: ${{ steps.resolve.outputs.plugins_branch }}
           # The plugins repo resolves its harness sibling by that name; the
           # product checkout IS the harness and lives next to the plugins
           # checkout under that name. It must be a real directory, not a
@@ -215,6 +221,7 @@ jobs:
         env:
           PORT: ${{ inputs.lane == 'x' && '3181' || '3180' }}
           PROFILE_DIR: /mnt/workspace/clouds/dsh-${{ inputs.lane }}/data/home/profiles/web
+          PLUGINS_SHA: ${{ steps.resolve.outputs.plugins_sha }}
         run: |
           set -euo pipefail
           echo "--- lane root"
@@ -243,6 +250,7 @@ jobs:
             const fs = require("node:fs");
             const path = require("node:path");
             const profile = process.argv[1];
+            const sha = process.argv[2];
             const manifest = JSON.parse(fs.readFileSync("deploy/dsh-customizations.json", "utf8"));
             const pkg = JSON.parse(fs.readFileSync(path.join(profile, "package.json"), "utf8"));
             const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies);
@@ -255,7 +263,20 @@ jobs:
                 : "MISSING";
               const spec = deps[p.name] || "MISSING";
               if (version === "MISSING") bad++;
-              console.log(`${p.name}  installed=${version}  spec=${spec}`);
+              // The build marker names the commit the installed package was
+              // built from. A version says nothing here: the version of a
+              // plugin only moves on a release commit, so a stale install and
+              // a good one carry the same version.
+              const markerPath = path.join(profile, "node_modules", p.name, "build-info.json");
+              let built = "MISSING";
+              if (fs.existsSync(markerPath)) {
+                try { built = JSON.parse(fs.readFileSync(markerPath, "utf8")).pluginsSha || "MISSING"; } catch { built = "UNREADABLE"; }
+              }
+              if (built !== sha) {
+                console.error(`STALE ${p.name} was built from ${built}, this run ships ${sha}`);
+                bad++;
+              }
+              console.log(`${p.name}  installed=${version}  build=${built}  spec=${spec}`);
             }
             // The @ddvnguyen scope must be exactly the manifest set: an extra
             // entry is an obsolete package left in the profile.
@@ -267,4 +288,5 @@ jobs:
               bad++;
             }
             if (bad) { console.error(`${bad} problem(s) with the installed package set`); process.exit(1); }
-          ' "$PROFILE_DIR"
+            console.log(`the lane runs the plugins commit ${sha}`);
+          ' "$PROFILE_DIR" "$PLUGINS_SHA"

@@ -17,6 +17,14 @@
 #   DSH_HARNESS_DIR name of the plugins repo's harness sibling checkout
 #                 default: deepseek-harness, next to the plugins checkout
 #
+#   PLUGINS_SHA   the plugins commit this deploy ships     default: the HEAD of
+#                 the plugins checkout
+#   PLUGINS_BRANCH the branch that commit came from         default: (unset)
+#
+# The commit names the artifact and is written into the installed package
+# (build-info.json), so the lane can answer "which plugins commit am I
+# running?" from a file.
+#
 # The plugins repo resolves its sibling harness checkout through that name (the
 # type facades point at the sibling's sources). The sibling must be a real
 # directory — see harness_sibling() below.
@@ -41,7 +49,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MANIFEST="${MANIFEST:-$REPO_ROOT/deploy/dsh-customizations.json}"
 
-log() { printf '[dsh-customizations %s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
+# The log goes to stderr: stdout is this script's DATA channel (the manifest
+# and the packed packages are read back from it), and a log line that lands
+# in that data is parsed as a package name. The deploy's output still shows
+# up in the CI log - both streams are captured there.
+log() { printf '[dsh-customizations %s] %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
 die() { printf '[dsh-customizations %s] FATAL: %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; exit 1; }
 warn() { printf '[dsh-customizations %s] WARN: %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
 
@@ -61,6 +73,22 @@ esac
 
 PLUGINS_ROOT="${PLUGINS_ROOT:-}"
 [ -n "$PLUGINS_ROOT" ] || die "PLUGINS_ROOT is required (checkout of the plugins repo)"
+
+# The plugins commit this deploy ships. The workflow resolves it before it
+# checks the plugins repo out, so the checkout IS that commit; the git
+# fallback covers a deploy that runs from a checkout without the env. The
+# commit is not decoration: it names the artifact and it is written into the
+# installed package, so the lane can answer "which plugins commit am I
+# running?" from a file.
+PLUGINS_SHA="${PLUGINS_SHA:-}"
+PLUGINS_BRANCH="${PLUGINS_BRANCH:-}"
+if [ -z "$PLUGINS_SHA" ]; then
+  PLUGINS_SHA="$(git -C "$PLUGINS_ROOT" rev-parse HEAD 2>/dev/null || true)"
+fi
+[ -n "$PLUGINS_SHA" ] || die "the plugins commit is unknown: set PLUGINS_SHA or check the plugins repo out from git"
+printf '%s' "$PLUGINS_SHA" | grep -Eq '^[0-9a-f]{7,40}$' \
+  || die "PLUGINS_SHA is not a commit sha: '$PLUGINS_SHA'"
+PLUGINS_SHORT_SHA="$(printf '%s' "$PLUGINS_SHA" | cut -c1-7)"
 
 DSH_ROOT="${DSH_ROOT:-/mnt/workspace/clouds/dsh-$LANE}"
 PROFILE_DIR="${PROFILE_DIR:-$DSH_ROOT/data/home/profiles/web}"
@@ -125,6 +153,17 @@ PATCH_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCH" && NF=
 PKG_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1!="#PATCH" && NF==2')"
 [ -n "$PKG_LINES" ] || die "manifest lists no packages"
 [ -n "$PATCH_LINES" ] || die "the manifest names no patches"
+# The package names are used as paths under the profile's node_modules (the
+# install removes the installed copy before it re-links it), so a name that is
+# not a plain package name must never reach a removal. A scoped name
+# (@scope/name) is one path segment deeper and is fine.
+while IFS=$'\t' read -r name _dir; do
+  [ -n "$name" ] || continue
+  base="${name#@*/}"
+  case "$base" in
+    */*|*..*) die "the manifest names an unsafe package: '$name'" ;;
+  esac
+done <<< "$PKG_LINES"
 # The appliers are owned by the plugins repo; their paths are relative to
 # that checkout.
 PATCH_APPLIERS=""
@@ -163,6 +202,14 @@ install_deps() {
 # packages are therefore removed from the lockfile before the install, so pnpm
 # resolves them again and records the checksum of the tarball it just built.
 # The rest of the lockfile is untouched: every other dependency stays pinned.
+#
+# Only the `packages:` and `snapshots:` entries are removed, together with
+# their body. The `importers:` section keeps the manifest's packages: that
+# section says which SPEC the profile asked for, and pnpm compares it with
+# package.json — a changed spec is what makes pnpm resolve the dependency
+# again. Dropping the importer's entry instead leaves its `specifier:` and
+# `version:` lines orphaned under `dependencies:`, which is a lockfile pnpm
+# cannot read (pnpm 11 fails on it with "Cannot read properties of undefined").
 strip_lock_entries() { # $1 = lockfile path
   node -e '
     const fs = require("node:fs");
@@ -170,6 +217,7 @@ strip_lock_entries() { # $1 = lockfile path
     const names = new Set(JSON.parse(namesJson));
     const lines = fs.readFileSync(lockPath, "utf8").split("\n");
     const out = [];
+    let section = null;
     let dropIndent = null;
     let removed = 0;
     for (const line of lines) {
@@ -180,21 +228,29 @@ strip_lock_entries() { # $1 = lockfile path
         dropIndent = null;
       }
       const trimmed = line.trim();
+      // A top-level section header: "packages:", "snapshots:", "importers:".
+      if (/^[A-Za-z][A-Za-z0-9_-]*:\s*$/.test(trimmed)) {
+        section = trimmed.slice(0, -1);
+        out.push(line);
+        continue;
+      }
+      if (section !== "packages" && section !== "snapshots") {
+        out.push(line);
+        continue;
+      }
       let key = null;
-      if (trimmed.startsWith("'\''@ddvnguyen/")) {
-        const first = trimmed.indexOf("'\''");
-        const last = trimmed.lastIndexOf("'\''");
+      if (trimmed.startsWith("'"'"'")) {
+        const first = trimmed.indexOf("'"'"'");
+        const last = trimmed.lastIndexOf("'"'"'");
         if (last > first) key = trimmed.slice(first + 1, last);
       } else if (trimmed.startsWith("@ddvnguyen/")) {
-        const m = trimmed.match(/^(@ddvnguyen\/[^:]+):/);
-        if (m) key = m[1];
+        key = trimmed.replace(/:$/, "");
       }
       if (key !== null) {
         const base = key.split("@file:")[0];
         if (names.has(base)) {
           const indent = line.length - line.trimStart().length;
-          const inline = trimmed.endsWith(":") || trimmed.endsWith(": {}") || trimmed.endsWith(":[]");
-          dropIndent = inline ? null : indent;
+          dropIndent = indent;
           removed++;
           console.log("removed the stale lockfile entry " + key);
           continue;
@@ -274,27 +330,63 @@ build_and_pack() { # $1 = manifest dir, $2 = package name -> "<name>\t<version>\
   esac
   tarball="$ARTIFACTS_DIR/$(basename "$packed")"
   [ -f "$tarball" ] || die "the packed tarball is missing: $tarball"
-  log "packed $name $version -> $tarball"
+  # The artifact is named by the plugins COMMIT, not by the version alone.
+  # The version of a plugin only moves on a release commit, so two different
+  # builds would write the same path with different content - and the
+  # profile's lockfile pins that path by integrity, so the lane would keep
+  # serving the bytes of the previous build. The commit moves the path with
+  # the content, so the lockfile can never pin a stale copy of a path whose
+  # content changed.
+  stamped="$ARTIFACTS_DIR/$(basename "$packed" .tgz)-$PLUGINS_SHORT_SHA.tgz"
+  mv "$tarball" "$stamped" || die "cannot rename the tarball to $stamped"
+  tarball="$stamped"
+  # The artifact carries the build it was made from: the marker is written
+  # INTO the tarball, so the installed package carries it too and the lane
+  # can answer "which plugins commit am I running?" from a file.
+  build_info="$(mktemp)"
+  node -e '
+    const fs = require("node:fs");
+    const [out, name, version, sha, branch, artifact] = process.argv.slice(1);
+    fs.writeFileSync(out, JSON.stringify({
+      package: name,
+      version,
+      pluginsSha: sha,
+      pluginsShortSha: sha.slice(0, 7),
+      pluginsBranch: branch || null,
+      builtAt: new Date().toISOString(),
+      artifact,
+    }, null, 2) + "\n");
+  ' "$build_info" "$name" "$version" "$PLUGINS_SHA" "$PLUGINS_BRANCH" "$(basename "$tarball")" \
+    || die "cannot write the build info of $name"
+  node "$SCRIPT_DIR/package-artifact.mjs" inject "$tarball" "$build_info" \
+    || die "cannot write the build info into $tarball"
+  rm -f "$build_info"
+  log "packed $name $version (plugins $PLUGINS_SHORT_SHA) -> $tarball"
   printf '%s\t%s\t%s\n' "$name" "$version" "$tarball"
 }
 
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY_RUN=1 - plan only, nothing on disk changes"
+  log "plugins commit: $PLUGINS_SHA"
   log "would install the plugins repo dependencies in $PLUGINS_ROOT"
   while IFS=$'\t' read -r name dir; do
     [ -n "$name" ] || continue
-    log "would build and pack $name from $PLUGINS_ROOT/$dir into $ARTIFACTS_DIR"
+    log "would build and pack $name from $PLUGINS_ROOT/$dir into $ARTIFACTS_DIR as <name>-<version>-$PLUGINS_SHORT_SHA.tgz"
   done <<< "$PKG_LINES"
+  log "would write the build info (plugins $PLUGINS_SHORT_SHA) into every artifact"
   log "would snapshot $PROFILE_DIR/package.json and pnpm-lock.yaml into $DSH_ROOT/data/backups/customizations-<timestamp>/"
   log "would rewrite the file: dependencies of: $(printf '%s\n' "$PKG_LINES" | cut -f1 | tr '\n' ' ')"
   log "would REMOVE the obsolete @ddvnguyen/* profile dependencies that the manifest does not list"
+  log "would REMOVE the installed copies of the manifest's packages so pnpm re-links this build"
   log "would run pnpm install in $PROFILE_DIR"
+  log "would compare every installed package with the artifact it was installed from"
   while IFS=$'\t' read -r target applier; do
     [ -n "${target:-}" ] || continue
     log "would apply $applier to $PROFILE_DIR/node_modules/$target"
     log "would verify that $PROFILE_DIR/node_modules/$target carries its patch"
   done <<< "$PATCH_APPLIERS"
   log "would verify every package version and print the package -> version table"
+  log "would print the plugins commit the lane runs"
   exit 0
 fi
 
@@ -352,6 +444,17 @@ rollback() {
         || log "FATAL: could not remove the patched $target"
     fi
   done <<< "$PATCH_APPLIERS"
+  # The manifest's packages are removed too: the install of this run removed
+  # them before it linked the new build, and pnpm reuses an import whose path
+  # did not move. Removing them makes the restoring install link the bytes of
+  # the restored lockfile - the build the profile ran before this deploy.
+  while IFS=$'\t' read -r name _rest; do
+    [ -n "$name" ] || continue
+    if [ -d "$PROFILE_DIR/node_modules/$name" ]; then
+      rm -rf "$PROFILE_DIR/node_modules/$name" \
+        || log "FATAL: could not remove the installed $name"
+    fi
+  done <<< "$PACKED"
   if [ -f "$BACKUP_DIR/pnpm-lock.yaml" ]; then
     cp "$BACKUP_DIR/pnpm-lock.yaml" "$PROFILE_DIR/pnpm-lock.yaml" || log "FATAL: could not restore pnpm-lock.yaml"
     ( cd "$PROFILE_DIR" && pnpm install --frozen-lockfile ) \
@@ -378,6 +481,26 @@ rollback() {
       RESTORE_OK=0
     fi
   done <<< "$PATCH_APPLIERS"
+  # The manifest's packages must be back when the profile ran them before
+  # this deploy: the rollback removed them before the restoring install, so
+  # a package that stayed missing means the profile cannot run the lane. A
+  # package the profile did not depend on before this deploy is not expected
+  # back - the snapshot says what the profile looked like.
+  while IFS=$'\t' read -r name _rest; do
+    [ -n "$name" ] || continue
+    WAS_DEPENDED="$(node -e '
+const fs = require("node:fs");
+const [pkgPath, name] = process.argv.slice(1);
+const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies);
+process.stdout.write(deps[name] ? "1" : "");
+' "$BACKUP_DIR/package.json" 2>/dev/null || true)"
+    [ "$WAS_DEPENDED" = "1" ] || continue
+    if [ ! -d "$PROFILE_DIR/node_modules/$name" ]; then
+      log "FATAL: rollback left $name missing from the profile"
+      RESTORE_OK=0
+    fi
+  done <<< "$PACKED"
   # dshmarket is pinned exactly by the restored package.json, so the restored
   # version is a string compare against that pin. A pin that is not an exact
   # version (a range) cannot be compared with a string, and the check is
@@ -535,8 +658,43 @@ if [ -f "$PROFILE_DIR/pnpm-lock.yaml" ]; then
   strip_lock_entries "$PROFILE_DIR/pnpm-lock.yaml" || die "could not strip the stale lockfile entries"
 fi
 INSTALLED=1
+# The install must REPLACE the manifest's packages, not reuse what is
+# installed. pnpm's import of a `file:` tarball is keyed by its PATH: a
+# tarball whose path did not move keeps the previously imported bytes, so the
+# lane runs the previous build while the lockfile and the artifact both look
+# current. The installed copy is therefore removed before the install - the
+# same thing the rollback path does - so pnpm re-links the bytes of the
+# tarball that was just built. strip_lock_entries above makes pnpm resolve
+# the dependency again; this makes it re-link it.
+log "removing the installed copies so pnpm re-links this build"
+while IFS=$'\t' read -r name _rest; do
+  [ -n "$name" ] || continue
+  installed_dir="$PROFILE_DIR/node_modules/$name"
+  case "$installed_dir" in
+    "$PROFILE_DIR"/node_modules/*) : ;;
+    *) die "refusing to remove $installed_dir (outside the profile)" ;;
+  esac
+  if [ -e "$installed_dir" ]; then
+    rm -rf "$installed_dir" || die "cannot remove the installed $name ($installed_dir)"
+    log "removed the installed $name"
+  fi
+done <<< "$PACKED"
 log "installing the profile"
 ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) || die "pnpm install failed in $PROFILE_DIR"
+
+# The proof that the lane runs the build this deploy produced is the
+# CONTENT: the installed package must carry the bytes of the artifact it was
+# installed from. A version equality is not evidence of a correct deploy -
+# the version of a plugin only moves on a release commit, so a stale install
+# and a good one carry the same version. The check runs before the patches,
+# which change the installed bytes on purpose and have their own --verify.
+log "comparing the installed packages with the artifacts"
+while IFS=$'\t' read -r name _version tarball; do
+  [ -n "$name" ] || continue
+  node "$SCRIPT_DIR/package-artifact.mjs" verify "$tarball" "$PROFILE_DIR/node_modules/$name" \
+    || die "the installed $name does not carry the build in $(basename "$tarball") - the profile was restored to its previous state"
+  log "$name carries the bytes of $(basename "$tarball")"
+done <<< "$PACKED"
 
 # --- 5. apply the patches ----------------------------------------------------
 # Every patch in the manifest is applied in turn and then VERIFIED: the
@@ -564,13 +722,14 @@ done <<< "$PATCH_APPLIERS"
 
 # --- 6. verify --------------------------------------------------------------
 # Every package of the manifest must be in the profile package.json AND
-# resolvable in the profile's node_modules at the expected version, and the
-# profile must carry NO @ddvnguyen/* dependency outside the manifest.
+# resolvable in the profile's node_modules at the expected version, the
+# profile must carry NO @ddvnguyen/* dependency outside the manifest, and
+# every installed package must name the plugins commit this deploy shipped.
 verify() {
   node -e '
     const fs = require("node:fs");
     const path = require("node:path");
-    const [profile, pairsJson] = process.argv.slice(1);
+    const [profile, pairsJson, sha] = process.argv.slice(1);
     const pairs = Object.entries(JSON.parse(pairsJson));
     const pkg = JSON.parse(fs.readFileSync(path.join(profile, "package.json"), "utf8"));
     const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies);
@@ -581,13 +740,27 @@ verify() {
       const installedPath = path.join(profile, "node_modules", name, "package.json");
       let installed = null;
       if (fs.existsSync(installedPath)) installed = JSON.parse(fs.readFileSync(installedPath, "utf8")).version;
+      // The build marker names the commit the installed package was built
+      // from. It is the answer to "which plugins commit am I running?", and
+      // a marker that names another commit means the profile still runs an
+      // older build.
+      const markerPath = path.join(profile, "node_modules", name, "build-info.json");
+      let built = null;
+      if (fs.existsSync(markerPath)) {
+        try { built = JSON.parse(fs.readFileSync(markerPath, "utf8")).pluginsSha || null; } catch { built = null; }
+      }
       const ok = installed === version && typeof spec === "string";
+      const buildOk = built === sha;
       if (!ok) bad++;
-      rows.push([name, version, installed || "MISSING", spec || "MISSING", ok ? "ok" : "FAIL"]);
+      if (!buildOk) {
+        bad++;
+        console.log("STALE BUILD  " + name + " was built from " + (built || "an unknown commit") + ", this deploy ships " + sha);
+      }
+      rows.push([name, version, installed || "MISSING", (built || "MISSING").slice(0, 7), spec || "MISSING", ok && buildOk ? "ok" : "FAIL"]);
     }
-    const w = [0,1,2,3,4].map(i => Math.max(...rows.map(r => r[i].length), 4));
+    const w = [0,1,2,3,4,5].map(i => Math.max(...rows.map(r => r[i].length), 4));
     const fmt = r => r.map((c, i) => String(c).padEnd(w[i])).join("  ");
-    console.log(fmt(["package", "expected", "installed", "spec", "state"]));
+    console.log(fmt(["package", "expected", "installed", "build", "spec", "state"]));
     console.log(w.map(n => "-".repeat(n)).join("  "));
     for (const r of rows) console.log(fmt(r));
     // The @ddvnguyen scope must match the manifest exactly: an extra entry is
@@ -623,9 +796,10 @@ verify() {
         if (name) out[name] = version;
       }
       process.stdout.write(JSON.stringify(out));
-    });')"
+    });')" "$PLUGINS_SHA"
 }
 
-verify || die "verification failed: not every manifest package is installed at the expected version, or an obsolete @ddvnguyen package is still in the profile"
-log "every manifest package is installed at the expected version"
+verify || die "verification failed: a manifest package is not installed at the expected version, an obsolete @ddvnguyen package is still in the profile, or a package was not built from the plugins commit this deploy ships"
+log "every manifest package is installed at the expected version and was built from $PLUGINS_SHORT_SHA"
+log "the lane runs the plugins commit $PLUGINS_SHA"
 log "customizations deploy complete for lane $LANE"
