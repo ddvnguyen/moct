@@ -270,7 +270,16 @@ The path, in order:
 
 1. `scripts/deploy/dsh-customizations-deploy.sh` builds every package of the
    manifest from the plugins checkout with the repo's own build script and
-   packs it with `npm pack` into `<lane-root>/artifacts/`. The plugins repo
+   packs it with `npm pack` into `<lane-root>/artifacts/`. The artifact is
+   named after the **plugins commit** it was built from
+   (`<name>-<version>-<sha7>.tgz`), not after the version alone: a version
+   only moves on a release commit, so two different builds would write the
+   same path with different content and the profile's lockfile - which pins
+   that `file:` spec by integrity - could pin the previous build's bytes.
+   The artifact also carries `build-info.json` (the commit, the branch, the
+   version, the artifact name), so the installed package says which build it
+   is.
+   The plugins repo
    compiles against a sibling `deepseek-harness` checkout (its tsconfig
    facades point at that sibling's sources) and that sibling must be a **real
    directory**: a symlink resolves to its real path and the TypeScript
@@ -291,22 +300,40 @@ The path, in order:
    runs in the profile so their `node_modules` entries go away with them. A
    `@ddvnguyen/*` package left in the profile that the manifest does not list
    is a deploy failure, not a leftover.
-4. Every patch of the manifest is applied and then **verified**:
+   The install **replaces** the manifest's packages instead of reusing them:
+   their installed directories are removed before the install, the way the
+   rollback path does it. pnpm's import of a `file:` tarball is keyed by its
+   path, so a package whose path did not move keeps the bytes pnpm imported
+   before - the lane would serve the previous build while every version check
+   stayed green. The stale `packages:`/`snapshots:` entries of those packages
+   are dropped from the profile's lockfile as well, so pnpm resolves them
+   again and records the checksum of the tarball that was just built.
+4. The installed packages are compared with the artifacts they were installed
+   from, **file by file** (`scripts/deploy/package-artifact.mjs verify`). A
+   version equality is not evidence of a correct deploy - the version of a
+   plugin only moves on a release commit - so the deploy compares the bytes
+   and names every file that differs.
+5. Every patch of the manifest is applied and then **verified**:
    `node <plugins>/scripts/<patch script> <profile>/node_modules/<target>`,
    followed by the same command with `--verify`. The appliers are
    anchor-based: a moved anchor is a **non-zero exit**, and the script fails
    with that message. The `--verify` pass asserts that the installed package
    carries its patch, so a package left half-patched fails the deploy here
    instead of reaching the lane.
-5. Every package of the manifest is verified: present in the profile
+6. Every package of the manifest is verified: present in the profile
    `package.json` **and** resolvable in the profile's `node_modules` at the
-   expected version, and no obsolete `@ddvnguyen/*` entry left. The script
-   prints the package -> version table.
-6. On any failure after step 3, the snapshot is restored, `pnpm install` runs
+   expected version, built from the plugins commit this deploy ships, and no
+   obsolete `@ddvnguyen/*` entry left. The script prints the package ->
+   version -> build table.
+7. On any failure after step 3, the snapshot is restored, `pnpm install` runs
    again and the script exits non-zero. The rollback is wired to the **EXIT
    trap**, not ERR: `die()` calls `exit 1` and bash never runs an ERR trap for
    `exit`, so an ERR-only rollback would miss every failure after the install
    step. The rollback happens before the script returns.
+
+The deploy's **stdout** is its data channel (the manifest and the packed
+packages are read back from it) and its **log** goes to stderr. Both streams
+show up in the CI log.
 
 `DRY_RUN=1` prints the plan and changes nothing on disk.
 
@@ -375,6 +402,28 @@ curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3181/
 node -p "require('/mnt/workspace/clouds/dsh-x/data/home/profiles/web/node_modules/@ddvnguyen/moct-dsh-team-room/package.json').version"
 journalctl --user -u dsh-x -n 40 --no-pager
 ```
+
+**Which plugins commit is the lane running?** The installed package carries
+the build it was installed from (`build-info.json`, written into the
+artifact):
+
+```sh
+node -p "require('/mnt/workspace/clouds/dsh-x/data/home/profiles/web/node_modules/@ddvnguyen/moct-dsh-team-room/build-info.json').pluginsSha"
+```
+
+**Does the lane run the bytes of the artifact it was installed from?** The
+same comparison the deploy makes, by hand:
+
+```sh
+node scripts/deploy/package-artifact.mjs verify \
+  /mnt/workspace/clouds/dsh-x/artifacts/ddvnguyen-moct-dsh-team-room-<version>-<sha7>.tgz \
+  /mnt/workspace/clouds/dsh-x/data/home/profiles/web/node_modules/@ddvnguyen/moct-dsh-team-room
+```
+
+It prints every file that differs and exits non-zero when the installed
+package is not the artifact. A version equality is not evidence of a correct
+deploy: the version of a plugin only moves on a release commit, so a stale
+install and a good one carry the same version.
 
 Both lanes see the same conversation history:
 
