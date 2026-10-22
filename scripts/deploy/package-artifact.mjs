@@ -67,7 +67,13 @@ function sha256(file) {
 function inject(tarball, markerFile) {
   if (!fs.existsSync(tarball)) die(`no such tarball: ${tarball}`);
   if (!fs.existsSync(markerFile)) die(`no such build info: ${markerFile}`);
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), "pkg-artifact-"));
+  // The work dir sits NEXT TO the tarball, on the tarball's own device: the
+  // rebuilt tarball is renamed onto it at the end, and rename cannot cross
+  // devices. On a lane the artifacts dir is on the nvme while TMPDIR is
+  // tmpfs, so a work dir in /tmp made the final rename fail with EXDEV - the
+  // deploy built the artifact and then died before installing it. A temp dir
+  // inside the destination also keeps the rename atomic.
+  const work = fs.mkdtempSync(path.join(path.dirname(tarball), ".pkg-artifact-"));
   try {
     tar(["-xzf", tarball, "-C", work]);
     const root = path.join(work, "package");
