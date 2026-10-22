@@ -73,9 +73,18 @@ function inject(tarball, markerFile) {
     const root = path.join(work, "package");
     if (!fs.existsSync(root)) die(`the tarball has no package/ root: ${tarball}`);
     fs.copyFileSync(markerFile, path.join(root, MARKER));
-    const out = path.join(work, "out.tgz");
-    tar(["-czf", out, "-C", work, "package"]);
-    fs.renameSync(out, tarball);
+    // The rewritten tarball is written INSIDE the destination directory and
+    // renamed within it. A rename cannot cross a filesystem (EXDEV), and the
+    // deploy's artifact directory is often on another one than the temp
+    // directory; a rename inside one directory is atomic, so a reader never
+    // sees a half-written artifact.
+    const out = path.join(path.dirname(tarball), `.${path.basename(tarball)}.tmp-${process.pid}`);
+    try {
+      tar(["-czf", out, "-C", work, "package"]);
+      fs.renameSync(out, tarball);
+    } finally {
+      fs.rmSync(out, { force: true });
+    }
   } finally {
     fs.rmSync(work, { recursive: true, force: true });
   }

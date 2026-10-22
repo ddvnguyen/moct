@@ -9,8 +9,8 @@
  * The proof has to be the bytes.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -69,6 +69,29 @@ describe("package-artifact", () => {
     expect(written.pluginsSha).toBe("c11c5ccd");
     // The rest of the package is untouched by the injection.
     expect(readFileSync(path.join(unpacked, "lib", "ledger.js"), "utf8")).toBe("build one\n");
+  });
+
+  it("writes the marker when the artifact is on another filesystem than the temp directory", () => {
+    // The deploy's artifact directory and the temp directory are often two
+    // filesystems, and a rename cannot cross one (EXDEV): the rewritten
+    // tarball is written inside the artifact's own directory and renamed
+    // there. This case bites wherever the two are different devices - the
+    // lane's artifacts live on the workspace disk and the temp directory is a
+    // tmpfs - and it is a no-op where they are one.
+    const root = mkdtempSync(path.join(homedir(), ".pkg-artifact-device-"));
+    dirs.push(root);
+    const tarball = packTarball(root, "build one\n");
+    const marker = path.join(root, "build-info.json");
+    writeFileSync(marker, JSON.stringify({ pluginsSha: "c11c5ccd" }));
+
+    const result = run(["inject", tarball, marker]);
+    expect(result.status).toBe(0);
+
+    const unpacked = extract(tarball, work());
+    expect(JSON.parse(readFileSync(path.join(unpacked, "build-info.json"), "utf8")).pluginsSha).toBe("c11c5ccd");
+    // The artifact's directory carries the artifact and nothing else: the
+    // rewrite leaves no temporary file behind.
+    expect(readdirSync(path.dirname(tarball))).toEqual([path.basename(tarball)]);
   });
 
   it("accepts an installed tree that carries the artifact's bytes", () => {
