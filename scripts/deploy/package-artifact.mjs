@@ -17,7 +17,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 const MARKER = "build-info.json";
@@ -64,10 +63,18 @@ function sha256(file) {
 // marker is added to its package/ root and the tarball is written back. The
 // package/ prefix is what npm pack produces and what pnpm expects from a
 // file: tarball, so it is kept exactly.
+//
+// The work happens NEXT TO THE TARBALL, never in the system temp dir. The
+// lane's artifacts dir is a different mount from TMPDIR (on the runner,
+// /tmp is a tmpfs and the lane lives on the data volume), and rename(2)
+// cannot move a file across devices: doing the work in /tmp and renaming the
+// result onto the artifact dies with EXDEV before the deploy installs
+// anything. Writing next to the artifact keeps the whole operation on one
+// device, so the rename is a plain same-device move.
 function inject(tarball, markerFile) {
   if (!fs.existsSync(tarball)) die(`no such tarball: ${tarball}`);
   if (!fs.existsSync(markerFile)) die(`no such build info: ${markerFile}`);
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), "pkg-artifact-"));
+  const work = fs.mkdtempSync(path.join(path.dirname(path.resolve(tarball)), ".pkg-artifact-"));
   try {
     tar(["-xzf", tarball, "-C", work]);
     const root = path.join(work, "package");
@@ -87,9 +94,13 @@ function inject(tarball, markerFile) {
 // verify: the installed tree must carry the artifact's bytes. The installed
 // tree is compared file by file (sha256), the artifact's file set is the
 // expected one, and every difference is named.
+//
+// The artifact is unpacked next to itself, for the same reason inject does
+// its work there: the lane's artifacts dir and the system temp dir are
+// different devices on the runner, and nothing here may assume they are one.
 function verify(tarball, installed) {
   if (!fs.existsSync(tarball)) die(`no such tarball: ${tarball}`);
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), "pkg-artifact-"));
+  const work = fs.mkdtempSync(path.join(path.dirname(path.resolve(tarball)), ".pkg-artifact-"));
   const differences = [];
   try {
     tar(["-xzf", tarball, "-C", work]);
