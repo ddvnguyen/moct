@@ -102,19 +102,52 @@ no force push and no branch deletion, and the review is enforced by process:
 
 **What a second account changes.** With a second GitHub account (or a GitHub
 App token) the review becomes a platform gate again: one `PUT` adds
-`required_pull_request_reviews` to the two branches, the reviewer approves
-normally, and the stack guard's auto-merge path below opens. Until then the
-owner merges the stack PR by hand.
+`required_pull_request_reviews` to the two branches and the reviewer approves
+normally, so `approved-by:` in a confirm marker stops being a claim and
+becomes a fact. The guard below does not need that to work — it gates on the
+marker — but the guarantee it makes does.
 
 The **stack guard** in `stack-pr.yml` decides whether the stack PR is
-auto-mergeable: every implementation PR in the stack must be merged, or must
-carry an approving review **and** a green `ci` check. Otherwise the blocking
-PRs are listed in the job output and a human merges. The workflow then asks
-for auto-merge with `gh pr merge --auto`; if GitHub refuses, the job **fails
-loudly** with that reason instead of pretending the merge is queued.
-`allow_auto_merge` is enabled on the three repositories of the train, but the
-guard will not pass while no PR can carry an approving review — so the
-expected path today is: the guard lists the blocking PRs, the owner merges.
+auto-mergeable. Its only non-blocking condition for an implementation PR is
+**merged**: an implementation PR reaches the released branch only through its
+merge commit, so an open PR — approved or not — is not in the stack, and
+letting one through would ship a partial stack (a released branch without
+that PR's changes, and a lane that installs unreviewed code).
+
+The stack PR's own merge is gated on a **confirm marker** posted on the stack
+PR, naming the head it is about to merge:
+
+```text
+<!-- moct-approve -->
+reviewed: <40 lowercase hex>
+approved-by: Lead|Architect
+```
+
+The marker is posted **before** the merge, names **that head only** (a
+rewritten PR needs a new marker), and is the **record** of a review — never a
+substitute for one. The review of record is the verdict on the Multica card,
+and the marker cites it.
+
+GitHub cannot carry that gate. `reviewDecision` is an enum of `APPROVED |
+CHANGES_REQUESTED | REVIEW_REQUIRED`; GitHub refuses an approving review from
+a PR's own author (`422 "Review Can not approve your own pull request"`), and
+in this workspace the human and every agent share one account, so
+`reviewDecision` is never `APPROVED`. **Under a single GitHub identity
+`approved-by:` is a claim, not a fact**: the guarantee is *"a review exists,
+is recorded on the card, and is named in the PR"*, not *"the PR was reviewed
+by someone other than its author"*.
+
+**The rule about markers.** A marker may not be posted on a PR whose verdict
+carries an open question — answer it first, then post the marker and merge.
+The disclosure inside a marker is the mitigation; the rule stops it becoming
+a habit.
+
+Otherwise the blocking PRs are listed in the job output. The workflow then
+asks for auto-merge with `gh pr merge --auto`; if GitHub refuses, the job
+**fails loudly** with that reason instead of pretending the merge is queued.
+`allow_auto_merge` is enabled on the three repositories of the train; the
+guard no longer merges stacks unattended — every stack needs a Lead or
+Architect marker on the stack PR first.
 
 ## The lane map
 
