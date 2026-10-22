@@ -9,7 +9,7 @@
  * The proof has to be the bytes.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,10 +50,30 @@ function extract(tarball: string, into: string): string {
   return path.join(into, "package");
 }
 
-function run(args: string[]): { status: number; stdout: string; stderr: string } {
-  const result = spawnSync("node", [HELPER, ...args], { encoding: "utf8" });
+function run(args: string[], env: NodeJS.ProcessEnv = process.env): { status: number; stdout: string; stderr: string } {
+  const result = spawnSync("node", [HELPER, ...args], { encoding: "utf8", env });
   return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
+
+/**
+ * A directory on a DIFFERENT device from `dir`, or null when this host has
+ * only one. A lane has two: the artifacts live on the nvme while TMPDIR is
+ * tmpfs. That boundary is where the first live deploy died - `inject` built
+ * the tarball in /tmp and could not rename it onto the lane's artifacts dir
+ * (EXDEV). A fixture that keeps everything on one device cannot see it.
+ */
+function otherDeviceThan(dir: string): string | null {
+  for (const candidate of ["/dev/shm", tmpdir()]) {
+    try {
+      if (statSync(candidate).dev !== statSync(dir).dev) return candidate;
+    } catch {
+      // not present on this host
+    }
+  }
+  return null;
+}
+
+const foreignTmp = otherDeviceThan(tmpdir());
 
 describe("package-artifact", () => {
   it("writes the build marker into the artifact", () => {
@@ -69,6 +89,26 @@ describe("package-artifact", () => {
     expect(written.pluginsSha).toBe("c11c5ccd");
     // The rest of the package is untouched by the injection.
     expect(readFileSync(path.join(unpacked, "lib", "ledger.js"), "utf8")).toBe("build one\n");
+  });
+
+  it.skipIf(foreignTmp === null)("injects when TMPDIR is on another device than the artifact", () => {
+    const root = work();
+    const tarball = packTarball(root, "build one\n");
+    const marker = path.join(root, "build-info.json");
+    writeFileSync(marker, JSON.stringify({ pluginsSha: "c11c5ccd" }));
+
+    // The lane's shape: TMPDIR (tmpfs) and the artifact dir (nvme) are
+    // different devices, and a file cannot be renamed across them. The
+    // helper's scratch space therefore has to live beside the artifact.
+    const env = { ...process.env, TMPDIR: foreignTmp! };
+    expect(run(["inject", tarball, marker], env).status).toBe(0);
+
+    const unpacked = extract(tarball, work());
+    expect(JSON.parse(readFileSync(path.join(unpacked, "build-info.json"), "utf8")).pluginsSha).toBe("c11c5ccd");
+    // The scratch dir does not survive the injection.
+    expect(readdirSync(path.dirname(tarball)).filter((name) => name.startsWith(".pkg-artifact-"))).toEqual([]);
+    // The content check reads both trees; it is unaffected by the boundary.
+    expect(run(["verify", tarball, unpacked], env).status).toBe(0);
   });
 
   it("accepts an installed tree that carries the artifact's bytes", () => {
