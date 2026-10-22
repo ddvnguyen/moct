@@ -8,9 +8,31 @@
 #   - No new commit on `integration` since the released branch -> no PR, no
 #     PR edit, exit 0.
 #   - An open PR for the same head/base is refreshed (body), never duplicated.
-#   - Auto-merge is only requested when every implementation PR of the stack
-#     is merged, or carries an approving review AND a green `ci` check.
-#     Otherwise the blocking PRs are listed and a human merges.
+#   - The only non-blocking condition for an implementation PR is MERGED. An
+#     implementation PR reaches the released branch only through its merge
+#     commit, so an open PR - approved or not - is not in the stack, and
+#     letting one through would ship a partial stack.
+#   - The stack PR's own merge is gated on a confirm marker posted on the
+#     stack PR, naming the head it is about to merge:
+#
+#         <!-- moct-approve -->
+#         reviewed: <40 lowercase hex>
+#         approved-by: Lead|Architect
+#
+#     The marker is posted before the merge, names that head only, and is the
+#     record of a review that happened on the card - never a substitute for
+#     one. The review of record is the verdict on the Multica card.
+#   - GitHub cannot carry that gate: `reviewDecision` is an enum of APPROVED
+#     | CHANGES_REQUESTED | REVIEW_REQUIRED, GitHub refuses an approving
+#     review from a PR's own author, and every PR in this workspace is
+#     authored by the one shared identity - so `reviewDecision` is never
+#     APPROVED. Under one identity `approved-by:` is a claim, not a fact: the
+#     guarantee is that a review exists, is recorded on the card, and is named
+#     in the PR.
+#   - The `ci` check stays a branch-protection requirement on the released
+#     branch; the guard does not duplicate it.
+#   - Otherwise the blocking PRs are listed and the Lead or the Architect
+#     merges by hand.
 name: stack-pr
 
 on:
@@ -185,32 +207,54 @@ jobs:
         run: |
           set -euo pipefail
           PR="${{ steps.pr.outputs.number }}"
-          STACK="$(gh pr list --base "$HEAD_BRANCH" --state open --limit 50 --json number,title,state,mergedAt,reviewDecision,statusCheckRollup)"
-          RESULT="$(printf '%s' "$STACK" | node -e '
+          REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+          HEAD_OID="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"
+          STACK="$(gh pr list --base "$HEAD_BRANCH" --state open --limit 50 --json number,title)"
+          OPEN_PR="$(printf '%s' "$STACK" | node -e '
             let s = "";
             process.stdin.on("data", d => s += d).on("end", () => {
               const prs = JSON.parse(s);
-              const blocking = [];
-              for (const pr of prs) {
-                if (pr.state === "MERGED") continue;
-                const approved = pr.reviewDecision === "APPROVED";
-                const checks = pr.statusCheckRollup || [];
-                const ci = checks.find(c => (c.name || c.context || c.workflowName) === "ci");
-                const green = !!ci && (ci.conclusion === "SUCCESS" || ci.state === "SUCCESS");
-                if (!(approved && green)) blocking.push(`#${pr.number} ${pr.title} (review: ${pr.reviewDecision || "none"}, ci: ${ci ? (ci.conclusion || ci.state || ci.status) : "missing"})`);
-              }
-              console.log(JSON.stringify({ blocking }));
+              console.log(prs.map(pr => `#${pr.number} ${pr.title}`).join("\n"));
             });')"
-          BLOCKING="$(printf '%s' "$RESULT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).blocking.join("\n")))')"
-          if [ -z "$BLOCKING" ]; then
-            echo "stack guard: every implementation PR is merged, or approved with a green ci check"
+          COMMENTS="$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq '.[] | .body | @json')"
+          MARKER="$(printf '%s' "$COMMENTS" | HEAD_OID="$HEAD_OID" node -e '
+            let s = "";
+            process.stdin.on("data", d => s += d).on("end", () => {
+              const head = process.env.HEAD_OID;
+              const bodies = s.split("\n").filter(Boolean).map(l => JSON.parse(l));
+              for (const body of bodies) {
+                const L = (body || "").split("\n").map(x => x.trim());
+                if (L[0] !== "<!-- moct-approve -->") continue;
+                const reviewed = /^reviewed:\s+([0-9a-f]{40})$/.exec(L[1] || "");
+                const by = /^approved-by:\s+(Lead|Architect)$/.exec(L[2] || "");
+                if (reviewed && by && reviewed[1] === head) {
+                  console.log(`${L[1]} ${L[2]}`);
+                  return;
+                }
+              }
+              console.log("");
+            });')"
+          if [ -z "$OPEN_PR" ] && [ -n "$MARKER" ]; then
+            echo "stack guard: every implementation PR is merged and the stack PR carries a confirm marker naming its head"
+            echo "stack guard: marker: $MARKER"
             echo "mergeable=true" >> "$GITHUB_OUTPUT"
           else
-            echo "stack guard: the stack is NOT auto-mergeable yet. Blocking PRs:"
-            while IFS= read -r line; do
-              [ -n "$line" ] && echo "  - $line"
-            done <<< "$BLOCKING"
-            echo "A human merges the stack PR #$PR."
+            echo "stack guard: the stack is NOT auto-mergeable yet."
+            if [ -n "$OPEN_PR" ]; then
+              echo "stack guard: open implementation PRs - each one must be MERGED; an open PR is not in the stack:"
+              while IFS= read -r line; do
+                [ -n "$line" ] && echo "  - $line"
+              done <<< "$OPEN_PR"
+            fi
+            if [ -z "$MARKER" ]; then
+              echo "stack guard: the stack PR #$PR carries no confirm marker naming its head $HEAD_OID"
+              echo "stack guard: post this marker on the stack PR before the merge:"
+              echo "  <!-- moct-approve -->"
+              echo "  reviewed: $HEAD_OID"
+              echo "  approved-by: Lead|Architect"
+            fi
+            echo "stack guard: route: the Lead or the Architect merges each implementation PR after a review, then posts the confirm marker on the stack PR and the merge goes out."
+            echo "stack guard: under one GitHub identity the marker is a claim, not a fact - the review of record is the verdict on the card."
             echo "mergeable=false" >> "$GITHUB_OUTPUT"
           fi
 
