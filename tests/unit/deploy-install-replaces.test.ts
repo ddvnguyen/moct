@@ -61,7 +61,7 @@ interface Fixture {
   manifest: string;
 }
 
-function fixture(options: { corruptOnInstall?: boolean } = {}): Fixture {
+function fixture(options: { corruptOnInstall?: boolean; noisyBuild?: boolean } = {}): Fixture {
   const root = mkdtempSync(path.join(tmpdir(), "dsh-deploy-"));
   dirs.push(root);
 
@@ -73,13 +73,27 @@ function fixture(options: { corruptOnInstall?: boolean } = {}): Fixture {
   writeFileSync(
     path.join(plugins, "package.json"),
     JSON.stringify(
-      { name: "@ddvnguyen/fake-plugin", version: "0.0.1", files: ["lib/**/*", "scripts/**/*"] },
+      {
+        name: "@ddvnguyen/fake-plugin",
+        version: "0.0.1",
+        files: ["lib/**/*", "scripts/**/*"],
+        // A real plugin's build prints progress. stdout of build_and_pack is
+        // its RESULT (the package records the install loops parse), so a
+        // build that prints on stdout must not corrupt it.
+        ...(options.noisyBuild
+          ? { scripts: { build: "node -e \"console.log('linked 351 sibling packages into node_modules')\"" } }
+          : {}),
+      },
       null,
       2,
     ),
   );
   writeFileSync(path.join(plugins, "lib", "ledger.js"), "build one\n");
   writeFileSync(path.join(plugins, "scripts", "applier.mjs"), APPLIER);
+  if (options.noisyBuild) {
+    // prepare_plugins_repo runs this before the build; it prints to stdout too.
+    writeFileSync(path.join(plugins, "scripts", "sync-paths.mjs"), "console.log('regenerated 12 tsconfig path facades');\n");
+  }
   // The plugins repo compiles against a sibling harness checkout; the deploy
   // refuses to run without it.
   mkdirSync(path.join(root, "deepseek-harness"), { recursive: true });
@@ -229,6 +243,42 @@ describe("the DSH customizations deploy", () => {
       expect(failed.status).not.toBe(0);
       expect(`${failed.stdout}${failed.stderr}`).toContain("ROLLING BACK");
       expect(installedLedger(fx)).toBe("build one\n");
+    },
+    180_000,
+  );
+
+  it(
+    "rolls the profile back when the SAME sha is rebuilt and the deploy fails",
+    () => {
+      const fx = fixture();
+      expect(deploy(fx, SHA_ONE).status).toBe(0);
+      expect(installedLedger(fx)).toBe("build one\n");
+
+      // The plugins repo moves on but the sha stays: the artifact path does
+      // not move, so this build overwrites the tarball the profile runs. The
+      // snapshot has to be a copy taken BEFORE the pack - otherwise the
+      // rollback restores the new bytes and the "rollback" changes nothing.
+      writeFileSync(path.join(fx.plugins, "lib", "ledger.js"), "build two\n");
+      const failed = deploy(fx, SHA_ONE, { FAIL_PATCH: "1" });
+      expect(failed.status).not.toBe(0);
+      expect(`${failed.stdout}${failed.stderr}`).toContain("ROLLING BACK");
+      expect(installedLedger(fx)).toBe("build one\n");
+    },
+    180_000,
+  );
+
+  it(
+    "survives a build that writes to stdout",
+    () => {
+      // The first live deploy read "linked 351 sibling packages into
+      // node_modules" as a package name and compared an empty tarball path.
+      // The build's output belongs on stderr; the result of the pack step is
+      // the only thing stdout may carry.
+      const fx = fixture({ noisyBuild: true });
+      const result = deploy(fx, SHA_ONE);
+      expect(result.status).toBe(0);
+      expect(installedLedger(fx)).toBe("build one\n");
+      expect(artifacts(fx)).toHaveLength(1);
     },
     180_000,
   );

@@ -184,7 +184,7 @@ while IFS=$'\t' read -r target applier; do
   log "  $target <- $applier"
 done <<< "$PATCH_APPLIERS"
 
-# --- 2. build and pack ------------------------------------------------------
+# --- build and pack (definitions) -------------------------------------------
 # The plugins repo is a pnpm workspace whose root build script compiles the
 # workspace packages; the standalone package under packages/ has its own build
 # script. Each package is built with its own build script and packed with
@@ -292,13 +292,18 @@ harness_sibling() {
 # sibling, then build.
 prepare_plugins_repo() {
   local repo="$PLUGINS_ROOT"
+  # The output goes to stderr: build_and_pack's stdout is its RESULT (the
+  # "<name>\t<version>\t<tarball>" record the install loops parse), so a line
+  # a child prints on stdout becomes a bogus package record - the first live
+  # deploy read "linked 351 sibling packages into node_modules" as a package
+  # name and died comparing a tarball that was the empty string.
   if [ -f "$repo/scripts/link-harness-packages.mjs" ]; then
     log "linking the harness packages into the plugins repo"
-    ( cd "$repo" && node scripts/link-harness-packages.mjs ) || die "link-harness-packages.mjs failed"
+    ( cd "$repo" && node scripts/link-harness-packages.mjs ) >&2 || die "link-harness-packages.mjs failed"
   fi
   if [ -f "$repo/scripts/sync-paths.mjs" ]; then
     log "regenerating the tsconfig path facades against the harness sibling"
-    ( cd "$repo" && node scripts/sync-paths.mjs ) || die "sync-paths.mjs failed"
+    ( cd "$repo" && node scripts/sync-paths.mjs ) >&2 || die "sync-paths.mjs failed"
   fi
 }
 
@@ -315,20 +320,30 @@ build_and_pack() { # $1 = manifest dir, $2 = package name -> "<name>\t<version>\
   fi
   if node -e 'const p=require(process.argv[1]);process.exit(p.scripts&&p.scripts.build?0:1)' "$pkg_dir/package.json"; then
     log "building $name ($dir)"
-    ( cd "$pkg_dir" && npm run build ) || die "build failed for $name in $pkg_dir"
+    ( cd "$pkg_dir" && npm run build ) >&2 || die "build failed for $name in $pkg_dir"
   else
     log "no build script for $name ($dir) - packing as is"
   fi
   mkdir -p "$ARTIFACTS_DIR"
   # npm pack prints the tarball name it wrote; the scripts are skipped because
   # the build above already produced the artifacts.
-  packed="$( cd "$pkg_dir" && npm pack --ignore-scripts --pack-destination "$ARTIFACTS_DIR" | tail -n 1 )" \
-    || die "npm pack failed for $name in $pkg_dir"
+  #
+  # The pack goes into a private dir INSIDE the artifacts dir, never into the
+  # dir itself. `npm pack` writes `<name>-<version>.tgz`, and the profile may
+  # still point at an artifact of exactly that name from the previous build of
+  # the same version: packing in place overwrote it, and the rename below then
+  # removed it. That destroyed the rollback's source - the first live deploy
+  # failed, its rollback found no tarball to restore and left the lane's
+  # profile missing packages. Only the sha-stamped name lands in the artifacts
+  # dir, and an existing file is never touched.
+  pack_dir="$(mktemp -d "$ARTIFACTS_DIR/.pkg-pack-XXXXXX")" || die "cannot create a pack dir in $ARTIFACTS_DIR"
+  packed="$( cd "$pkg_dir" && npm pack --ignore-scripts --pack-destination "$pack_dir" | tail -n 1 )" \
+    || { rm -rf "$pack_dir"; die "npm pack failed for $name in $pkg_dir"; }
   case "$packed" in
     *.tgz) : ;;
-    *) die "npm pack did not report a tarball for $name (got '$packed')" ;;
+    *) rm -rf "$pack_dir"; die "npm pack did not report a tarball for $name (got '$packed')" ;;
   esac
-  tarball="$ARTIFACTS_DIR/$(basename "$packed")"
+  tarball="$pack_dir/$(basename "$packed")"
   [ -f "$tarball" ] || die "the packed tarball is missing: $tarball"
   # The artifact is named by the plugins COMMIT, not by the version alone.
   # The version of a plugin only moves on a release commit, so two different
@@ -339,6 +354,7 @@ build_and_pack() { # $1 = manifest dir, $2 = package name -> "<name>\t<version>\
   # content changed.
   stamped="$ARTIFACTS_DIR/$(basename "$packed" .tgz)-$PLUGINS_SHORT_SHA.tgz"
   mv "$tarball" "$stamped" || die "cannot rename the tarball to $stamped"
+  rm -rf "$pack_dir"
   tarball="$stamped"
   # The artifact carries the build it was made from: the marker is written
   # INTO the tarball, so the installed package carries it too and the lane
@@ -390,6 +406,51 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+# --- 2. snapshot the profile ------------------------------------------------
+# The snapshot is taken BEFORE the build and pack. The artifacts the profile
+# points at are replaced by this run's build - a redeploy of the same plugins
+# sha rewrites the same path - so the rollback source has to be a COPY, not
+# the path. Taking it after the pack (as the first version did) meant the
+# tarball had already been overwritten and renamed away, the copy was skipped,
+# and the rollback had nothing to restore: the failed deploy left the lane's
+# profile without its packages.
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+BACKUP_DIR="$DSH_ROOT/data/backups/customizations-$TS"
+mkdir -p "$BACKUP_DIR/artifacts" || die "cannot create the backup dir: $BACKUP_DIR"
+cp "$PROFILE_DIR/package.json" "$BACKUP_DIR/package.json" || die "cannot snapshot package.json"
+if [ -f "$PROFILE_DIR/pnpm-lock.yaml" ]; then
+  cp "$PROFILE_DIR/pnpm-lock.yaml" "$BACKUP_DIR/pnpm-lock.yaml" || die "cannot snapshot pnpm-lock.yaml"
+fi
+# The tarballs themselves are part of the profile: the manifest points at
+# them by path and the lockfile pins their checksum. A tarball the profile
+# references but that is not on disk is an already-inconsistent profile (a
+# previous run renamed the artifact away and died before rewriting the spec).
+# The deploy still proceeds - replacing that dependency is exactly what it is
+# for - but the warning is loud, because a rollback has no copy to restore.
+: > "$BACKUP_DIR/tarballs.tsv"
+node -e '
+  const fs = require("node:fs");
+  const [pkgPath, listPath] = process.argv.slice(1);
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies);
+  const out = [];
+  for (const [name, spec] of Object.entries(deps)) {
+    if (typeof spec !== "string" || !spec.startsWith("file:")) continue;
+    out.push(name + "\t" + spec.slice("file:".length));
+  }
+  fs.writeFileSync(listPath, out.join("\n") + (out.length ? "\n" : ""));
+' "$PROFILE_DIR/package.json" "$BACKUP_DIR/tarballs.tsv" || die "cannot list the profile's tarballs"
+while IFS=$'\t' read -r pkg_name tarball_path; do
+  [ -n "${tarball_path:-}" ] || continue
+  if [ ! -f "$tarball_path" ]; then
+    warn "the profile references a tarball that does not exist: $tarball_path - this deploy replaces it, but a rollback cannot restore $pkg_name"
+    continue
+  fi
+  cp "$tarball_path" "$BACKUP_DIR/artifacts/$(basename "$tarball_path")" \
+    || die "cannot snapshot the tarball $tarball_path"
+done < "$BACKUP_DIR/tarballs.tsv"
+log "snapshot of the profile in $BACKUP_DIR"
+
 install_deps
 
 PACKED=""
@@ -399,18 +460,14 @@ while IFS=$'\t' read -r name dir; do
 "
 done <<< "$PKG_LINES"
 [ -n "$PACKED" ] || die "no package was packed"
+# build_and_pack's stdout is its RESULT. Anything else on it is a child that
+# wrote to stdout, and parsing it as a package record is how the first live
+# deploy compared an empty tarball path. Fail with the offending line instead.
+BAD_RECORD="$(printf '%s\n' "$PACKED" | awk -F'\t' 'NF != 3 { print; exit }')"
+[ -z "$BAD_RECORD" ] \
+  || die "the pack step wrote a line that is not a package record (a child wrote to stdout?): '$BAD_RECORD'"
 
-# --- 3. snapshot the profile ------------------------------------------------
-TS="$(date -u +%Y%m%dT%H%M%SZ)"
-BACKUP_DIR="$DSH_ROOT/data/backups/customizations-$TS"
-mkdir -p "$BACKUP_DIR" || die "cannot create the backup dir: $BACKUP_DIR"
-cp "$PROFILE_DIR/package.json" "$BACKUP_DIR/package.json" || die "cannot snapshot package.json"
-if [ -f "$PROFILE_DIR/pnpm-lock.yaml" ]; then
-  cp "$PROFILE_DIR/pnpm-lock.yaml" "$BACKUP_DIR/pnpm-lock.yaml" || die "cannot snapshot pnpm-lock.yaml"
-fi
-log "snapshot of the profile in $BACKUP_DIR"
-
-# --- rollback ---------------------------------------------------------------
+# --- rollback (definitions) -------------------------------------------------
 # Wired to the EXIT trap, not ERR: `die` calls `exit 1` and bash does not run
 # an ERR trap for `exit`, so an ERR-only rollback would miss every failure
 # after the install step. The rollback decision lives in on_exit and it runs
@@ -455,6 +512,14 @@ rollback() {
         || log "FATAL: could not remove the installed $name"
     fi
   done <<< "$PACKED"
+  # pnpm's current-state lock describes the install THIS run made. When the
+  # tarball path did not move - a redeploy of the same plugins sha rewrites
+  # the same `-<sha7>.tgz` - it still records the new build's integrity for
+  # that path, and a frozen install against the restored lockfile dies with
+  # ERR_PNPM_TARBALL_INTEGRITY even though the restored tarball is correct.
+  # Dropping it makes pnpm resolve the restored lockfile from scratch.
+  rm -f "$PROFILE_DIR/node_modules/.pnpm/lock.yaml" \
+    || log "FATAL: could not drop the current-state lock"
   if [ -f "$BACKUP_DIR/pnpm-lock.yaml" ]; then
     cp "$BACKUP_DIR/pnpm-lock.yaml" "$PROFILE_DIR/pnpm-lock.yaml" || log "FATAL: could not restore pnpm-lock.yaml"
     ( cd "$PROFILE_DIR" && pnpm install --frozen-lockfile ) \
@@ -537,7 +602,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# --- 4. rewrite the file: dependencies and install --------------------------
+# --- rewrite the file: dependencies (definition) ----------------------------
 # The profile pins the plugins as file: tarballs; the rewrite points them at
 # the tarballs that were just built. A @ddvnguyen/* dependency the manifest
 # does not list is obsolete (the old @ddvnguyen/dsh-side-menu and
@@ -617,40 +682,7 @@ rewrite_deps() {
     });')"
 }
 
-# --- 3. snapshot the profile ------------------------------------------------
-TS="$(date -u +%Y%m%dT%H%M%SZ)"
-BACKUP_DIR="$DSH_ROOT/data/backups/customizations-$TS"
-mkdir -p "$BACKUP_DIR" || die "cannot create the backup dir: $BACKUP_DIR"
-cp "$PROFILE_DIR/package.json" "$BACKUP_DIR/package.json" || die "cannot snapshot package.json"
-if [ -f "$PROFILE_DIR/pnpm-lock.yaml" ]; then
-  cp "$PROFILE_DIR/pnpm-lock.yaml" "$BACKUP_DIR/pnpm-lock.yaml" || die "cannot snapshot pnpm-lock.yaml"
-fi
-# The tarballs themselves are part of the profile: the manifest points at
-# them by path, the build overwrites them with the same file name, and the
-# restored lockfile pins their checksum. Without a copy, the rollback would
-# restore a manifest whose tarball no longer exists (and whose checksum no
-# longer matches) — the profile would be unrepairable.
-mkdir -p "$BACKUP_DIR/artifacts"
-: > "$BACKUP_DIR/tarballs.tsv"
-node -e '
-  const fs = require("node:fs");
-  const [pkgPath, listPath] = process.argv.slice(1);
-  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-  const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies);
-  const out = [];
-  for (const [name, spec] of Object.entries(deps)) {
-    if (typeof spec !== "string" || !spec.startsWith("file:")) continue;
-    out.push(name + "\t" + spec.slice("file:".length));
-  }
-  fs.writeFileSync(listPath, out.join("\n") + (out.length ? "\n" : ""));
-' "$PROFILE_DIR/package.json" "$BACKUP_DIR/tarballs.tsv"
-while IFS=$'\t' read -r pkg_name tarball_path; do
-  [ -n "${tarball_path:-}" ] || continue
-  [ -f "$tarball_path" ] || continue
-  cp "$tarball_path" "$BACKUP_DIR/artifacts/$(basename "$tarball_path")" \
-    || die "cannot snapshot the tarball $tarball_path"
-done < "$BACKUP_DIR/tarballs.tsv"
-log "snapshot of the profile in $BACKUP_DIR"
+# --- 3. rewrite the file: dependencies and install --------------------------
 log "rewriting the file: dependency entries in $PROFILE_DIR/package.json"
 rewrite_deps || die "could not rewrite the profile dependencies"
 if [ -f "$PROFILE_DIR/pnpm-lock.yaml" ]; then
@@ -696,7 +728,7 @@ while IFS=$'\t' read -r name _version tarball; do
   log "$name carries the bytes of $(basename "$tarball")"
 done <<< "$PACKED"
 
-# --- 5. apply the patches ----------------------------------------------------
+# --- 4. apply the patches ----------------------------------------------------
 # Every patch in the manifest is applied in turn and then VERIFIED: the
 # applier's --verify mode asserts that the installed package carries its
 # patch. A package that was left half-patched - an applier that wrote one
@@ -720,7 +752,7 @@ while IFS=$'\t' read -r target applier; do
   log "$target patch applied and verified"
 done <<< "$PATCH_APPLIERS"
 
-# --- 6. verify --------------------------------------------------------------
+# --- 5. verify --------------------------------------------------------------
 # Every package of the manifest must be in the profile package.json AND
 # resolvable in the profile's node_modules at the expected version, the
 # profile must carry NO @ddvnguyen/* dependency outside the manifest, and
