@@ -161,6 +161,70 @@ Both DSH lanes run with `DSH_HOME=<lane-root>/data/home` and
 `MOCT_TEAM_URL=http://127.0.0.1:8210` — the lanes talk to MOCT-X, which holds
 the data of record.
 
+## Restoring a lane's lifecycle
+
+The two DSH units live in this repository — `deploy/systemd/dsh-x.service` and
+`deploy/systemd/dsh-z.service` — as the **source of record**. The lane's
+lifecycle belongs to them: the unit owns the port, the trusted-host list
+(including the tunnel peer `10.88.0.1`), the `MOCT_TEAM_*` environment and the
+restart. No repo script may take the port or start a host by hand.
+
+```bash
+install -m 0644 deploy/systemd/dsh-x.service ~/.config/systemd/user/
+install -m 0644 deploy/systemd/dsh-z.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now dsh-x dsh-z
+systemctl --user is-active dsh-x dsh-z && ss -ltnp | grep -E '3181|3180'
+```
+
+The install command **overwrites** the host's copy, so the repository copy wins
+on every restore; drift between the two is repaired by running it again.
+
+### What those files restore — and what they do not
+
+The unit is the lane's **lifecycle**. The lane's **content** comes from three
+further steps, each with its own owner:
+
+1. **The release deploy** — the release tree, the `current` switch, the unit
+   restart and the smoke — is the **fork's** `scripts/deploy/dsh-deploy.sh`
+   (`ddvnguyen/deepseek-harness`). The lane workflow checks the fork out as
+   `deploy-scripts/` (its reviewed `integration` branch) and runs
+   `bash deploy-scripts/scripts/deploy/dsh-deploy.sh`. It refuses to run without
+   the unit, and it requires the unit to carry `--host 0.0.0.0`.
+2. **The customizations install** — the lane profile's packages and the codex-ui
+   sidebar patch — is **this repository's own**
+   `scripts/deploy/dsh-customizations-deploy.sh`. It touches the profile, not
+   the unit.
+3. **The sidebar bootstrap** — `deploy-dsh-x-sidebar.sh` in
+   `ddvnguyen/moct-dsh-team-room` — is the only path that installs the
+   lane-local applier copy (`<lane-root>/scripts/codex-ui-sidebar-patch/`), the
+   `apply-codex-ui-sidebar-patch.sh` wrapper and the profile's `postinstall`
+   hook. Run it once, by hand, from a checkout of that repository **before** the
+   customizations install: without that wrapper the next `pnpm install` either
+   fails or leaves codex-ui unpatched, i.e. the lane comes up with no Teams tab.
+
+Two facts a rebuilt host has to respect. The units hard-code `/home/ddv` and
+`/mnt/workspace/clouds/<lane>`, so a host with a different layout edits those
+lines by hand — there is no template step, and the lane tree is a host fact.
+And the credentials-bearing `EnvironmentFile=-<lane-root>/data/moct.env` is host
+state, deliberately **not** kept in this repository.
+
+### Surviving a reboot
+
+Both units are `enabled`, the user session lingers
+(`loginctl show-user <user> -p Linger` → `Linger=yes`) and the
+`default.target.wants` symlinks carry them into the user session at boot. That
+is not an argument — it has been measured: when the host rebooted on
+2026-10-21 at 13:45 (+07) both units were active again at `13:45:47`, with
+`NRestarts=0`, and owned their ports.
+
+### One lane fact that is not yet per lane
+
+The applier wrapper and the profile's `postinstall` hook currently point at
+**lane x's** paths — lane z's profile runs lane x's wrapper — and lane z has no
+copy of the three files in its own tree. A restored lane z needs its own copy;
+the bootstrap script does not create one today.
+
 ## The rotation rule
 
 Lane x and lane z rotate between `integration` (alpha) and `stable`
