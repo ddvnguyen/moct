@@ -1,0 +1,26 @@
+[Unit]
+Description=DSH Fleet DSH-X (fork, TARGET=x)
+Wants=moct-x.service
+After=moct-x.service
+StartLimitIntervalSec=0
+
+[Service]
+Environment=DSH_HOME=/mnt/workspace/clouds/dsh-x/data/home
+Environment=PATH=/home/ddv/.nvm/versions/node/v24.15.0/bin:/usr/local/bin:/usr/bin:/bin
+Environment=MOCT_TEAM_URL=http://127.0.0.1:8210
+Environment=MOCT_TEAM_WORKSPACE=f61e8134-4367-40c0-afff-b4b9a9b8d90e
+EnvironmentFile=-/mnt/workspace/clouds/dsh-x/data/moct.env
+# The unit owns port 3181: a deploy that launches its own instance must not leave
+# the UI on an unconnected process (no MOCT_TEAM_* -> empty Team Room).
+ExecStartPre=-/usr/bin/fuser -k 3181/tcp
+# The lane binds the wildcard address on purpose: the train's deploy guard
+# requires it (the unit must carry --host 0.0.0.0) and the Cloudflare tunnel
+# dials the host's podman bridge (10.88.0.1), so a concrete bind would leave
+# the public hostname unreachable. The boot patch (data/overlay.yml) grants
+# the fork's allowWildcardHost, which the harness requires for that bind.
+ExecStart=/home/ddv/.nvm/versions/node/v24.15.0/bin/node /mnt/workspace/clouds/dsh-x/current/apps/cli/lib/bin.js --profile web --patch /mnt/workspace/clouds/dsh-x/data/overlay.yml --host 0.0.0.0 --port 3181 --no-open --trusted-host dsh-x.ddvnguyen.com --trusted-host localhost --trusted-host 127.0.0.1 --trusted-host 10.88.0.1 --trusted-host 192.168.7.99
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
