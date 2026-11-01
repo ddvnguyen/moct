@@ -51,6 +51,7 @@ import {
 import { api } from "@multica/core/api";
 import { browserTimezone, timezoneOptions } from "../../common/timezone-select";
 import { SegmentedToggle } from "../../common/segmented-toggle";
+import { useIssueOpeningCapability } from "../../issues/surface/issue-opening-capability";
 import { useT } from "../../i18n";
 import {
   SettingsCard,
@@ -315,7 +316,9 @@ function RunningAgentReplyRow() {
  */
 function IssueOpeningRow() {
   const { t } = useT("settings");
-  const value = useIssueOpeningStore((s) => s.openMode);
+  const capability = useIssueOpeningCapability();
+  const storedValue = useIssueOpeningStore((s) => s.openMode);
+  const value = capability.openMode ?? storedValue;
   const setValue = useIssueOpeningStore((s) => s.setOpenMode);
   const label = t(($) => $.issue.opening.click);
   return (
@@ -331,7 +334,11 @@ function IssueOpeningRow() {
           buttonClassName="px-3 py-1 text-label"
           options={[
             ["page", t(($) => $.issue.opening.page)],
-            ["peek", t(($) => $.issue.opening.peek)],
+            ...(capability.supportsTabs
+              ? [["tab", t(($) => $.issue.opening.tab)] as const]
+              : capability.supportsPeek
+                ? [["peek", t(($) => $.issue.opening.peek)] as const]
+                : []),
           ]}
         />
       </div>

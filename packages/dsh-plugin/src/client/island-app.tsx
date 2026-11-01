@@ -37,6 +37,7 @@ import {
   createIssueViewStore,
   ErrorBoundary,
   InboxPage,
+  IssueOpeningCapabilityProvider,
   IssueDetailRoute,
   IssuesPage,
   mmxBuild,
@@ -480,22 +481,24 @@ export function IslandPages({
               />
             }
           />
-          <ErrorBoundary
-            resetKeys={[tabsState.activeId ?? "none", islandRouteKey(route)]}
-          >
-            {route.view === "settings" ? (
-              // The fork's page, scoped to what this shell can actually render:
-              // no billing, integrations, plugins or shortcut reference, plus the
-              // one group that only exists here.
-              <SettingsPage
-                extraGroups={[moctGroup]}
-                hiddenTabs={HIDDEN_SETTINGS_TABS}
-                preferencesExtraRows={<PanelZoomRow />}
-              />
-            ) : (
-              <IslandPage route={route} extraAgentSections={agentMemorySections} />
-            )}
-          </ErrorBoundary>
+          <IssueOpeningCapabilityProvider supportsTabs supportsPeek={false}>
+            <ErrorBoundary
+              resetKeys={[tabsState.activeId ?? "none", islandRouteKey(route)]}
+            >
+              {route.view === "settings" ? (
+                // The fork's page, scoped to what this shell can actually render:
+                // no billing, integrations, plugins or shortcut reference, plus the
+                // one group that only exists here.
+                <SettingsPage
+                  extraGroups={[moctGroup]}
+                  hiddenTabs={HIDDEN_SETTINGS_TABS}
+                  preferencesExtraRows={<PanelZoomRow />}
+                />
+              ) : (
+                <IslandPage route={route} extraAgentSections={agentMemorySections} />
+              )}
+            </ErrorBoundary>
+          </IssueOpeningCapabilityProvider>
           {/* The fork's pages ask for a dialog through `useModalStore` and one
               component renders whatever it names; the web and desktop layouts
               mount it, and the island had no equivalent, so every dialog in the

@@ -1,9 +1,10 @@
 "use client";
 
 import { createContext, useCallback, useContext, useMemo } from "react";
-import { useIssueOpeningStore, type IssueOpenMode } from "@multica/core/issues/stores/issue-opening-store";
+import type { IssueOpenMode } from "@multica/core/issues/stores/issue-opening-store";
 import { useWorkspacePaths } from "@multica/core/paths";
 import { useNavigation } from "../../navigation";
+import { useIssueOpeningCapability } from "./issue-opening-capability";
 
 /**
  * Side peek: Shift+Click (or Space) on an issue — a board or swimlane card, a
@@ -107,10 +108,15 @@ export function locateInColumns(
 export function resolveIssueClick(
   event: Pick<MouseEvent, "button" | "shiftKey" | "metaKey" | "ctrlKey" | "altKey">,
   openMode: IssueOpenMode = "page",
+  supportsPeek = true,
+  supportsTabs = false,
 ): IssueOpenMode | null {
   if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey) return null;
   if (!event.shiftKey) return openMode;
-  return openMode === "peek" ? "page" : "peek";
+  if (openMode === "peek") return "page";
+  if (openMode === "tab") return "page";
+  if (supportsPeek) return "peek";
+  return supportsTabs ? "tab" : "page";
 }
 
 export const IssuePeekActionsContext = createContext<IssuePeekActions | null>(null);
@@ -146,13 +152,28 @@ export function useIssuePeekPosition() {
  */
 export function useIssuePeekClick() {
   const peek = useIssuePeekActions();
-  const openMode = useIssueOpeningStore((s) => s.openMode);
+  const capability = useIssueOpeningCapability();
   const { push } = useNavigation();
   const paths = useWorkspacePaths();
-  return useCallback((issueId: string, event?: React.MouseEvent) => {
-    if (!peek || event?.defaultPrevented) return false;
-    const target = event ? resolveIssueClick(event, openMode) : openMode;
-    if (target === "peek") {
+  return useCallback((issueId: string, event?: React.MouseEvent, issueIdentifier?: string) => {
+    if (event?.defaultPrevented) return false;
+    const tabIssueId = issueIdentifier ?? issueId;
+    if (
+      capability.openMode === "tab" &&
+      event?.button === 0 &&
+      (event.metaKey || event.ctrlKey)
+    ) {
+      event.preventDefault();
+      return capability.openIssueInTab(tabIssueId, event.shiftKey);
+    }
+    const target = event
+      ? resolveIssueClick(event, capability.openMode, capability.supportsPeek, capability.supportsTabs)
+      : capability.openMode;
+    if (target === "tab") {
+      if (event) event.preventDefault();
+      return capability.openIssueInTab(tabIssueId);
+    }
+    if (target === "peek" && peek) {
       event?.preventDefault();
       // A plain click opens (or keeps open) the issue. Shift+Click is the
       // explicit preview gesture and toggles it closed again, like Space.
@@ -168,26 +189,33 @@ export function useIssuePeekClick() {
       return true;
     }
     return false;
-  }, [peek, openMode, push, paths]);
+  }, [peek, capability, push, paths]);
 }
 
 /** Empty outside a peek host, so other issue links retain normal navigation. */
-export function useIssuePeekLinkProps(issueId: string) {
+export function useIssuePeekLinkProps(issueId: string, issueIdentifier?: string) {
   const peek = useIssuePeekActions();
   const handlePeekClick = useIssuePeekClick();
+  const capability = useIssueOpeningCapability();
+  const hasOpeningHandler = peek !== null || capability.supportsTabs;
   return useMemo(
     () =>
-      peek
+      hasOpeningHandler
         ? {
             // Keep the shift-click from extending the text selection.
             onMouseDown: (event: React.MouseEvent) => {
               if (event.shiftKey) event.preventDefault();
             },
             onClick: (event: React.MouseEvent) => {
-              handlePeekClick(issueId, event);
+              handlePeekClick(issueId, event, issueIdentifier);
+            },
+            onAuxClick: (event: React.MouseEvent) => {
+              if (event.button !== 1 || event.defaultPrevented || capability.openMode !== "tab") return;
+              event.preventDefault();
+              capability.openIssueInTab(issueIdentifier ?? issueId, false);
             },
           }
         : {},
-    [peek, handlePeekClick, issueId],
+    [hasOpeningHandler, handlePeekClick, issueId, issueIdentifier, capability],
   );
 }

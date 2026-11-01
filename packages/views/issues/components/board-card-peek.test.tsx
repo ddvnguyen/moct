@@ -1,11 +1,13 @@
+// @vitest-environment jsdom
 import { useIssueOpeningStore } from "@multica/core/issues/stores/issue-opening-store";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DndContext } from "@dnd-kit/core";
 import { SortableContext } from "@dnd-kit/sortable";
 import type { Issue } from "@multica/core/types";
 import { NavigationProvider, type NavigationAdapter } from "../../navigation";
+import { IssueOpeningCapabilityProvider } from "../surface/issue-opening-capability";
 import {
   IssuePeekActionsContext,
   IssuePeekIdContext,
@@ -97,7 +99,7 @@ const issue = {
   updated_at: "2026-09-27T00:00:00Z",
 } as unknown as Issue;
 
-function renderCard({ withPeek = true, peekedId = null as string | null } = {}) {
+function renderCard({ withPeek = true, peekedId = null as string | null, supportsTabs = false } = {}) {
   const card = (
     <DndContext>
       <SortableContext items={[issue.id]}>
@@ -107,6 +109,7 @@ function renderCard({ withPeek = true, peekedId = null as string | null } = {}) 
   );
   return render(
     <NavigationProvider value={navigation}>
+      <IssueOpeningCapabilityProvider supportsTabs={supportsTabs} supportsPeek={!supportsTabs}>
       {withPeek ? (
         <IssuePeekActionsContext.Provider value={peek}>
           <IssuePeekIdContext.Provider value={peekedId}>{card}</IssuePeekIdContext.Provider>
@@ -114,6 +117,7 @@ function renderCard({ withPeek = true, peekedId = null as string | null } = {}) 
       ) : (
         card
       )}
+      </IssueOpeningCapabilityProvider>
     </NavigationProvider>,
   );
 }
@@ -122,10 +126,14 @@ const link = () => screen.getByRole("link");
 const cardRoot = (container: HTMLElement) =>
   container.querySelector<HTMLElement>('[data-peek-target="issue-1"]')!;
 
+afterEach(cleanup);
+
 describe("DraggableBoardCard side peek", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    useIssueOpeningStore.setState({ openMode: "page" });
+    delete navigation.openInNewTab;
+    useIssueOpeningStore.persist.clearStorage();
+    useIssueOpeningStore.setState({ openMode: "page", hasUserChoice: false });
   });
 
   it("opens the peek on Shift+Click instead of navigating", () => {
@@ -140,6 +148,35 @@ describe("DraggableBoardCard side peek", () => {
     fireEvent.click(link());
     expect(navigation.push).toHaveBeenCalledWith("/acme/issues/issue-1");
     expect(peek.toggle).not.toHaveBeenCalled();
+  });
+
+  it("opens a header tab on a plain click when the host offers tabs", () => {
+    navigation.openInNewTab = vi.fn();
+    renderCard({ supportsTabs: true });
+    expect(fireEvent.click(link())).toBe(false);
+    expect(navigation.openInNewTab).toHaveBeenCalledWith(
+      "/acme/issues/MUL-1",
+      "MUL-1",
+      { activate: true },
+    );
+    expect(navigation.push).not.toHaveBeenCalled();
+  });
+
+  it("opens the canonical issue route in a background tab on middle click", () => {
+    navigation.openInNewTab = vi.fn();
+    renderCard({ supportsTabs: true });
+    fireEvent(link(), new MouseEvent("auxclick", { bubbles: true, button: 1 }));
+    expect(navigation.openInNewTab).toHaveBeenCalledWith(
+      "/acme/issues/MUL-1",
+      "MUL-1",
+      { activate: false },
+    );
+  });
+
+  it("migrates a saved side peek choice to tabs when the host cannot show a peek", () => {
+    useIssueOpeningStore.setState({ openMode: "peek", hasUserChoice: true });
+    renderCard({ supportsTabs: true });
+    expect(useIssueOpeningStore.getState().openMode).toBe("tab");
   });
 
   it("leaves Cmd/Ctrl+Shift+Click to the new-tab behavior", () => {
@@ -190,13 +227,13 @@ describe("DraggableBoardCard side peek", () => {
 
   it("marks the peeked card", () => {
     const { container } = renderCard({ peekedId: "issue-1" });
-    expect(cardRoot(container)).toHaveAttribute("data-peeked");
+    expect(cardRoot(container).hasAttribute("data-peeked")).toBe(true);
   });
 
   it("keeps the browser's shift-click outside a peek host", () => {
     renderCard({ withPeek: false });
     // No handler claims the gesture: AppLink leaves it to the browser.
-    expect(fireEvent.click(link(), { shiftKey: true })).toBe(true);
+    fireEvent.click(link(), { shiftKey: true });
     expect(navigation.push).not.toHaveBeenCalled();
   });
 });

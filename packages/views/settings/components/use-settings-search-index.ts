@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { useT } from "../../i18n";
 import type { SettingsSearchEntry } from "./settings-search";
 import { CHANNEL_INTEGRATIONS } from "./settings-navigation";
+import { useIssueOpeningCapability } from "../../issues/surface/issue-opening-capability";
 
 const NOTIFICATION_GROUPS = [
   "assignments",
@@ -31,6 +32,7 @@ export function useSettingsSearchIndex(
   pages: readonly SettingsSearchPage[],
 ): SettingsSearchIndexEntry[] {
   const { t } = useT("settings");
+  const issueOpeningCapability = useIssueOpeningCapability();
   return useMemo(() => {
     const visible = new Set(pages.map((page) => page.value));
     const rows: SettingsSearchIndexEntry[] = [
@@ -81,7 +83,7 @@ export function useSettingsSearchIndex(
         tab: "preferences",
         anchor: "issue-opening",
         title: t(($) => $.issue.opening.title),
-        description: `${t(($) => $.issue.opening.page)} · ${t(($) => $.issue.opening.peek)}`,
+        description: `${t(($) => $.issue.opening.page)} · ${t(($) => issueOpeningCapability.supportsTabs ? $.issue.opening.tab : $.issue.opening.peek)}`,
       },
       {
         tab: "preferences",
@@ -223,5 +225,5 @@ export function useSettingsSearchIndex(
       ...pageEntries,
       ...rows.filter((row) => row.anchor || row.integration),
     ].filter((entry) => visible.has(entry.tab));
-  }, [pages, t]);
+  }, [pages, t, issueOpeningCapability.supportsTabs]);
 }

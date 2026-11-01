@@ -15,6 +15,7 @@
     "./common/shortcut-keycaps": "./common/shortcut-keycaps.tsx",
     "./editor": "./editor/index.ts",
     "./issues/components": "./issues/components/index.ts",
+    "./issues/issue-opening-capability": "./issues/surface/issue-opening-capability.tsx",
     "./issues/hooks": "./issues/hooks/index.ts",
     "./issues/utils/filter": "./issues/utils/filter.ts",
     "./issues/utils/sort": "./issues/utils/sort.ts",

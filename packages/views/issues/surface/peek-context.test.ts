@@ -48,6 +48,11 @@ describe("resolveIssueClick", () => {
     expect(resolveIssueClick({ ...plain, shiftKey: true }, "page")).toBe("peek");
     expect(resolveIssueClick({ ...plain, shiftKey: true }, "peek")).toBe("page");
   });
+  it("uses the new tab as the alternate when side peek is unavailable", () => {
+    expect(resolveIssueClick(plain, "tab", false, true)).toBe("tab");
+    expect(resolveIssueClick({ ...plain, shiftKey: true }, "page", false, true)).toBe("tab");
+    expect(resolveIssueClick({ ...plain, shiftKey: true }, "tab", false, true)).toBe("page");
+  });
   it.each([{ metaKey: true }, { ctrlKey: true }, { altKey: true }, { button: 1 }, { button: 2 }])(
     "leaves modified clicks native: %j", (modifier) => {
       for (const openMode of ["page", "peek"] as const) {

@@ -323,7 +323,7 @@ function ScheduledRow({
   });
   const project = issue.project_id ? projects.find((pr) => pr.id === issue.project_id) : undefined;
   const peeked = useIsIssuePeeked(issue.id);
-  const peekLinkProps = useIssuePeekLinkProps(issue.id);
+  const peekLinkProps = useIssuePeekLinkProps(issue.id, issue.identifier);
 
   const start = parseDay(issue.start_date);
   const due = parseDay(issue.due_date);

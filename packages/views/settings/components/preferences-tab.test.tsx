@@ -15,6 +15,7 @@ import { I18nProvider } from "@multica/core/i18n/react";
 import enCommon from "../../locales/en/common.json";
 import enAuth from "../../locales/en/auth.json";
 import enSettings from "../../locales/en/settings.json";
+import { IssueOpeningCapabilityProvider } from "../../issues/surface/issue-opening-capability";
 
 const navigationState = vi.hoisted(() => ({ search: "", replace: vi.fn() }));
 vi.mock("../../navigation", () => ({
@@ -69,6 +70,7 @@ vi.mock("@multica/core/chat", () => ({
 
 vi.mock("@multica/core/paths", () => ({
   useCurrentWorkspace: () => ({ id: "ws-1", name: "Acme" }),
+  useWorkspacePaths: () => ({ issueDetail: (id: string) => `/acme/issues/${id}` }),
 }));
 
 vi.mock("@multica/core/api", () => ({
@@ -120,7 +122,7 @@ const TEST_RESOURCES = {
 function I18nWrapper({ children }: { children: ReactNode }) {
   return (
     <I18nProvider locale="en" resources={TEST_RESOURCES}>
-      {children}
+      <IssueOpeningCapabilityProvider>{children}</IssueOpeningCapabilityProvider>
     </I18nProvider>
   );
 }

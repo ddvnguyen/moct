@@ -10,6 +10,7 @@
  */
 import { useIssueOpeningStore } from "@multica/core/issues/stores/issue-opening-store";
 import { IssuePeekActionsContext } from "../surface/peek-context";
+import { IssueOpeningCapabilityProvider } from "../surface/issue-opening-capability";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   act,
@@ -441,7 +442,9 @@ describe("TableView cell editors under data refresh", () => {
     renderWithI18n(
       <QueryClientProvider client={queryClient}>
         <IssuePeekActionsContext.Provider value={peek}>
-          <Harness childProgressMap={new Map()} surfaceKey="test-preferred-peek" />
+          <IssueOpeningCapabilityProvider>
+            <Harness childProgressMap={new Map()} surfaceKey="test-preferred-peek" />
+          </IssueOpeningCapabilityProvider>
         </IssuePeekActionsContext.Provider>
       </QueryClientProvider>,
     );

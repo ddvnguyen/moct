@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Issue } from "@multica/core/types";
 import { NavigationProvider, type NavigationAdapter } from "../../navigation";
+import { IssueOpeningCapabilityProvider } from "../surface/issue-opening-capability";
 import {
   IssuePeekActionsContext,
   IssuePeekIdContext,
@@ -80,11 +81,13 @@ const issue = {
 function renderRow(peekedId: string | null = null) {
   return render(
     <NavigationProvider value={navigation}>
-      <IssuePeekActionsContext.Provider value={peek}>
-        <IssuePeekIdContext.Provider value={peekedId}>
-          <ListRow issue={issue} />
-        </IssuePeekIdContext.Provider>
-      </IssuePeekActionsContext.Provider>
+      <IssueOpeningCapabilityProvider>
+        <IssuePeekActionsContext.Provider value={peek}>
+          <IssuePeekIdContext.Provider value={peekedId}>
+            <ListRow issue={issue} />
+          </IssuePeekIdContext.Provider>
+        </IssuePeekActionsContext.Provider>
+      </IssueOpeningCapabilityProvider>
     </NavigationProvider>,
   );
 }

@@ -14,7 +14,7 @@ import { useIssueOpeningStore } from "./issue-opening-store";
 
 beforeEach(() => {
   storage.clear();
-  useIssueOpeningStore.setState({ openMode: "page" });
+  useIssueOpeningStore.setState({ openMode: "page", hasUserChoice: false });
 });
 
 describe("issue opening preference", () => {
@@ -28,10 +28,20 @@ describe("issue opening preference", () => {
     expect(useIssueOpeningStore.getState().openMode).toBe("peek");
   });
 
+  it("restores the new-tab preference", async () => {
+    useIssueOpeningStore.getState().setOpenMode("tab");
+    const saved = storage.get("multica_issue_opening")!;
+    useIssueOpeningStore.getState().setOpenMode("page");
+    storage.set("multica_issue_opening", saved);
+    await useIssueOpeningStore.persist.rehydrate();
+    expect(useIssueOpeningStore.getState()).toMatchObject({ openMode: "tab", hasUserChoice: true });
+  });
+
   it.each([null, {}, { openMode: "unknown" }])("defaults to full pages for missing or invalid preferences: %j", async (state) => {
     useIssueOpeningStore.getState().setOpenMode("peek");
     storage.set("multica_issue_opening", JSON.stringify({ state, version: 0 }));
     await useIssueOpeningStore.persist.rehydrate();
     expect(useIssueOpeningStore.getState().openMode).toBe("page");
+    expect(useIssueOpeningStore.getState().hasUserChoice).toBe(false);
   });
 });

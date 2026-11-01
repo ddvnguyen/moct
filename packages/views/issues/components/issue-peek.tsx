@@ -36,6 +36,7 @@ import {
   type IssuePeekActions,
   type IssuePeekColumns,
 } from "../surface/peek-context";
+import { useIssueOpeningCapability } from "../surface/issue-opening-capability";
 
 const NEXT_KEY = createShortcutChord("J");
 const PREV_KEY = createShortcutChord("K");
@@ -65,6 +66,12 @@ const ARROW_STEPS: Record<string, Step> = {
  * issue under the pointer, so mouse users need not Tab to it first.
  */
 export function IssuePeekHost({ children }: { children: ReactNode }) {
+  const { supportsPeek } = useIssueOpeningCapability();
+  if (!supportsPeek) return <>{children}</>;
+  return <IssuePeekHostContent>{children}</IssuePeekHostContent>;
+}
+
+function IssuePeekHostContent({ children }: { children: ReactNode }) {
   const [peekId, setPeekId] = useState<string | null>(null);
   const [columns, setColumns] = useState<IssuePeekColumns | null>(null);
 
