@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -925,3 +926,4 @@ func TestBuildCodebuddyEnvForcesRandomInternalPortAndBashBackground(t *testing.T
 		}
 	}
 }
+

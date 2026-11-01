@@ -83,6 +83,16 @@ wins on collision).
   the model itself, so the list is the single entry `freebuff-desktop`.
 - Otherwise it drives the desktop HTTP API and emits codebuddy stream-json on
   stdout, exit 0 on success.
+- **Task context (M-199):** the bridge prepends `CODEBUDDY.md` only when it
+  creates a thread, including after an expired or invalid resume. The bridge's
+  per-run shim keeps the task-scoped Multica identity available to the agent.
+- **Session rotation (M-199):** a known or resumed thread is reused only when
+  the desktop API reports its creation time as less than four hours ago. A
+  stale thread or one with an unknown creation time is abandoned. The bridge
+  does not scan project threads for idle conversations. It stores the thread
+  ID in account-local `state.json`; state writes are atomic (`renameSync`).
+- **System instruction (M-199):** references `CODEBUDDY.md` only, never
+  `AGENTS.md`.
 - Fork PR: https://github.com/ddvnguyen/freebuff/pull/1 (the `proxy.ts` hunks
   in it are the upstream sync that main was behind on, not bridge changes).
 
@@ -106,10 +116,19 @@ bridge (or `MULTICA_FREEBUFF_DESKTOP_PATH`). No Go registry change is needed.
 1. Merge the PR into `multica-moct` (Claude Architect approval + CI green).
 2. Open the stack PR `multica-moct → master`; the Owner approves it and the
    deploy.
-3. Update the deployed Freebuff Desktop to the latest upstream (recorded:
-   `9cd09bacf`, previously `3fc5979f3`), with the bridge from the fork PR.
-4. Deploy via `ddvnguyen/moct` `dsh-lane-deploy.yml` from `stable`.
-5. Smoke test: add two accounts on the runtime page, bind one agent to each
+3. Update the deployed Freebuff Desktop to the slimmer Linux build
+   (commit `7807c228ed488496a7bc468aace868368fd605fa` (v0.0.196), ~121 MB RSS vs ~400 MB
+   for the previous build). It drops the cloud-account-management endpoints
+   Multica never used and keeps everything the bridge needs. Run headless under
+   Bun: `FREEBUFF_WEB_SERVER=1 FREEBUFF_WEB_HOST=127.0.0.1 FREEBUFF_WEB_NO_AUTH=1
+   bun orchestrator.js`. The Electron binary is ARM64; the orchestrator is
+   plain Bun JS and runs on x86_64.
+4. Install the reviewed bridge source from
+   https://github.com/ddvnguyen/freebuff/pull/5 on the configured
+   `freebuff-desktop` path; record the source commit and verify
+   `--list-models --json` before deployment.
+5. Deploy via `ddvnguyen/moct` `dsh-lane-deploy.yml` from `stable`.
+6. Smoke test: add two accounts on the runtime page, bind one agent to each
    and one to `any`; check the model picker per account and one run per agent;
    with one account busy, a second task for it stays queued.
 
@@ -121,3 +140,7 @@ bridge (or `MULTICA_FREEBUFF_DESKTOP_PATH`). No Go registry change is needed.
   idle account in the same instant can both pass it. The bridge's own
   single-run handling is the backstop.
 - DB-backed handler tests (CRUD authz, validation, lease) run in CI only.
+- Memory: each account needs its own orchestrator process. Budget ~0.5 GB per
+  account on the daemon host with the previous build, ~0.15 GB with the slimmer
+  build. Remove idle accounts to free their process; `any`-mode agents do not
+  need every account live.

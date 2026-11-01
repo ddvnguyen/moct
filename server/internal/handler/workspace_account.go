@@ -144,6 +144,13 @@ func (h *Handler) CreateWorkspaceAccount(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Auto-generate a credential_ref when the user does not supply one, so
+	// account creation needs only a label (M-199 UX improvement). The daemon
+	// resolves this name on its own machine; nothing secret travels here.
+	credentialRef := strings.TrimSpace(req.CredentialRef)
+	if credentialRef == "" {
+		credentialRef = "freebuff-desktop-" + uuidToString(wsUUID) + "-" + strings.ToLower(strings.ReplaceAll(label, " ", "-"))
+	}
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -157,7 +164,7 @@ func (h *Handler) CreateWorkspaceAccount(w http.ResponseWriter, r *http.Request)
 		Provider:      provider,
 		Label:         label,
 		Endpoint:      optionalText(endpoint),
-		CredentialRef: optionalText(req.CredentialRef),
+		CredentialRef: optionalText(credentialRef),
 		Enabled:       enabled,
 		CreatedBy:     parseUUID(userID),
 	})
