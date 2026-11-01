@@ -317,10 +317,15 @@ export function createIslandNavigation({
     push: go,
     replace: replaceGo,
     back,
-    pathname: tabs
-      ? (tabs.getState().activeTab()?.url ?? islandPathname(slug, route)).split("?")[0]!
-      : islandPathname(slug, route),
-    searchParams: new URLSearchParams(route.query ?? ""),
+    get pathname() {
+      const activeUrl = tabs?.getState().activeTab()?.url;
+      const path = activeUrl ?? islandPathname(slug, currentRoute());
+      const queryOrHash = path.search(/[?#]/);
+      return queryOrHash === -1 ? path : path.slice(0, queryOrHash);
+    },
+    get searchParams() {
+      return new URLSearchParams(currentRoute().query ?? "");
+    },
     hash: "",
     openInNewTab,
     getShareableUrl: () => "",

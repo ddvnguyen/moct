@@ -221,6 +221,20 @@ describe("createIslandNavigation over the window's history (M-197)", () => {
     return createTabsStore(createIslandStorage(backing as any), "demo");
   }
 
+  it("reads the active tab's pathname and query after tab changes", () => {
+    const store = tabs();
+    const navigation = createIslandNavigation({ slug: "demo", tabs: store });
+
+    store.getState().openTab("/demo/agents/agent-7");
+    expect(navigation.pathname).toBe("/demo/agents/agent-7");
+    expect(navigation.searchParams.get("view")).toBeNull();
+
+    navigation.replace(`${navigation.pathname}?view=general`);
+    expect(store.getState().activeUrl()).toBe("/demo/agents/agent-7?view=general");
+    expect(navigation.pathname).toBe("/demo/agents/agent-7");
+    expect(navigation.searchParams.get("view")).toBe("general");
+  });
+
   it("back crosses tabs and forward returns to the tab it left", () => {
     const store = tabs();
     const onChange = vi.fn();
