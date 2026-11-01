@@ -195,6 +195,9 @@ const (
 	// PendingWorkKindFreebuff asks the daemon to start a browser login for
 	// the runtime's Freebuff account.
 	PendingWorkKindFreebuff = "freebuff"
+	// PendingWorkKindFreebuffDesktop asks the daemon to drive a browser login
+	// for a workspace's daemon-managed freebuff-desktop account.
+	PendingWorkKindFreebuffDesktop = "freebuff-desktop"
 )
 
 // PendingWorkPayload is sent from server to daemon as a wakeup hint when a
@@ -472,16 +475,19 @@ type DaemonHeartbeatPendingUpdate struct {
 // DaemonHeartbeatPendingModelList describes a request for the daemon to
 // enumerate the runtime's supported models.
 type DaemonModelAccount struct {
-	ID            string `json:"id"`
-	Label         string `json:"label,omitempty"`
-	Endpoint      string `json:"endpoint,omitempty"`
-	CredentialRef  string `json:"credential_ref,omitempty"`
+	ID              string `json:"id"`
+	Label           string `json:"label,omitempty"`
+	Endpoint        string `json:"endpoint,omitempty"`
+	CredentialRef   string `json:"credential_ref,omitempty"`
+	DaemonAccountID string `json:"daemon_account_id,omitempty"`
+	LaunchID        string `json:"-"`
+	LaunchError     string `json:"-"`
 }
 
 type DaemonHeartbeatPendingModelList struct {
-	ID       string                `json:"id"`
-	Account  string                `json:"account,omitempty"`
-	Accounts []DaemonModelAccount  `json:"accounts,omitempty"`
+	ID       string               `json:"id"`
+	Account  string               `json:"account,omitempty"`
+	Accounts []DaemonModelAccount `json:"accounts,omitempty"`
 }
 
 // DaemonHeartbeatPendingLocalSkills describes a request for the runtime's

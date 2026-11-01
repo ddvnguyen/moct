@@ -1440,21 +1440,30 @@ export type AgentAccountMode = "default" | "specific" | "any";
 
 export interface WorkspaceAccount {
   id: string;
-  workspace_id: string;
+  workspaceId: string;
   provider: string;
   label: string;
   endpoint?: string;
   enabled: boolean;
-  credential_ref?: string;
-  created_at: string;
-  updated_at: string;
+  credentialRef?: string;
+  state?: string;
+  loginUrl?: string;
+  expiresAt?: string;
+  error?: string;
+  status?: unknown;
+  daemonAccountId?: string;
+  runtimeId?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface CreateWorkspaceAccountRequest {
-  label: string;
+  label?: string;
   endpoint?: string;
   credential_ref?: string;
   enabled?: boolean;
+  managed?: boolean;
+  runtime_id?: string;
 }
 
-export type UpdateWorkspaceAccountRequest = Partial<CreateWorkspaceAccountRequest>;
+export type UpdateWorkspaceAccountRequest = Partial<CreateWorkspaceAccountRequest> & { retry?: boolean };

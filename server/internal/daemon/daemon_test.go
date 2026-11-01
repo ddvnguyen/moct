@@ -6474,14 +6474,15 @@ func TestWatchTaskCancellation_ReconcileRunningKeepsTickerAlive(t *testing.T) {
 func TestSanitizeAgentEnv(t *testing.T) {
 	t.Parallel()
 	in := map[string]string{
-		"HOME":        "/evil",
-		"PATH":        "/evil/bin",
-		"MULTICA_X":   "1",
-		"TEAM_SKILLS": "/srv/team",
-		"HERMES_HOME": "/some/home",
+		"HOME":                     "/evil",
+		"PATH":                     "/evil/bin",
+		"MULTICA_X":                "1",
+		freebuffDesktopLaunchIDEnv: "spoofed",
+		"TEAM_SKILLS":              "/srv/team",
+		"HERMES_HOME":              "/some/home",
 	}
 	got := sanitizeAgentEnv(in)
-	for _, blocked := range []string{"HOME", "PATH", "MULTICA_X"} {
+	for _, blocked := range []string{"HOME", "PATH", "MULTICA_X", freebuffDesktopLaunchIDEnv} {
 		if _, ok := got[blocked]; ok {
 			t.Errorf("blocklisted key %q must be dropped from the effective env", blocked)
 		}

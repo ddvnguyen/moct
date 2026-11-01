@@ -481,6 +481,10 @@ type Daemon struct {
 	// break. Read it through daemonLifecycleCtx.
 	lifecycleCtx context.Context
 
+	freebuffDesktopLogins     sync.Map // runtime/account key -> context.CancelFunc
+	freebuffDesktopInstances  sync.Map // runtime/account key -> *freebuffDesktopInstance
+	freebuffDesktopInstanceMu sync.Mutex
+
 	// dshInstallInFlight is true while an automatic DSH profile install is
 	// running. Read when a verdict becomes an offline reason, so the server can
 	// tell "wait, this resolves itself" from "a human has to act".
@@ -2195,6 +2199,7 @@ func (d *Daemon) run(ctx context.Context, healthLn net.Listener) error {
 	// Keep the Freebuff account state fresh (session slot, prices, credit)
 	// and start a browser login when the user asks for one from the web UI.
 	go d.freebuffLoop(ctx)
+	go d.freebuffDesktopLoop(ctx)
 
 	taskWakeups := make(chan taskWakeup, 256)
 	go d.taskWakeupLoop(ctx, taskWakeups)
@@ -4708,6 +4713,7 @@ func (d *Daemon) handlePendingWorkHint(runtimeID, kind string) {
 // usable; only the second one tells the user why it is empty.
 func (d *Daemon) handleModelList(ctx context.Context, rt Runtime, requestID string, accounts []protocol.DaemonModelAccount) {
 	d.logger.Info("model list requested", "runtime_id", rt.ID, "request_id", requestID, "provider", rt.Provider)
+	accounts = d.prepareManagedFreebuffDesktopAccounts(ctx, rt, accounts)
 
 	// Freebuff discovery (M-165) precedes the CLI-command resolution below:
 	// there is no CLI to enumerate — the catalog is the account picker of a
@@ -8904,9 +8910,38 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Critical internal variables are blocklisted to prevent accidental or
 	// malicious override of daemon-set values.
 	var agentCustomEnv map[string]string
+	var managedFreebuffLaunchID string
 	if task.Agent != nil {
 		agentCustomEnv = task.Agent.CustomEnv
 	}
+	// A managed Freebuff Desktop account is daemon-owned. Re-ensure its
+	// orchestrator before handing the endpoint and state directory to a task;
+	// this also repairs endpoint changes after a daemon or provider restart.
+	if task.Agent != nil && task.Agent.AccountDaemonID != "" {
+		d.mu.Lock()
+		rt, ok := d.runtimeIndex[task.RuntimeID]
+		d.mu.Unlock()
+		if !ok {
+			return TaskResult{}, errors.New("managed Freebuff Desktop runtime is unavailable")
+		}
+		accountCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		client, err := d.ensureFreebuffDesktopInstance(accountCtx, rt, task.Agent.AccountDaemonID)
+		cancel()
+		if err != nil {
+			return TaskResult{}, fmt.Errorf("start managed Freebuff Desktop account: %w", err)
+		}
+		dir, err := freebuffDesktopAccountDir(rt, task.Agent.AccountDaemonID)
+		if err != nil {
+			return TaskResult{}, fmt.Errorf("resolve managed Freebuff Desktop account state: %w", err)
+		}
+		task.Agent.AccountEndpoint = client.BaseURL()
+		task.Agent.AccountCredentialRef = dir
+		managedFreebuffLaunchID = client.LaunchID()
+		if managedFreebuffLaunchID == "" {
+			return TaskResult{}, errors.New("managed Freebuff Desktop launch credential unavailable")
+		}
+	}
+
 	// freebuff-desktop account injection (M-153): resolved account is layered
 	// UNDER the agent's custom_env so custom_env wins.
 	if task.Agent != nil && task.Agent.AccountMode != "default" && task.Agent.AccountMode != "" {
@@ -8920,7 +8955,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		if v := strings.TrimSpace(task.Agent.AccountCredentialRef); v != "" {
 			if _, ok := agentCustomEnv["FREEBUFF_DESKTOP_CREDENTIAL_REF"]; !ok {
-				agentCustomEnv["FREEBUFF_DESKTOP_CREDENTIAL_REF"] = v
+				ref := v
+				if _, err := os.Stat(ref); err != nil {
+					if dir, err := agent.FreebuffAccountDir(agent.Config{RuntimeID: task.RuntimeID}, v); err == nil {
+						ref = dir
+					}
+				}
+				agentCustomEnv["FREEBUFF_DESKTOP_CREDENTIAL_REF"] = ref
 			}
 		}
 	}
@@ -8939,6 +8980,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
+	if managedFreebuffLaunchID != "" {
+		applyManagedFreebuffDesktopEnv(agentEnv, task.Agent.AccountEndpoint, task.Agent.AccountCredentialRef, managedFreebuffLaunchID)
+	}
 	if provider == "reasonix" {
 		reasonixStateHome, err := prepareReasonixTaskStateHome(d.cfg.Profile, task.RuntimeID, task.AgentID)
 		if err != nil {
@@ -11042,7 +11086,7 @@ func isBlockedEnvKey(key string) bool {
 		return true
 	}
 	switch upper {
-	case "HOME", "PATH", "USER", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "CODEX_HOME", "REASONIX_STATE_HOME", "CURSOR_DATA_DIR", execenv.CursorMcpAuthSourceEnv, "OPENCLAW_CONFIG_PATH", "OPENCLAW_INCLUDE_ROOTS":
+	case "HOME", "PATH", "USER", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "CODEX_HOME", "REASONIX_STATE_HOME", "CURSOR_DATA_DIR", execenv.CursorMcpAuthSourceEnv, "OPENCLAW_CONFIG_PATH", "OPENCLAW_INCLUDE_ROOTS", freebuffDesktopLaunchIDEnv:
 		return true
 	}
 	return false

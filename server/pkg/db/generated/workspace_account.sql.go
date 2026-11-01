@@ -18,9 +18,13 @@ SELECT CASE
         WHERE t.account_id = ag.account_id AND t.status IN ('dispatched', 'running'))
     WHEN ag.account_mode = 'any' THEN
         EXISTS (SELECT 1 FROM workspace_account a
-                WHERE a.workspace_id = ag.workspace_id AND a.provider = 'freebuff-desktop' AND a.enabled)
+                WHERE a.workspace_id = ag.workspace_id AND a.provider = 'freebuff-desktop' AND a.enabled
+                  AND (a.daemon_account_id IS NULL OR a.state = 'connected')
+                  AND (a.runtime_id IS NULL OR a.runtime_id = $2))
         AND NOT EXISTS (SELECT 1 FROM workspace_account a
                 WHERE a.workspace_id = ag.workspace_id AND a.provider = 'freebuff-desktop' AND a.enabled
+                  AND (a.daemon_account_id IS NULL OR a.state = 'connected')
+                  AND (a.runtime_id IS NULL OR a.runtime_id = $2)
                   AND NOT EXISTS (SELECT 1 FROM agent_task_queue t
                                   WHERE t.account_id = a.id AND t.status IN ('dispatched', 'running')))
     ELSE FALSE
@@ -29,12 +33,17 @@ FROM agent ag
 WHERE ag.id = $1
 `
 
+type AgentAccountBlockedParams struct {
+	ID        pgtype.UUID `json:"id"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+}
+
 // Whether the agent must wait for an account to free up before a task is
 // claimed. `specific` is blocked while its account holds a dispatched/running
 // task; `any` only when every enabled account does. An agent with no usable
 // account (`default`, or `any` with none configured) is never blocked.
-func (q *Queries) AgentAccountBlocked(ctx context.Context, id pgtype.UUID) (bool, error) {
-	row := q.db.QueryRow(ctx, agentAccountBlocked, id)
+func (q *Queries) AgentAccountBlocked(ctx context.Context, arg AgentAccountBlockedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, agentAccountBlocked, arg.ID, arg.RuntimeID)
 	var blocked bool
 	err := row.Scan(&blocked)
 	return blocked, err
@@ -45,7 +54,7 @@ INSERT INTO workspace_account (
     workspace_id, provider, label, endpoint, credential_ref, enabled, created_by
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7
-) RETURNING id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at
+) RETURNING id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at, state, login_url, expires_at, error, status, daemon_account_id, runtime_id
 `
 
 type CreateWorkspaceAccountParams struct {
@@ -80,6 +89,13 @@ func (q *Queries) CreateWorkspaceAccount(ctx context.Context, arg CreateWorkspac
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.State,
+		&i.LoginUrl,
+		&i.ExpiresAt,
+		&i.Error,
+		&i.Status,
+		&i.DaemonAccountID,
+		&i.RuntimeID,
 	)
 	return i, err
 }
@@ -105,7 +121,7 @@ func (q *Queries) DemoteAgentsOnAccountDelete(ctx context.Context, accountID pgt
 }
 
 const getWorkspaceAccount = `-- name: GetWorkspaceAccount :one
-SELECT id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at FROM workspace_account
+SELECT id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at, state, login_url, expires_at, error, status, daemon_account_id, runtime_id FROM workspace_account
 WHERE id = $1
 `
 
@@ -123,12 +139,19 @@ func (q *Queries) GetWorkspaceAccount(ctx context.Context, id pgtype.UUID) (Work
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.State,
+		&i.LoginUrl,
+		&i.ExpiresAt,
+		&i.Error,
+		&i.Status,
+		&i.DaemonAccountID,
+		&i.RuntimeID,
 	)
 	return i, err
 }
 
 const getWorkspaceAccountInWorkspace = `-- name: GetWorkspaceAccountInWorkspace :one
-SELECT id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at FROM workspace_account
+SELECT id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at, state, login_url, expires_at, error, status, daemon_account_id, runtime_id FROM workspace_account
 WHERE id = $1 AND workspace_id = $2
 `
 
@@ -151,12 +174,19 @@ func (q *Queries) GetWorkspaceAccountInWorkspace(ctx context.Context, arg GetWor
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.State,
+		&i.LoginUrl,
+		&i.ExpiresAt,
+		&i.Error,
+		&i.Status,
+		&i.DaemonAccountID,
+		&i.RuntimeID,
 	)
 	return i, err
 }
 
 const listAccountsForDispatch = `-- name: ListAccountsForDispatch :many
-SELECT a.id, a.label, a.endpoint, a.credential_ref,
+SELECT a.id, a.label, a.endpoint, a.credential_ref, a.daemon_account_id, a.runtime_id,
        COALESCE(l.active, 0)::int AS active_tasks
 FROM workspace_account a
 LEFT JOIN (
@@ -168,27 +198,32 @@ LEFT JOIN (
     GROUP BY account_id
 ) l ON l.account_id = a.id
 WHERE a.workspace_id = $1 AND a.provider = $2 AND a.enabled = TRUE
+  AND (a.daemon_account_id IS NULL OR a.state = 'connected')
+  AND (a.runtime_id IS NULL OR a.runtime_id = $3)
 ORDER BY COALESCE(l.active, 0) ASC, l.last_used ASC NULLS FIRST, a.created_at ASC
 `
 
 type ListAccountsForDispatchParams struct {
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	Provider    string      `json:"provider"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 }
 
 type ListAccountsForDispatchRow struct {
-	ID            pgtype.UUID `json:"id"`
-	Label         string      `json:"label"`
-	Endpoint      pgtype.Text `json:"endpoint"`
-	CredentialRef pgtype.Text `json:"credential_ref"`
-	ActiveTasks   int32       `json:"active_tasks"`
+	ID              pgtype.UUID `json:"id"`
+	Label           string      `json:"label"`
+	Endpoint        pgtype.Text `json:"endpoint"`
+	CredentialRef   pgtype.Text `json:"credential_ref"`
+	DaemonAccountID pgtype.Text `json:"daemon_account_id"`
+	RuntimeID       pgtype.UUID `json:"runtime_id"`
+	ActiveTasks     int32       `json:"active_tasks"`
 }
 
 // The enabled accounts of one provider, least busy first. "Busy" is the number
 // of dispatched/running tasks holding the account; ties break on the account
 // that has been idle longest, so `any` spreads runs instead of piling on one.
 func (q *Queries) ListAccountsForDispatch(ctx context.Context, arg ListAccountsForDispatchParams) ([]ListAccountsForDispatchRow, error) {
-	rows, err := q.db.Query(ctx, listAccountsForDispatch, arg.WorkspaceID, arg.Provider)
+	rows, err := q.db.Query(ctx, listAccountsForDispatch, arg.WorkspaceID, arg.Provider, arg.RuntimeID)
 	if err != nil {
 		return nil, err
 	}
@@ -201,6 +236,8 @@ func (q *Queries) ListAccountsForDispatch(ctx context.Context, arg ListAccountsF
 			&i.Label,
 			&i.Endpoint,
 			&i.CredentialRef,
+			&i.DaemonAccountID,
+			&i.RuntimeID,
 			&i.ActiveTasks,
 		); err != nil {
 			return nil, err
@@ -214,7 +251,7 @@ func (q *Queries) ListAccountsForDispatch(ctx context.Context, arg ListAccountsF
 }
 
 const listWorkspaceAccounts = `-- name: ListWorkspaceAccounts :many
-SELECT id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at FROM workspace_account
+SELECT id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at, state, login_url, expires_at, error, status, daemon_account_id, runtime_id FROM workspace_account
 WHERE workspace_id = $1
 ORDER BY created_at ASC
 `
@@ -239,6 +276,13 @@ func (q *Queries) ListWorkspaceAccounts(ctx context.Context, workspaceID pgtype.
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.State,
+			&i.LoginUrl,
+			&i.ExpiresAt,
+			&i.Error,
+			&i.Status,
+			&i.DaemonAccountID,
+			&i.RuntimeID,
 		); err != nil {
 			return nil, err
 		}
@@ -251,8 +295,9 @@ func (q *Queries) ListWorkspaceAccounts(ctx context.Context, workspaceID pgtype.
 }
 
 const listWorkspaceAccountsByProvider = `-- name: ListWorkspaceAccountsByProvider :many
-SELECT id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at FROM workspace_account
+SELECT id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at, state, login_url, expires_at, error, status, daemon_account_id, runtime_id FROM workspace_account
 WHERE workspace_id = $1 AND provider = $2 AND enabled = TRUE
+  AND (daemon_account_id IS NULL OR state = 'connected')
 ORDER BY created_at ASC
 `
 
@@ -281,6 +326,13 @@ func (q *Queries) ListWorkspaceAccountsByProvider(ctx context.Context, arg ListW
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.State,
+			&i.LoginUrl,
+			&i.ExpiresAt,
+			&i.Error,
+			&i.Status,
+			&i.DaemonAccountID,
+			&i.RuntimeID,
 		); err != nil {
 			return nil, err
 		}
@@ -292,6 +344,44 @@ func (q *Queries) ListWorkspaceAccountsByProvider(ctx context.Context, arg ListW
 	return items, nil
 }
 
+const retryManagedWorkspaceAccount = `-- name: RetryManagedWorkspaceAccount :one
+UPDATE workspace_account
+SET state='requested', login_url=NULL, expires_at=NULL, error=NULL, status=NULL, updated_at=now()
+WHERE id=$1 AND runtime_id=$2 AND daemon_account_id IS NOT NULL
+  AND state IN ('failed','signed_out')
+RETURNING id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at, state, login_url, expires_at, error, status, daemon_account_id, runtime_id
+`
+
+type RetryManagedWorkspaceAccountParams struct {
+	ID        pgtype.UUID `json:"id"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+}
+
+func (q *Queries) RetryManagedWorkspaceAccount(ctx context.Context, arg RetryManagedWorkspaceAccountParams) (WorkspaceAccount, error) {
+	row := q.db.QueryRow(ctx, retryManagedWorkspaceAccount, arg.ID, arg.RuntimeID)
+	var i WorkspaceAccount
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Provider,
+		&i.Label,
+		&i.Endpoint,
+		&i.CredentialRef,
+		&i.Enabled,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.State,
+		&i.LoginUrl,
+		&i.ExpiresAt,
+		&i.Error,
+		&i.Status,
+		&i.DaemonAccountID,
+		&i.RuntimeID,
+	)
+	return i, err
+}
+
 const updateWorkspaceAccount = `-- name: UpdateWorkspaceAccount :one
 UPDATE workspace_account
 SET label = $2,
@@ -300,7 +390,7 @@ SET label = $2,
     enabled = $5,
     updated_at = now()
 WHERE id = $1
-RETURNING id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at
+RETURNING id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at, state, login_url, expires_at, error, status, daemon_account_id, runtime_id
 `
 
 type UpdateWorkspaceAccountParams struct {
@@ -331,6 +421,13 @@ func (q *Queries) UpdateWorkspaceAccount(ctx context.Context, arg UpdateWorkspac
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.State,
+		&i.LoginUrl,
+		&i.ExpiresAt,
+		&i.Error,
+		&i.Status,
+		&i.DaemonAccountID,
+		&i.RuntimeID,
 	)
 	return i, err
 }

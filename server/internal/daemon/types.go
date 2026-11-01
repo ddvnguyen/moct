@@ -259,6 +259,7 @@ type AgentData struct {
 	AccountID             string                     `json:"account_id,omitempty"`
 	AccountEndpoint       string                     `json:"account_endpoint,omitempty"`
 	AccountCredentialRef  string                     `json:"account_credential_ref,omitempty"`
+	AccountDaemonID       string                     `json:"account_daemon_id,omitempty"`
 	DisabledRuntimeSkills []DisabledRuntimeSkillData `json:"disabled_runtime_skills,omitempty"`
 	// RuntimeConfig is the per-provider runtime_config JSON as stored on
 	// the agent record, forwarded verbatim by the claim endpoint. The

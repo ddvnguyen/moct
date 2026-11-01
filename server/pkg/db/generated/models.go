@@ -1826,16 +1826,23 @@ type Workspace struct {
 }
 
 type WorkspaceAccount struct {
-	ID            pgtype.UUID        `json:"id"`
-	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
-	Provider      string             `json:"provider"`
-	Label         string             `json:"label"`
-	Endpoint      pgtype.Text        `json:"endpoint"`
-	CredentialRef pgtype.Text        `json:"credential_ref"`
-	Enabled       bool               `json:"enabled"`
-	CreatedBy     pgtype.UUID        `json:"created_by"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	Provider        string             `json:"provider"`
+	Label           string             `json:"label"`
+	Endpoint        pgtype.Text        `json:"endpoint"`
+	CredentialRef   pgtype.Text        `json:"credential_ref"`
+	Enabled         bool               `json:"enabled"`
+	CreatedBy       pgtype.UUID        `json:"created_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	State           string             `json:"state"`
+	LoginUrl        pgtype.Text        `json:"login_url"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	Error           pgtype.Text        `json:"error"`
+	Status          []byte             `json:"status"`
+	DaemonAccountID pgtype.Text        `json:"daemon_account_id"`
+	RuntimeID       pgtype.UUID        `json:"runtime_id"`
 }
 
 type WorkspaceInvitation struct {

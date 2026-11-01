@@ -3895,7 +3895,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		// is running a task. Each account allows one run at a time. A lookup
 		// failure does not strand the task; the bridge also serializes per
 		// account, so the worst case is a short wait there.
-		if blocked, berr := s.Queries.AgentAccountBlocked(ctx, candidate.AgentID); berr != nil {
+		if blocked, berr := s.Queries.AgentAccountBlocked(ctx, db.AgentAccountBlockedParams{ID: candidate.AgentID, RuntimeID: runtimeID}); berr != nil {
 			slog.Warn("claim_for_runtime: account lease check failed; claiming anyway",
 				"agent_id", agentKey, "runtime_id", runtimeKey, "error", berr)
 		} else if blocked {

@@ -584,6 +584,10 @@
     "endpoint_placeholder": "Endpoint (http://host:4320)",
     "credential_placeholder": "Credential reference",
     "add": "Add account",
+    "retry": "Retry",
+    "advanced": "Advanced",
+    "copy_login_url_aria": "Copy sign-in link",
+    "open_login_url_aria": "Open sign-in link",
     "toast_failed": "Could not update the account"
   },
   "qoder": {

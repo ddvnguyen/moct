@@ -858,6 +858,7 @@ type TaskAgentData struct {
 	AccountID             string                      `json:"account_id,omitempty"`
 	AccountEndpoint       string                      `json:"account_endpoint,omitempty"`
 	AccountCredentialRef  string                      `json:"account_credential_ref,omitempty"`
+	AccountDaemonID       string                      `json:"account_daemon_id,omitempty"`
 	DisabledRuntimeSkills []DisabledRuntimeSkill      `json:"disabled_runtime_skills,omitempty"`
 	// RuntimeConfig is the agent's saved runtime_config JSON as-is. The
 	// daemon decodes it per-provider — e.g. the openclaw backend reads

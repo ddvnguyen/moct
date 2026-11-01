@@ -118,17 +118,24 @@ func (h *Handler) validateAgentAccount(ctx context.Context, workspaceID pgtype.U
 	if acc.Provider != accountProviderFreebuffDesktop {
 		return http.StatusBadRequest, "account provider mismatch"
 	}
+	if acc.DaemonAccountID.Valid && (!acc.RuntimeID.Valid || acc.RuntimeID != runtime.ID) {
+		return http.StatusBadRequest, "managed account belongs to another runtime"
+	}
 	if !acc.Enabled {
 		return http.StatusBadRequest, "account is disabled"
+	}
+	if acc.DaemonAccountID.Valid && acc.State != "connected" {
+		return http.StatusBadRequest, "managed account is not connected"
 	}
 	return 0, ""
 }
 
 // claimAccount is the account a claimed task runs against.
 type claimAccount struct {
-	ID            pgtype.UUID
-	Endpoint      string
-	CredentialRef string
+	ID              pgtype.UUID
+	Endpoint        string
+	CredentialRef   string
+	DaemonAccountID string
 }
 
 // errAccountUnavailable means the agent's account setting cannot be honoured
@@ -149,10 +156,13 @@ func (h *Handler) resolveClaimAccount(ctx context.Context, agent db.Agent) (acc 
 		if gerr != nil || !a.Enabled || a.Provider != accountProviderFreebuffDesktop {
 			return claimAccount{}, false, errAccountUnavailable
 		}
-		return claimAccount{ID: a.ID, Endpoint: a.Endpoint.String, CredentialRef: a.CredentialRef.String}, true, nil
+		if a.DaemonAccountID.Valid && (!a.RuntimeID.Valid || a.RuntimeID != agent.RuntimeID || a.State != "connected") {
+			return claimAccount{}, false, errAccountUnavailable
+		}
+		return claimAccount{ID: a.ID, Endpoint: a.Endpoint.String, CredentialRef: a.CredentialRef.String, DaemonAccountID: a.DaemonAccountID.String}, true, nil
 	case accountModeAny:
 		rows, lerr := h.Queries.ListAccountsForDispatch(ctx, db.ListAccountsForDispatchParams{
-			WorkspaceID: agent.WorkspaceID, Provider: accountProviderFreebuffDesktop,
+			WorkspaceID: agent.WorkspaceID, Provider: accountProviderFreebuffDesktop, RuntimeID: agent.RuntimeID,
 		})
 		if lerr != nil {
 			return claimAccount{}, false, lerr
@@ -161,7 +171,7 @@ func (h *Handler) resolveClaimAccount(ctx context.Context, agent db.Agent) (acc 
 			return claimAccount{}, false, nil
 		}
 		r := rows[0] // least busy first
-		return claimAccount{ID: r.ID, Endpoint: r.Endpoint.String, CredentialRef: r.CredentialRef.String}, true, nil
+		return claimAccount{ID: r.ID, Endpoint: r.Endpoint.String, CredentialRef: r.CredentialRef.String, DaemonAccountID: r.DaemonAccountID.String}, true, nil
 	}
 	return claimAccount{}, false, nil
 }
@@ -205,10 +215,11 @@ func resolveModelAccounts(ctx context.Context, q *db.Queries, runtimeID, account
 	}
 	toWire := func(a db.WorkspaceAccount) protocol.DaemonModelAccount {
 		return protocol.DaemonModelAccount{
-			ID:            uuidToString(a.ID),
-			Label:         a.Label,
-			Endpoint:      a.Endpoint.String,
-			CredentialRef: a.CredentialRef.String,
+			ID:              uuidToString(a.ID),
+			Label:           a.Label,
+			Endpoint:        a.Endpoint.String,
+			CredentialRef:   a.CredentialRef.String,
+			DaemonAccountID: a.DaemonAccountID.String,
 		}
 	}
 	if account == modelAccountAll {
@@ -220,6 +231,9 @@ func resolveModelAccounts(ctx context.Context, q *db.Queries, runtimeID, account
 		}
 		out := make([]protocol.DaemonModelAccount, 0, len(accs))
 		for _, a := range accs {
+			if a.DaemonAccountID.Valid && (!a.RuntimeID.Valid || uuidToString(a.RuntimeID) != runtimeID || a.State != "connected") {
+				continue
+			}
 			out = append(out, toWire(a)) // the query already filters enabled
 		}
 		return out
@@ -232,6 +246,9 @@ func resolveModelAccounts(ctx context.Context, q *db.Queries, runtimeID, account
 		ID: accUUID, WorkspaceID: rt.WorkspaceID,
 	})
 	if err != nil || !acc.Enabled || acc.Provider != accountProviderFreebuffDesktop {
+		return nil
+	}
+	if acc.DaemonAccountID.Valid && (!acc.RuntimeID.Valid || uuidToString(acc.RuntimeID) != runtimeID || acc.State != "connected") {
 		return nil
 	}
 	return []protocol.DaemonModelAccount{toWire(acc)}

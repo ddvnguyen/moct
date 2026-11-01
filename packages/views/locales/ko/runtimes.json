@@ -567,6 +567,10 @@
     "endpoint_placeholder": "엔드포인트 (http://host:4320)",
     "credential_placeholder": "자격 증명 참조",
     "add": "계정 추가",
+    "retry": "다시 시도",
+    "advanced": "고급",
+    "copy_login_url_aria": "로그인 링크 복사",
+    "open_login_url_aria": "로그인 링크 열기",
     "toast_failed": "계정을 업데이트할 수 없습니다"
   },
   "qoder": {

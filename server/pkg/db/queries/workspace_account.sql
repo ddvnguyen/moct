@@ -21,6 +21,7 @@ ORDER BY created_at ASC;
 -- name: ListWorkspaceAccountsByProvider :many
 SELECT * FROM workspace_account
 WHERE workspace_id = $1 AND provider = $2 AND enabled = TRUE
+  AND (daemon_account_id IS NULL OR state = 'connected')
 ORDER BY created_at ASC;
 
 -- name: UpdateWorkspaceAccount :one
@@ -36,6 +37,13 @@ RETURNING *;
 -- name: DeleteWorkspaceAccount :exec
 DELETE FROM workspace_account WHERE id = $1;
 
+-- name: RetryManagedWorkspaceAccount :one
+UPDATE workspace_account
+SET state='requested', login_url=NULL, expires_at=NULL, error=NULL, status=NULL, updated_at=now()
+WHERE id=$1 AND runtime_id=$2 AND daemon_account_id IS NOT NULL
+  AND state IN ('failed','signed_out')
+RETURNING *;
+
 -- name: DemoteAgentsOnAccountDelete :exec
 UPDATE agent
 SET account_mode = 'default', account_id = NULL, updated_at = now()
@@ -44,7 +52,7 @@ WHERE account_id = $1;
 -- The enabled accounts of one provider, least busy first. "Busy" is the number
 -- of dispatched/running tasks holding the account; ties break on the account
 -- that has been idle longest, so `any` spreads runs instead of piling on one.
-SELECT a.id, a.label, a.endpoint, a.credential_ref,
+SELECT a.id, a.label, a.endpoint, a.credential_ref, a.daemon_account_id, a.runtime_id,
        COALESCE(l.active, 0)::int AS active_tasks
 FROM workspace_account a
 LEFT JOIN (
@@ -56,6 +64,8 @@ LEFT JOIN (
     GROUP BY account_id
 ) l ON l.account_id = a.id
 WHERE a.workspace_id = $1 AND a.provider = $2 AND a.enabled = TRUE
+  AND (a.daemon_account_id IS NULL OR a.state = 'connected')
+  AND (a.runtime_id IS NULL OR a.runtime_id = $3)
 ORDER BY COALESCE(l.active, 0) ASC, l.last_used ASC NULLS FIRST, a.created_at ASC;
 
 -- name: AgentAccountBlocked :one
@@ -69,9 +79,13 @@ SELECT CASE
         WHERE t.account_id = ag.account_id AND t.status IN ('dispatched', 'running'))
     WHEN ag.account_mode = 'any' THEN
         EXISTS (SELECT 1 FROM workspace_account a
-                WHERE a.workspace_id = ag.workspace_id AND a.provider = 'freebuff-desktop' AND a.enabled)
+                WHERE a.workspace_id = ag.workspace_id AND a.provider = 'freebuff-desktop' AND a.enabled
+                  AND (a.daemon_account_id IS NULL OR a.state = 'connected')
+                  AND (a.runtime_id IS NULL OR a.runtime_id = sqlc.arg(runtime_id)))
         AND NOT EXISTS (SELECT 1 FROM workspace_account a
                 WHERE a.workspace_id = ag.workspace_id AND a.provider = 'freebuff-desktop' AND a.enabled
+                  AND (a.daemon_account_id IS NULL OR a.state = 'connected')
+                  AND (a.runtime_id IS NULL OR a.runtime_id = sqlc.arg(runtime_id))
                   AND NOT EXISTS (SELECT 1 FROM agent_task_queue t
                                   WHERE t.account_id = a.id AND t.status IN ('dispatched', 'running')))
     ELSE FALSE

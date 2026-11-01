@@ -12,12 +12,12 @@ import type { WorkspaceAccount } from "../types/agent";
 
 const acct = (over: Partial<WorkspaceAccount>): WorkspaceAccount => ({
   id: "a1",
-  workspace_id: "w",
+  workspaceId: "w",
   provider: "freebuff-desktop",
   label: "A",
   enabled: true,
-  created_at: "",
-  updated_at: "",
+  createdAt: "",
+  updatedAt: "",
   ...over,
 });
 

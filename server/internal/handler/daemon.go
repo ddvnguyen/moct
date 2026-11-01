@@ -3052,6 +3052,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		AccountID:             accountID,
 		AccountEndpoint:       claimAcct.Endpoint,
 		AccountCredentialRef:  claimAcct.CredentialRef,
+		AccountDaemonID:       claimAcct.DaemonAccountID,
 	}
 	// Snapshot the agent's persistent OpenClaw model override for this claim.
 	// It applies to every claim until changed or cleared; later edits do not

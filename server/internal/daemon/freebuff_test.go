@@ -61,23 +61,42 @@ func (fx *freebuffFixture) snapshot() []map[string]any {
 
 // fakeAccount is an orchestrator stand-in for the account flow.
 type fakeAccount struct {
-	mu       sync.Mutex
-	statuses []freebuffrt.AuthStatus // returned in order; the last repeats
-	catalogs []freebuffrt.ModelCatalog // returned in order; the last repeats
+	mu         sync.Mutex
+	statuses   []freebuffrt.AuthStatus // returned in order; the last repeats
+	authErr    error
+	launchID   string
+	catalogs   []freebuffrt.ModelCatalog // returned in order; the last repeats
 	catalogErr error
-	login    freebuffrt.LoginStart
-	loginErr error
-	canceled bool
+	login      freebuffrt.LoginStart
+	loginErr   error
+	canceled   bool
 }
 
 func (f *fakeAccount) AuthStatus(context.Context) (freebuffrt.AuthStatus, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.authErr != nil {
+		return freebuffrt.AuthStatus{}, f.authErr
+	}
 	st := f.statuses[0]
 	if len(f.statuses) > 1 {
 		f.statuses = f.statuses[1:]
 	}
 	return st, nil
+}
+
+func (f *fakeAccount) LaunchID() string { return f.launchID }
+
+func TestManagedFreebuffDesktopEnvOverridesUserValues(t *testing.T) {
+	env := map[string]string{
+		"FREEBUFF_DESKTOP_URL":            "https://untrusted.example",
+		"FREEBUFF_DESKTOP_CREDENTIAL_REF": "/wrong-account",
+		freebuffDesktopLaunchIDEnv:        "stale",
+	}
+	applyManagedFreebuffDesktopEnv(env, "http://127.0.0.1:4321", "/account", "fresh-launch")
+	if env["FREEBUFF_DESKTOP_URL"] != "http://127.0.0.1:4321" || env["FREEBUFF_DESKTOP_CREDENTIAL_REF"] != "/account" || env[freebuffDesktopLaunchIDEnv] != "fresh-launch" {
+		t.Fatalf("managed endpoint, directory, and launch credential must stay paired: %#v", env)
+	}
 }
 
 func (f *fakeAccount) StartLogin(context.Context) (freebuffrt.LoginStart, error) {
@@ -99,6 +118,8 @@ func (f *fakeAccount) ModelCatalog(context.Context) (freebuffrt.ModelCatalog, er
 	}
 	return cat, nil
 }
+
+func (f *fakeAccount) BaseURL() string { return "http://127.0.0.1:4320" }
 
 func (f *fakeAccount) CancelLogin(context.Context) error {
 	f.mu.Lock()
@@ -214,6 +235,220 @@ func TestHandleFreebuffLogin_AlreadySignedIn(t *testing.T) {
 	reports := fx.accountReports()
 	if len(reports) != 1 || reports[0]["state"] != "connected" {
 		t.Fatalf("reports = %#v", reports)
+	}
+}
+
+func TestHandleFreebuffDesktopLogin_KeepsInstanceUntilDaemonShutdown(t *testing.T) {
+	fx := newFreebuffFixture(t)
+	fastLogin(t)
+	useProfiles(t)
+	account := &fakeAccount{statuses: []freebuffrt.AuthStatus{{}, signedIn("owner@example.com")}, login: freebuffrt.LoginStart{RemoteURL: "https://freebuff.example/login"}}
+	stopped := false
+	prev := startFreebuffAccount
+	startFreebuffAccount = func(context.Context, string, string) (freebuffAccount, func(), error) {
+		return account, func() { stopped = true }, nil
+	}
+	t.Cleanup(func() { startFreebuffAccount = prev })
+
+	rt := Runtime{ID: "rt-managed", Provider: "codebuddy", Status: "online"}
+	fx.daemon.handleFreebuffDesktopLogin(context.Background(), rt, "a1")
+	if stopped {
+		t.Fatal("desktop instance stopped when the browser-login request returned")
+	}
+	if _, ok := fx.daemon.freebuffDesktopInstances.Load(freebuffDesktopLoginKey(rt.ID, "a1")); !ok {
+		t.Fatal("desktop instance was not retained by the daemon")
+	}
+	fx.daemon.stopFreebuffDesktopInstances()
+	if !stopped {
+		t.Fatal("daemon shutdown did not stop the retained desktop instance")
+	}
+}
+
+func TestFreebuffDesktopPending_DuplicateRequestsStartOneLogin(t *testing.T) {
+	fx := newFreebuffFixture(t)
+	useProfiles(t)
+	fastLogin(t)
+	fx.pending = `{"accounts":[{"id":"a1","state":"requested"}]}`
+	prevTimeout := freebuffLoginTimeout
+	freebuffLoginTimeout = 35 * time.Millisecond
+	t.Cleanup(func() { freebuffLoginTimeout = prevTimeout })
+	account := &fakeAccount{statuses: []freebuffrt.AuthStatus{{}}, login: freebuffrt.LoginStart{RemoteURL: "https://freebuff.example/login"}}
+	var mu sync.Mutex
+	starts := 0
+	prev := startFreebuffAccount
+	startFreebuffAccount = func(context.Context, string, string) (freebuffAccount, func(), error) {
+		mu.Lock()
+		starts++
+		mu.Unlock()
+		return account, func() {}, nil
+	}
+	t.Cleanup(func() { startFreebuffAccount = prev })
+	rt := Runtime{ID: "rt-managed", Provider: "codebuddy", Status: "online"}
+	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
+	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
+	time.Sleep(120 * time.Millisecond)
+	mu.Lock()
+	gotStarts := starts
+	mu.Unlock()
+	if gotStarts != 1 {
+		t.Fatalf("duplicate pending request started %d orchestrators, want 1", gotStarts)
+	}
+	account.mu.Lock()
+	canceled := account.canceled
+	account.mu.Unlock()
+	if !canceled {
+		t.Fatal("timed out desktop login did not cancel the provider login")
+	}
+}
+
+func TestHandleFreebuffDesktopLogin_CancellationKeepsDaemonOwnedInstance(t *testing.T) {
+	fx := newFreebuffFixture(t)
+	fastLogin(t)
+	useProfiles(t)
+	account := &fakeAccount{statuses: []freebuffrt.AuthStatus{{}}, login: freebuffrt.LoginStart{RemoteURL: "https://freebuff.example/login"}}
+	stopped := false
+	prev := startFreebuffAccount
+	startFreebuffAccount = func(context.Context, string, string) (freebuffAccount, func(), error) {
+		return account, func() { stopped = true }, nil
+	}
+	t.Cleanup(func() { startFreebuffAccount = prev })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fx.daemon.handleFreebuffDesktopLogin(ctx, Runtime{ID: "rt-managed", Provider: "codebuddy"}, "a1")
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(fx.accountReports()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled sign-in did not stop waiting")
+	}
+	account.mu.Lock()
+	canceled := account.canceled
+	account.mu.Unlock()
+	if !canceled || stopped {
+		t.Fatalf("cancelled=%v stopped=%v; cancellation should close sign-in but retain the daemon-owned instance", canceled, stopped)
+	}
+	fx.daemon.stopFreebuffDesktopInstances()
+	if !stopped {
+		t.Fatal("daemon shutdown did not stop the retained instance")
+	}
+}
+
+func TestFreebuffDesktopRemovalWaitsForActiveTaskAndAcknowledgesRemoval(t *testing.T) {
+	fx := newFreebuffFixture(t)
+	profiles := useProfiles(t)
+	rt := Runtime{ID: "rt-managed", Provider: "codebuddy", Status: "online"}
+	cfg := agent.Config{RuntimeID: rt.ID}
+	dir, err := agent.EnsureFreebuffAccountDir(cfg, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := false
+	fx.daemon.freebuffDesktopInstances.Store(freebuffDesktopLoginKey(rt.ID, "a1"), &freebuffDesktopInstance{
+		client: &fakeAccount{statuses: []freebuffrt.AuthStatus{{}}}, stop: func() { stopped = true },
+	})
+	fx.pending = `{"accounts":[{"id":"a1","state":"removing","active":true}]}`
+	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
+	if stopped {
+		t.Fatal("active task's orchestrator was stopped during removal")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("active account state was removed: %v", err)
+	}
+	fx.pending = `{"accounts":[{"id":"a1","state":"removing","active":false}]}`
+	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
+	if !stopped {
+		t.Fatal("account orchestrator was not stopped on removal")
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("account state still exists, stat error=%v", err)
+	}
+	reports := fx.snapshot()
+	if len(reports) == 0 || len(reports[len(reports)-1]["removed"].([]any)) != 1 {
+		t.Fatalf("removal acknowledgement missing: %#v", reports)
+	}
+	if _, err := os.Stat(profiles); err != nil {
+		t.Fatalf("profile root unexpectedly disappeared: %v", err)
+	}
+}
+
+func TestReportFreebuffDesktopAccountsRestartsOwnedInstance(t *testing.T) {
+	fx := newFreebuffFixture(t)
+	useProfiles(t)
+	account := &fakeAccount{statuses: []freebuffrt.AuthStatus{signedIn("owner@example.com")}}
+	prev := startFreebuffAccount
+	startFreebuffAccount = func(context.Context, string, string) (freebuffAccount, func(), error) {
+		return account, func() {}, nil
+	}
+	t.Cleanup(func() { startFreebuffAccount = prev })
+	cfg := agent.Config{RuntimeID: "rt-managed"}
+	if _, err := agent.EnsureFreebuffAccountDir(cfg, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	rt := Runtime{ID: cfg.RuntimeID, Provider: "codebuddy", Status: "online"}
+	fx.daemon.reportFreebuffDesktopAccounts(context.Background(), rt)
+	reports := fx.snapshot()
+	if len(reports) != 2 || reports[0]["snapshot"] != true || reports[1]["complete"] != true {
+		t.Fatalf("startup status report = %#v", reports)
+	}
+	entries := reports[0]["accounts"].([]any)
+	entry := entries[0].(map[string]any)
+	if entry["state"] != "connected" || entry["endpoint"] != account.BaseURL() || entry["credential_ref"] == "a1" {
+		t.Fatalf("restarted managed account report = %#v", entry)
+	}
+	if _, ok := fx.daemon.freebuffDesktopInstances.Load(freebuffDesktopLoginKey(rt.ID, "a1")); !ok {
+		t.Fatal("startup did not retain the rehydrated account instance")
+	}
+	fx.daemon.stopFreebuffDesktopInstances()
+}
+
+func TestFreebuffDesktopStatusRestartsCrashedInstanceWithFreshLaunchID(t *testing.T) {
+	fx := newFreebuffFixture(t)
+	useProfiles(t)
+	rt := Runtime{ID: "rt-managed", Provider: "codebuddy", Status: "online"}
+	if _, err := agent.EnsureFreebuffAccountDir(agent.Config{RuntimeID: rt.ID}, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	dead := &fakeAccount{authErr: errors.New("connection refused"), launchID: "old-launch"}
+	live := &fakeAccount{statuses: []freebuffrt.AuthStatus{signedIn("owner@example.com")}, launchID: "new-launch"}
+	starts := 0
+	stops := 0
+	prev := startFreebuffAccount
+	startFreebuffAccount = func(context.Context, string, string) (freebuffAccount, func(), error) {
+		starts++
+		if starts == 1 {
+			return dead, func() { stops++ }, nil
+		}
+		return live, func() {}, nil
+	}
+	t.Cleanup(func() { startFreebuffAccount = prev })
+
+	fx.daemon.reportFreebuffDesktopAccounts(context.Background(), rt)
+	first := fx.snapshot()
+	firstAccounts := first[0]["accounts"].([]any)
+	if firstAccounts[0].(map[string]any)["state"] != "failed" {
+		t.Fatalf("dead instance was reported ready: %#v", firstAccounts[0])
+	}
+
+	client, err := fx.daemon.ensureFreebuffDesktopInstance(context.Background(), rt, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if starts != 2 || stops != 1 || client.LaunchID() != "new-launch" {
+		t.Fatalf("recovery starts=%d stops=%d launch_id=%q", starts, stops, client.LaunchID())
+	}
+	fx.daemon.reportFreebuffDesktopAccounts(context.Background(), rt)
+	reports := fx.snapshot()
+	last := reports[len(reports)-2]
+	lastAccounts := last["accounts"].([]any)
+	if lastAccounts[0].(map[string]any)["state"] != "connected" {
+		t.Fatalf("recovered instance status = %#v", lastAccounts[0])
 	}
 }
 
@@ -379,5 +614,51 @@ func TestFreebuffRuntimes_SelectsByProvider(t *testing.T) {
 	got := d.freebuffRuntimes()
 	if len(got) != 1 || got[0].ID != "rt-fb" {
 		t.Fatalf("freebuffRuntimes = %#v", got)
+	}
+}
+
+func TestFreebuffDesktopRemovalRetriesAfterFilesystemFailure(t *testing.T) {
+	fx := newFreebuffFixture(t)
+	useProfiles(t)
+	rt := Runtime{ID: "rt-managed", Provider: "codebuddy", Status: "online"}
+	cfg := agent.Config{RuntimeID: rt.ID}
+	dir, err := agent.EnsureFreebuffAccountDir(cfg, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(dir)
+	if err := os.Rename(parent, parent+"-preserved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(parent, []byte("filesystem failure fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.RemoveFreebuffAccount(cfg, "a1"); err == nil {
+		t.Fatal("fixture must cause removal to fail")
+	}
+	fx.pending = `{"accounts":[{"id":"a1","state":"removing","active":false}]}`
+	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
+	for _, report := range fx.snapshot() {
+		if report["removed"] != nil {
+			t.Fatalf("acknowledged failed removal: %#v", report)
+		}
+	}
+	if err := os.Remove(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(parent+"-preserved", parent); err != nil {
+		t.Fatal(err)
+	}
+	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("account state still exists after retry: %v", err)
+	}
+	reports := fx.snapshot()
+	if len(reports) != 1 {
+		t.Fatalf("expected one successful removal acknowledgement, got %#v", reports)
+	}
+	removed, ok := reports[0]["removed"].([]any)
+	if !ok || len(removed) != 1 || removed[0] != "a1" {
+		t.Fatalf("unexpected acknowledgement: %#v", reports[0])
 	}
 }

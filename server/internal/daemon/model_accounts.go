@@ -23,6 +23,9 @@ func accountEnv(acc protocol.DaemonModelAccount) []string {
 	if v := strings.TrimSpace(acc.CredentialRef); v != "" {
 		env = append(env, "FREEBUFF_DESKTOP_CREDENTIAL_REF="+v)
 	}
+	if v := strings.TrimSpace(acc.LaunchID); v != "" {
+		env = append(env, "FREEBUFF_DESKTOP_LAUNCH_ID="+v)
+	}
 	return env
 }
 
@@ -58,6 +61,13 @@ func discoverAccountCatalogs(
 	for _, acc := range accounts {
 		if err := ctx.Err(); err != nil {
 			return accountCatalog{}, err
+		}
+		if acc.LaunchError != "" {
+			out.Failed[acc.ID] = errors.New(acc.LaunchError)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("account %q: %s", accountDisplay(acc), acc.LaunchError)
+			}
+			continue
 		}
 		cat, err := listModels(ctx, provider, base.WithEnv(accountEnv(acc)...))
 		if err != nil {

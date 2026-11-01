@@ -37,14 +37,14 @@ const runtime = { id: "rt-1", provider: "codebuddy", profile_id: "profile-1" } a
 
 const account = (over: Partial<WorkspaceAccount> = {}): WorkspaceAccount => ({
   id: "acc-1",
-  workspace_id: "ws-1",
+  workspaceId: "ws-1",
   provider: "freebuff-desktop",
   label: "Team A",
   endpoint: "http://a.test:4320",
   enabled: true,
-  credential_ref: "ref-a",
-  created_at: "",
-  updated_at: "",
+  credentialRef: "ref-a",
+  createdAt: "",
+  updatedAt: "",
   ...over,
 });
 
@@ -81,13 +81,25 @@ describe("WorkspaceAccountsCard", () => {
     expect(screen.queryByRole("button", { name: "Delete Team A" })).toBeNull();
   });
 
-  it("lets an admin add an account", async () => {
+  it("shows only accounts owned by the selected runtime", async () => {
+    api.listWorkspaceAccounts.mockResolvedValue([
+      account(),
+      account({ id: "acc-other", label: "Other runtime", runtimeId: "rt-2" }),
+    ]);
+    renderCard(false);
+    expect(await screen.findByText("Team A")).toBeTruthy();
+    expect(screen.queryByText("Other runtime")).toBeNull();
+  });
+
+  it("lets an admin add an account (manual, advanced)", async () => {
     const user = userEvent.setup();
     renderCard(true);
     await screen.findByText("Team A");
+    await user.click(screen.getByRole("button", { name: "Advanced" }));
     await user.type(screen.getByLabelText("Label"), "Team B");
     await user.type(screen.getByLabelText("Credential reference"), "ref-b");
-    await user.click(screen.getByRole("button", { name: "Add account" }));
+    const buttons = screen.getAllByRole("button", { name: "Add account" });
+    await user.click(buttons.at(-1)!);
     await waitFor(() =>
       expect(api.createWorkspaceAccount).toHaveBeenCalledWith("ws-1", {
         label: "Team B",
@@ -97,10 +109,46 @@ describe("WorkspaceAccountsCard", () => {
     );
   });
 
+  it("lets an admin add a managed account", async () => {
+    const user = userEvent.setup();
+    renderCard(true);
+    await screen.findByText("Team A");
+    await user.type(screen.getByLabelText("Label"), "Team B");
+    await user.click(screen.getAllByRole("button", { name: "Add account" })[0]!);
+    await waitFor(() =>
+      expect(api.createWorkspaceAccount).toHaveBeenCalledWith("ws-1", {
+        label: "Team B",
+        managed: true,
+        runtime_id: "rt-1",
+      }),
+    );
+  });
+
   it("lets an admin delete an account", async () => {
     const user = userEvent.setup();
     renderCard(true);
     await user.click(await screen.findByRole("button", { name: "Delete Team A" }));
     await waitFor(() => expect(api.deleteWorkspaceAccount).toHaveBeenCalledWith("ws-1", "acc-1"));
+  });
+
+  it("lets an admin retry a failed sign-in", async () => {
+    const user = userEvent.setup();
+    api.listWorkspaceAccounts.mockResolvedValue([account({ state: "failed", error: "expired" })]);
+    renderCard(true);
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(api.updateWorkspaceAccount).toHaveBeenCalledWith("ws-1", "acc-1", { retry: true }),
+    );
+  });
+
+  it("shows the browser login URL while sign-in is waiting", async () => {
+    api.listWorkspaceAccounts.mockResolvedValue([
+      account({ runtimeId: "rt-1", state: "awaiting_login", loginUrl: "https://freebuff.example/login" }),
+    ]);
+    renderCard(true);
+    expect(await screen.findByDisplayValue("https://freebuff.example/login")).toBeTruthy();
+    expect(screen.getByText(/awaiting_login/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy sign-in link" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open sign-in link" })).toBeTruthy();
   });
 });

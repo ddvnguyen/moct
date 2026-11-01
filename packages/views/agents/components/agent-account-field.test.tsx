@@ -22,12 +22,12 @@ const TEST_RESOURCES = { en: { common: enCommon, agents: enAgents } };
 
 const account = (over: Partial<WorkspaceAccount>): WorkspaceAccount => ({
   id: "acc-1",
-  workspace_id: "ws-1",
+  workspaceId: "ws-1",
   provider: "freebuff-desktop",
   label: "Team A",
   enabled: true,
-  created_at: "",
-  updated_at: "",
+  createdAt: "",
+  updatedAt: "",
   ...over,
 });
 

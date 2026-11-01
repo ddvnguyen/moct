@@ -65,14 +65,14 @@ func TestDiscoverAccountCatalogsPassesAccountEnvOnTheCommand(t *testing.T) {
 	})
 	base := agent.NewCommand("bridge", nil)
 	_, err := discoverAccountCatalogs(context.Background(), "codebuddy", base, []protocol.DaemonModelAccount{
-		{ID: "A", Endpoint: "http://a", CredentialRef: "ref-a"},
+		{ID: "A", Endpoint: "http://a", CredentialRef: "ref-a", LaunchID: "launch-a"},
 		{ID: "B", Endpoint: " http://b "},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
-		"FREEBUFF_DESKTOP_URL=http://a,FREEBUFF_DESKTOP_CREDENTIAL_REF=ref-a",
+		"FREEBUFF_DESKTOP_URL=http://a,FREEBUFF_DESKTOP_CREDENTIAL_REF=ref-a,FREEBUFF_DESKTOP_LAUNCH_ID=launch-a",
 		"FREEBUFF_DESKTOP_URL=http://b",
 	}
 	if strings.Join(seen, "|") != strings.Join(want, "|") {

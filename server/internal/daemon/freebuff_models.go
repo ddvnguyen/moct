@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // Freebuff model discovery (M-165).
@@ -85,6 +86,42 @@ func (d *Daemon) discoverFreebuffModelList(ctx context.Context, rt Runtime, requ
 		"models":    wire,
 		"supported": supported,
 	})
+}
+
+// prepareManagedFreebuffDesktopAccounts resolves launch credentials from the
+// daemon-owned instances. Credentials stay in memory and are added only to the
+// local discovery command environment; they never travel through server
+// account records or heartbeat payloads.
+func (d *Daemon) prepareManagedFreebuffDesktopAccounts(ctx context.Context, rt Runtime, accounts []protocol.DaemonModelAccount) []protocol.DaemonModelAccount {
+	if len(accounts) == 0 {
+		return accounts
+	}
+	prepared := append([]protocol.DaemonModelAccount(nil), accounts...)
+	for i := range prepared {
+		if prepared[i].DaemonAccountID == "" {
+			continue
+		}
+		startCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		client, err := d.ensureFreebuffDesktopInstance(startCtx, rt, prepared[i].DaemonAccountID)
+		cancel()
+		if err != nil {
+			d.logger.Warn("managed Freebuff Desktop model discovery instance unavailable", "runtime_id", rt.ID, "account_id", prepared[i].DaemonAccountID, "error", err)
+			prepared[i].LaunchError = "managed Freebuff Desktop instance unavailable"
+			continue
+		}
+		dir, err := freebuffDesktopAccountDir(rt, prepared[i].DaemonAccountID)
+		if err != nil {
+			prepared[i].LaunchError = "managed Freebuff Desktop account state unavailable"
+			continue
+		}
+		prepared[i].Endpoint = client.BaseURL()
+		prepared[i].CredentialRef = dir
+		prepared[i].LaunchID = client.LaunchID()
+		if prepared[i].LaunchID == "" {
+			prepared[i].LaunchError = "managed Freebuff Desktop launch credential unavailable"
+		}
+	}
+	return prepared
 }
 
 // discoverFreebuffCatalogs runs model discovery once per account and merges

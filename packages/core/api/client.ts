@@ -272,6 +272,8 @@ import { parseWithFallback } from "./schema";
 import {
   RuntimeProfileSchema,
   RuntimeProfileListSchema,
+  WorkspaceAccountSchema,
+  WorkspaceAccountListSchema,
   AgentTaskListSchema,
   AgentTaskPageSchema,
   AgentActivityBucketListSchema,
@@ -510,6 +512,16 @@ import {
   type IssueViewPreference,
   type CreateIssueViewRequest,
 } from "./schemas";
+
+const EMPTY_WORKSPACE_ACCOUNT: WorkspaceAccount = {
+  id: "",
+  workspaceId: "",
+  provider: "freebuff-desktop",
+  label: "",
+  enabled: false,
+  createdAt: "",
+  updatedAt: "",
+};
 
 /** Identifies the calling client to the server.
  *  Sent on every HTTP request as X-Client-Platform / X-Client-Version /
@@ -2531,19 +2543,24 @@ export class ApiClient {
   }
 
   async listWorkspaceAccounts(workspaceId: string): Promise<WorkspaceAccount[]> {
-    const res = await this.fetch<{ accounts?: WorkspaceAccount[] }>(
+    const res = await this.fetch<unknown>(
       `/api/workspaces/${workspaceId}/accounts`,
     );
-    return res.accounts ?? [];
+    return parseWithFallback(res, WorkspaceAccountListSchema, { accounts: [] }, {
+      endpoint: "listWorkspaceAccounts",
+    }).accounts;
   }
 
   async createWorkspaceAccount(
     workspaceId: string,
     body: CreateWorkspaceAccountRequest,
   ): Promise<WorkspaceAccount> {
-    return this.fetch<WorkspaceAccount>(`/api/workspaces/${workspaceId}/accounts`, {
+    const response = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/accounts`, {
       method: "POST",
       body: JSON.stringify(body),
+    });
+    return parseWithFallback(response, WorkspaceAccountSchema, EMPTY_WORKSPACE_ACCOUNT, {
+      endpoint: "createWorkspaceAccount",
     });
   }
 
@@ -2552,10 +2569,13 @@ export class ApiClient {
     accountId: string,
     patch: UpdateWorkspaceAccountRequest,
   ): Promise<WorkspaceAccount> {
-    return this.fetch<WorkspaceAccount>(
+    const response = await this.fetch<unknown>(
       `/api/workspaces/${workspaceId}/accounts/${accountId}`,
       { method: "PATCH", body: JSON.stringify(patch) },
     );
+    return parseWithFallback(response, WorkspaceAccountSchema, EMPTY_WORKSPACE_ACCOUNT, {
+      endpoint: "updateWorkspaceAccount",
+    });
   }
 
   async deleteWorkspaceAccount(workspaceId: string, accountId: string): Promise<void> {

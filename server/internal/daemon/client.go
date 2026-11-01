@@ -863,6 +863,29 @@ func (c *Client) GetFreebuffPending(ctx context.Context, runtimeID string) (Free
 	return resp, err
 }
 
+// FreebuffDesktopPending is what the user asked the daemon to do to a
+// workspace's daemon-managed freebuff-desktop accounts.
+type FreebuffDesktopPending struct {
+	Accounts []struct {
+		ID     string `json:"id"`
+		State  string `json:"state"`
+		Active bool   `json:"active"`
+	} `json:"accounts"`
+}
+
+// GetFreebuffDesktopPending asks the server for pending daemon-managed
+// freebuff-desktop accounts for a runtime's workspace.
+func (c *Client) GetFreebuffDesktopPending(ctx context.Context, runtimeID string) (FreebuffDesktopPending, error) {
+	var resp FreebuffDesktopPending
+	err := c.getJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/freebuff-desktop/pending", runtimeID), &resp)
+	return resp, err
+}
+
+// ReportFreebuffDesktopAccount sends a report back to the server.
+func (c *Client) ReportFreebuffDesktopAccount(ctx context.Context, runtimeID string, payload map[string]any) error {
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/freebuff-desktop", runtimeID), payload, nil)
+}
+
 // ReportModelListResult sends the model-discovery result back to the server.
 func (c *Client) ReportModelListResult(ctx context.Context, runtimeID, requestID string, result map[string]any) error {
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/models/%s/result", runtimeID, requestID), result, nil)
