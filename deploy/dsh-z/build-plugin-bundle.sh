@@ -36,7 +36,7 @@ for f in package.json cordis.patch.yml FORK.md README.md; do
   [ -f "$SRC/packages/dsh-plugin/$f" ] || die "missing packages/dsh-plugin/$f in $SRC"
 done
 [ -f "$SRC/packages/dsh-plugin/lib/index.js" ] || die "packages/dsh-plugin is not built in $SRC (run: pnpm --filter @multica/dsh-plugin build)"
-[ -d "$SRC/packages/dsh-plugin/node_modules/ws" ] || die "$SRC has no pnpm install; run pnpm install in the checkout first"
+[ -d "$SRC/packages/dsh-plugin" ] || die "$SRC has no pnpm install; run pnpm install in the checkout first"
 
 OUT="${3:-${DSH_Z_PLUGIN_BUNDLE:-}}"
 [ -n "$OUT" ] || die "set DSH_Z_PLUGIN_BUNDLE in dsh-z.env or pass an output directory"
@@ -87,8 +87,12 @@ EOF
 # packages/dsh-plugin pins ws ^8.18.3 through its own link.
 # -L: the ws path in a pnpm tree is a symlink into .pnpm; the vendor copy must
 # materialize real files or the bundle ships a dangling link.
+# Resolve ws through Node module resolution (handles pnpm hoisting) rather than
+# assuming packages/dsh-plugin/node_modules/ws exists.
+WS_SRC="$(node -e 'const p=require.resolve("ws/package.json",{paths:[process.argv[1]]}); console.log(require("node:path").dirname(p))' "$SRC/packages/dsh-plugin")"
+[ -n "$WS_SRC" ] && [ -f "$WS_SRC/package.json" ] || die "could not resolve ws from $SRC/packages/dsh-plugin"
 mkdir -p "$OUT/node_modules"
-cp -aL "$SRC/packages/dsh-plugin/node_modules/ws" "$OUT/node_modules/ws"
+cp -aL "$WS_SRC" "$OUT/node_modules/ws"
 node -e 'require(process.argv[1])' "$OUT/node_modules/ws/package.json" >/dev/null \
   || die "vendored ws is unusable"
 if [ "$(node -p "require('$OUT/node_modules/ws/package.json').version.startsWith('8.')")" != "true" ]; then
