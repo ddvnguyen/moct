@@ -16,6 +16,7 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  TruncatedTooltip,
 } from "../fork";
 
 /** Label of the "no project filter" row. */
@@ -36,6 +37,8 @@ export function ProjectPicker({
   onSelect: (projectId: string | null) => void;
 }) {
   const selected = projects.find((project) => project.id === projectId) ?? null;
+  const triggerLabel =
+    selected === null ? ALL_PROJECTS_LABEL : selected.title;
   return (
     <Select
       items={[
@@ -50,26 +53,38 @@ export function ProjectPicker({
         onSelect(value === ALL_PROJECTS_VALUE ? null : value)
       }
     >
-      <SelectTrigger
-        size="sm"
-        className="w-40 shrink-0"
-        aria-label="Project"
-        // The panel is not a form: the picker only narrows what is already on
-        // screen, and a submit on Enter would move the user out of the tabs.
-        data-project-picker=""
+      <TruncatedTooltip content={triggerLabel}>
+        <SelectTrigger
+          size="sm"
+          className="max-w-[240px] w-fit shrink-0"
+          aria-label="Project"
+          // The panel is not a form: the picker only narrows what is already on
+          // screen, and a submit on Enter would move the user out of the tabs.
+          data-project-picker=""
+        >
+          <SelectValue>
+            {selected === null ? ALL_PROJECTS_LABEL : selected.title}
+          </SelectValue>
+        </SelectTrigger>
+      </TruncatedTooltip>
+      <SelectContent
+        align="start"
+        style={{ width: "auto", minWidth: 280 }}
+        className="min-w-[280px]"
       >
-        <SelectValue>
-          {selected === null ? ALL_PROJECTS_LABEL : selected.title}
-        </SelectValue>
-      </SelectTrigger>
-      <SelectContent align="start">
         <SelectGroup>
           <SelectItem value={ALL_PROJECTS_VALUE}>
             {ALL_PROJECTS_LABEL}
           </SelectItem>
           {projects.map((project) => (
-            <SelectItem key={project.id} value={project.id}>
-              {project.title}
+            <SelectItem
+              key={project.id}
+              value={project.id}
+              className="whitespace-normal"
+            >
+              <span className="whitespace-normal break-words line-clamp-2">
+                {project.title}
+              </span>
             </SelectItem>
           ))}
         </SelectGroup>

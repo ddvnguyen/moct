@@ -77,6 +77,9 @@ export type { ExtraSettingsGroup } from "@multica/views/settings";
 // would otherwise have to reproduce.
 export { Input } from "@multica/ui/components/ui/input";
 export { Switch } from "@multica/ui/components/ui/switch";
+export { cn } from "@multica/ui/lib/utils";
+export { ArrowLeft, ArrowRight, Plus, X, Pin, PinOff, Search } from "@multica/ui/icons";
+export { TruncatedTooltip } from "@multica/ui/components/common/truncated-tooltip";
 export {
   Select,
   SelectContent,
@@ -92,6 +95,9 @@ export { usePageScope } from "@multica/views/layout";
 export type { PageScope } from "@multica/views/layout";
 export { projectListOptions } from "@multica/core/projects/queries";
 export type { Project } from "@multica/core/types/project";
+
+// Search: reuse the fork's command palette for results instead of a second search.
+export { SearchCommand, useSearchStore } from "@multica/views/search";
 
 // Locale resolution. The island has no cookie and must not write one on dsh's
 // origin, so it supplies its own `LocaleAdapter` over `createIslandStorage` and

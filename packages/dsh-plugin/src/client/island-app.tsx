@@ -41,6 +41,7 @@ import {
   IssuesPage,
   mmxBuild,
   ModalRegistry,
+  SearchCommand,
   PageChromeProvider,
   NavigationProvider,
   PortalContainerProvider,
@@ -470,6 +471,7 @@ export function IslandPages({
           <TabBar
             tabsStore={tabsStore}
             navigation={navigation}
+            slug={slug}
             projectPicker={
               <ProjectPicker
                 projects={projects ?? []}
@@ -506,6 +508,7 @@ export function IslandPages({
               portal container comes from `IslandApp`, so it renders into the
               island's shadow root and not the shell's document. */}
           <ModalRegistry />
+          <SearchCommand />
           {/* The build stamp (M-155): a sibling of the route switch, so it
               survives page changes and renders even when the boundary shows
               its fallback — the one moment an error report needs it most. */}
