@@ -1,0 +1,25 @@
+[Unit]
+Description=GitHub Actions runner mmx-%i (rootless podman, M-164)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=TMPDIR=/mnt/workspace/tmp/mmx
+Environment=XDG_CACHE_HOME=/mnt/workspace/cache/xdg
+Environment=GOCACHE=/mnt/workspace/cache/go-build
+Environment=GOMODCACHE=/mnt/workspace/cache/go-mod
+Environment=npm_config_cache=/mnt/workspace/cache/npm
+Environment=BUN_INSTALL_CACHE_DIR=/mnt/workspace/cache/bun
+Environment=RUNNER_MANUALLY_TRAP_SIG=1
+ExecStart=/mnt/workspace/clouds/runners/multica-x/bin/runner-entry.sh %i
+ExecStopPost=-/usr/bin/podman rm -f mmx-runner-%i
+KillMode=mixed
+Restart=always
+RestartSec=5
+CPUQuota=600%
+MemoryMax=12G
+TasksMax=4096
+IOWeight=10
+
+[Install]
+WantedBy=default.target

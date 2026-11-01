@@ -1,0 +1,30 @@
+# mmx-ci in-container egress filter (M-164, rootless analogue of M-150's
+# uid-owner host filter). Installed by mmx-entrypoint.sh inside the
+# container's own network namespace. The runner is then exec'd capless, so
+# job steps cannot remove the filter or reach a container engine.
+table inet mmx_filter {
+  chain output {
+    type filter hook output priority 0; policy accept;
+
+    # drop IPv6 loopback / ULA / link-local (before any accept)
+    ip6 daddr { ::1, fc00::/7, fe80::/10 } drop
+
+    # loopback inside the container is fine (IPv4)
+    oif "lo" accept
+
+    # DNS to the pasta gateway and public resolvers only
+    ip daddr 169.254.1.2 udp dport 53 accept
+    ip daddr 169.254.1.2 tcp dport 53 accept
+    ip daddr 1.1.1.1 udp dport 53 accept
+    ip daddr 1.1.1.1 tcp dport 53 accept
+    ip daddr 8.8.8.8 udp dport 53 accept
+    ip daddr 8.8.8.8 tcp dport 53 accept
+    ip6 daddr 2001:4860:4860::8888 udp dport 53 accept
+    ip6 daddr 2001:4860:4860::8888 tcp dport 53 accept
+
+    # drop RFC1918 + loopback + link-local + gateway (all ports, IPv4)
+    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16 } drop
+
+    # everything else (public internet) is allowed
+  }
+}

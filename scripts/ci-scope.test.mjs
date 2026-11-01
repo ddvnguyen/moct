@@ -379,5 +379,7 @@ test("production runner wiring: changes decides, heavy frontend jobs consume, ev
   }
   // The firewall proof runs on the self-hosted path only.
   assert.match(jobs["mmx-firewall"], /^    if: \$\{\{ needs\.changes\.outputs\.self_hosted == 'true' \}\}$/m);
-  assert.match(jobs["mmx-firewall"], /curl --max-time 3 http:\/\/127\.0\.0\.1:3180\//);
+  assert.match(jobs["mmx-firewall"], /curl --max-time 3 "http:\/\/127\.0\.0\.1:\$\{CANARY_PORT:-39180\}\/"/);
+  assert.match(jobs["mmx-firewall"], /curl --max-time 3 "http:\/\/\$\{gw\}:\$\{CANARY_PORT:-39180\}\/"/);
+  assert.match(jobs["mmx-firewall"], /rc" -ne 28/);
 });

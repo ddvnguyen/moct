@@ -113,10 +113,13 @@ jobs:
           REVIEW_DECISION: ${{ github.event.pull_request.review_decision }}
         run: node scripts/ci-scope.mjs runner
 
-  # Egress firewall proof (M-150): the unprivileged mmx-ci user must not be
-  # able to reach a loopback port (3180). Runs only when the self-hosted pool
-  # is selected. Exit 28 is curl's operation timeout: a DROPped SYN hangs until
-  # --max-time, which only the nftables uid-owner rule produces here.
+  # Container-isolation proof (M-164): every job step runs inside a rootless
+  # podman container. This job proves (a) the container cannot reach host
+  # loopback, (b) the container cannot reach host services via the pasta
+  # gateway (lane ports 3180/3702/4320/5432 + ssh + LAN), (c) host paths are
+  # not mounted, (d) the runner env carries no tokens / MULTICA_* vars.
+  # The host wrapper starts a canary listener on 0.0.0.0:$CANARY_PORT for the
+  # job's lifetime; $CANARY_PORT defaults to 39180.
   mmx-firewall:
     needs: changes
     if: ${{ needs.changes.outputs.self_hosted == 'true' }}
@@ -127,15 +130,58 @@ jobs:
         run: |
           getent hosts github.com || { echo "::error::DNS resolution broken (mmx-ci)"; exit 1; }
           curl -sf --max-time 10 https://github.com/ -o /dev/null || { echo "::error::egress to github.com broken (mmx-ci)"; exit 1; }
-      - name: Loopback port 3180 must be unreachable (firewall proof)
+      - name: Container cannot reach host loopback
         run: |
           rc=0
-          curl --max-time 3 http://127.0.0.1:3180/ -o /dev/null 2>/dev/null || rc=$?
-          if [ "$rc" -ne 28 ]; then
-            echo "::error::curl exit $rc (expected 28=timeout); loopback reachable - nftables NOT applied"
+          curl --max-time 3 "http://127.0.0.1:${CANARY_PORT:-39180}/" -o /dev/null 2>/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::host loopback reachable from container - isolation broken"
             exit 1
           fi
-          echo "loopback dropped (curl timeout as required)"
+          echo "host loopback not reachable from container (rc=$rc)"
+      - name: Container cannot reach host loopback over IPv6
+        run: |
+          rc=0
+          curl -6 --max-time 3 "http://[::1]:${CANARY_PORT:-39180}/" -o /dev/null 2>/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::host IPv6 loopback reachable from container - isolation broken"
+            exit 1
+          fi
+          echo "host IPv6 loopback not reachable from container (rc=$rc)"
+      - name: Container cannot reach host services via gateway
+        run: |
+          gw="${HOST_GATEWAY:-host.containers.internal}"
+          for port in 3180 3702 4320 5432 22; do
+            rc=0
+            curl --max-time 3 "http://${gw}:${port}/" -o /dev/null 2>/dev/null || rc=$?
+            if [ "$rc" -eq 0 ] || [ "$rc" -eq 52 ]; then
+              echo "::error::gateway port $port reachable from container (rc=$rc) - filter not applied"
+              exit 1
+            fi
+            echo "gateway port $port blocked (rc=$rc)"
+          done
+          # canary on the gateway must time out (proves the filter drops, not refuses)
+          rc=0
+          curl --max-time 3 "http://${gw}:${CANARY_PORT:-39180}/" -o /dev/null 2>/dev/null || rc=$?
+          if [ "$rc" -ne 28 ]; then
+            echo "::error::canary expected timeout (28), got $rc - filter not dropping"
+            exit 1
+          fi
+          echo "canary dropped (curl timeout as required)"
+      - name: Container has no host paths mounted
+        run: |
+          test ! -e /home/ddv/.multica || { echo "::error::/home/ddv/.multica visible in container"; exit 1; }
+          test ! -S /run/user/1000/bus || { echo "::error::host dbus socket visible"; exit 1; }
+          test ! -d /mnt/workspace/clouds/runners/moct || { echo "::error::sibling runner dir visible"; exit 1; }
+          echo "no host paths mounted"
+      - name: Container env carries no tokens or MULTICA vars
+        run: |
+          if env | grep -E '^(MULTICA_|GH_TOKEN|RUNNER_TOKEN)=' >/dev/null; then
+            echo "::error::secret/token env var present in container"
+            env | grep -E '^(MULTICA_|GH_TOKEN|RUNNER_TOKEN)='
+            exit 1
+          fi
+          echo "env clean"
 
   sqlc-check:
     needs: changes
