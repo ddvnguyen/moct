@@ -64,6 +64,7 @@ func TestDecideDshSessionStart(t *testing.T) {
 		wantResume    string
 		wantFork      string
 		wantSeedParts []string
+		wantReason    string
 	}{
 		{
 			name: "warm session resumes",
@@ -111,14 +112,43 @@ func TestDecideDshSessionStart(t *testing.T) {
 			wantVerdict: dshSessionStartFresh,
 		},
 		{
-			name:  "an unknown end time keeps today's resume",
+			name:  "an unknown same-issue end time starts fresh",
 			store: freshSummary,
 			in: dshSessionStartInput{
 				PriorSessionID: priorID,
 				// A server that predates prior_session_ended_at sends no time.
+				Reachable: func(dshSessionCandidate) bool { return true },
 			},
-			wantVerdict: dshSessionStartResumed,
-			wantResume:  priorID,
+			wantVerdict: dshSessionStartFresh,
+			wantReason:  dshSessionStartReasonEndUnknown,
+		},
+		{
+			name: "an unknown linked end time starts fresh",
+			store: summaryStore{"sess-linked": {
+				Summary:       "linked summary",
+				MadeAt:        now,
+				ParentSession: "sess-linked",
+			}},
+			in: dshSessionStartInput{
+				LinkedSessionID: "sess-linked",
+				LinkedIssueID:   "issue-linked",
+				LinkedEndedAt:   "",
+				Reachable:       func(dshSessionCandidate) bool { return true },
+			},
+			wantVerdict: dshSessionStartFresh,
+			wantReason:  dshSessionStartReasonEndUnknown,
+		},
+		{
+			name:  "both end times unknown starts fresh",
+			store: freshSummary,
+			in: dshSessionStartInput{
+				PriorSessionID:  priorID,
+				LinkedSessionID: "sess-linked",
+				LinkedIssueID:   "issue-linked",
+				Reachable:       func(dshSessionCandidate) bool { return true },
+			},
+			wantVerdict: dshSessionStartFresh,
+			wantReason:  dshSessionStartReasonEndUnknown,
 		},
 		{
 			name:  "summaries disabled never seeds",
@@ -172,6 +202,9 @@ func TestDecideDshSessionStart(t *testing.T) {
 				if !strings.Contains(plan.Seed, part) {
 					t.Errorf("seed %q does not carry %q", plan.Seed, part)
 				}
+			}
+			if tc.wantReason != "" && plan.Reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", plan.Reason, tc.wantReason)
 			}
 			if tc.wantFork != "" && plan.SeedTokens <= 0 {
 				t.Errorf("a seeded plan must price its seed, got %d", plan.SeedTokens)
@@ -385,7 +418,8 @@ func TestDecideDshSessionStartUnreachableWarm(t *testing.T) {
 		{name: "unreachable warm with a fresh summary is seeded", store: freshSummary, reach: false, endedAt: ended.Format(time.RFC3339), want: dshSessionStartSeededPrefix + priorID},
 		{name: "unreachable warm with no summary starts fresh", store: summaryStore{}, reach: false, endedAt: ended.Format(time.RFC3339), want: dshSessionStartFresh},
 		{name: "unreachable warm with a stale summary starts fresh", store: staleSummary, reach: false, endedAt: ended.Format(time.RFC3339), want: dshSessionStartFresh},
-		{name: "unreachable unknown end time starts fresh", store: freshSummary, reach: false, endedAt: "", want: dshSessionStartSeededPrefix + priorID},
+		{name: "unreachable unknown end time starts fresh", store: freshSummary, reach: false, endedAt: "", want: dshSessionStartFresh},
+		{name: "reachable unknown end time starts fresh", store: freshSummary, reach: true, endedAt: "", want: dshSessionStartFresh},
 		{name: "reachable warm resumes", store: summaryStore{}, reach: true, endedAt: ended.Format(time.RFC3339), want: dshSessionStartResumed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -508,6 +542,72 @@ func TestApplyDshSessionStartPlanReachesResume(t *testing.T) {
 	if task.PriorSessionResumeUnavailable {
 		t.Fatal("a linked seed loses nothing the user was continuing; no notice is owed")
 	}
+}
+
+// TestApplyDshSessionStartPlanUnknownEndNeverResumes pins the unknown-end rule
+// at the exec level: ExecOptions.ResumeSessionID is built from
+// task.PriorSessionID, so a candidate with no end time must leave it empty even
+// though plan.Candidate still names the skipped session.
+func TestApplyDshSessionStartPlanUnknownEndNeverResumes(t *testing.T) {
+	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	workDir := t.TempDir()
+	reachable := func(dshSessionCandidate) bool { return true }
+	summaries := summaryStore{
+		"sess-linked": {Summary: "linked summary", MadeAt: now, ParentSession: "sess-linked"},
+		"sess-prior":  {Summary: "prior summary", MadeAt: now, ParentSession: "sess-prior"},
+	}
+
+	t.Run("linked candidate", func(t *testing.T) {
+		task := Task{ID: "task-1", IssueID: "issue-child"}
+		taskCtx := execenv.TaskContextForEnv{IssueID: "issue-child"}
+		plan := decideDshSessionStart(dshSessionStartInput{
+			Now:             now,
+			Cfg:             testSessionStartConfig(),
+			LinkedSessionID: "sess-linked",
+			LinkedIssueID:   "issue-parent",
+			LinkedWorkDir:   workDir,
+			ReadSummary:     summaries.read,
+			Reachable:       reachable,
+		})
+		if plan.Verdict != dshSessionStartFresh || plan.Reason != dshSessionStartReasonEndUnknown {
+			t.Fatalf("verdict = %q reason = %q, want fresh / end unknown", plan.Verdict, plan.Reason)
+		}
+		if plan.Candidate.SessionID != "sess-linked" {
+			t.Fatalf("candidate = %q, want the skipped linked session kept for the log", plan.Candidate.SessionID)
+		}
+
+		applyDshSessionStartPlan(&task, &taskCtx, plan)
+		if task.PriorSessionID != "" || taskCtx.PriorSessionResumed {
+			t.Fatalf("resume reached the task: id = %q resumed = %v", task.PriorSessionID, taskCtx.PriorSessionResumed)
+		}
+		if task.PriorSessionResumeUnavailable {
+			t.Fatal("a skipped linked session is not the user's own conversation; no loss notice is owed")
+		}
+	})
+
+	t.Run("same-issue candidate", func(t *testing.T) {
+		task := Task{ID: "task-1", IssueID: "issue-1", PriorSessionID: "sess-prior", PriorWorkDir: workDir}
+		taskCtx := execenv.TaskContextForEnv{IssueID: "issue-1", PriorSessionResumed: true}
+		plan := decideDshSessionStart(dshSessionStartInput{
+			Now:            now,
+			Cfg:            testSessionStartConfig(),
+			PriorSessionID: "sess-prior",
+			PriorWorkDir:   workDir,
+			ReadSummary:    summaries.read,
+			Reachable:      reachable,
+		})
+		if plan.Verdict != dshSessionStartFresh || plan.Reason != dshSessionStartReasonEndUnknown {
+			t.Fatalf("verdict = %q reason = %q, want fresh / end unknown", plan.Verdict, plan.Reason)
+		}
+
+		applyDshSessionStartPlan(&task, &taskCtx, plan)
+		if task.PriorSessionID != "" || taskCtx.PriorSessionResumed {
+			t.Fatalf("prior session survived: id = %q resumed = %v", task.PriorSessionID, taskCtx.PriorSessionResumed)
+		}
+		if !task.PriorSessionResumeUnavailable {
+			t.Fatal("a fresh start over the user's own prior session must disclose the loss")
+		}
+	})
 }
 
 // TestApplyDshSessionStartPlanDisclosesAnUnreachableResume pins the behaviour

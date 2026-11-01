@@ -45,6 +45,11 @@ const (
 	// nothing related, nothing usable to seed from, or a seed the runtime
 	// rejected.
 	dshSessionStartFresh = "fresh"
+	// dshSessionStartReasonEndUnknown is the plan reason for a candidate with
+	// no known end time: it is never judged warm, resumed or seeded, because
+	// without an end time we cannot tell whether the cache is warm or whether a
+	// summary is newer than the session's end.
+	dshSessionStartReasonEndUnknown = "fresh: session end time unknown"
 )
 
 // dshSeedTokenCap is the ceiling on the whole seed — summary plus trigger —
@@ -165,43 +170,39 @@ func decideDshSessionStart(in dshSessionStartInput) dshSessionStartPlan {
 		Margin:          in.Cfg.Margin,
 	}
 
+	// Without an end time the cache cannot be judged warm and a summary's age
+	// cannot be compared to the session's end, so nothing is resumed or seeded.
+	// The candidate stays on the plan so the log line names the skipped session.
+	if candidate.EndedAt.IsZero() {
+		plan.ResumeSessionID = ""
+		plan.Verdict = dshSessionStartFresh
+		plan.Reason = dshSessionStartReasonEndUnknown
+		return plan
+	}
+
 	reachable := true
 	if in.Reachable != nil {
 		reachable = in.Reachable(candidate)
 	}
 
-	// An unknown end time cannot prove the cache cold. Resume, which is what
-	// this daemon did before the decision existed: additive, never a silent
-	// behaviour change on a server that predates prior_session_ended_at. A
-	// candidate this run cannot reach is the one exception: the gate would
-	// drop that resume, so returning it here would record a resume that never
-	// happens (F3).
-	if candidate.EndedAt.IsZero() {
-		if reachable {
-			plan.Reason = "session end time unknown"
-			return plan
-		}
-		plan.Reason = "cold: session store not reachable"
-	} else {
-		plan.Age = in.Now.Sub(candidate.EndedAt)
-		if plan.Age < 0 {
-			// A clock that disagrees with the server's is not evidence of warmth;
-			// treat it as just-ended rather than as a negative age.
-			plan.Age = 0
-		}
-		warmWindow := ttl - in.Cfg.Margin
-		switch {
-		case warmWindow > 0 && plan.Age < warmWindow && reachable:
-			plan.Reason = fmt.Sprintf("warm: idle %s < %s", plan.Age.Round(time.Second), warmWindow)
-			return plan
-		case warmWindow > 0 && plan.Age < warmWindow:
-			// Warm by the clock, but unreachable from here: never "resumed".
-			plan.Reason = fmt.Sprintf("cold: session store not reachable (idle %s < %s)", plan.Age.Round(time.Second), warmWindow)
-		case warmWindow <= 0:
-			plan.Reason = "cold: no positive warm window configured"
-		default:
-			plan.Reason = fmt.Sprintf("cold: idle %s >= %s", plan.Age.Round(time.Second), warmWindow)
-		}
+	plan.Age = in.Now.Sub(candidate.EndedAt)
+	if plan.Age < 0 {
+		// A clock that disagrees with the server's is not evidence of warmth;
+		// treat it as just-ended rather than as a negative age.
+		plan.Age = 0
+	}
+	warmWindow := ttl - in.Cfg.Margin
+	switch {
+	case warmWindow > 0 && plan.Age < warmWindow && reachable:
+		plan.Reason = fmt.Sprintf("warm: idle %s < %s", plan.Age.Round(time.Second), warmWindow)
+		return plan
+	case warmWindow > 0 && plan.Age < warmWindow:
+		// Warm by the clock, but unreachable from here: never "resumed".
+		plan.Reason = fmt.Sprintf("cold: session store not reachable (idle %s < %s)", plan.Age.Round(time.Second), warmWindow)
+	case warmWindow <= 0:
+		plan.Reason = "cold: no positive warm window configured"
+	default:
+		plan.Reason = fmt.Sprintf("cold: idle %s >= %s", plan.Age.Round(time.Second), warmWindow)
 	}
 
 	// Cold from here on: the only way to keep the conversation is a summary
@@ -285,7 +286,7 @@ func applyDshSessionStartPlan(task *Task, taskCtx *execenv.TaskContextForEnv, pl
 // dshPickSessionCandidate ranks the two related candidates: newest end time
 // wins, and a candidate with a known end time always beats one without. When
 // neither end time is known the same-issue session wins — it is the more
-// relevant of the two, and the verdict for it is "resume" anyway.
+// relevant of the two; either way the verdict is fresh.
 func dshPickSessionCandidate(in dshSessionStartInput) (dshSessionCandidate, bool) {
 	var (
 		same, linked     dshSessionCandidate
