@@ -24,6 +24,8 @@ ENV_FILE="$SCRIPT_DIR/dsh-z.env"
 [ -f "$ENV_FILE" ] || ENV_FILE="$SCRIPT_DIR/../../deploy/dsh-z/dsh-z.env"
 # shellcheck source=/dev/null
 . "$ENV_FILE"
+# shellcheck source=./lane-lib.sh
+. "$SCRIPT_DIR/lane-lib.sh"
 
 log() { printf '[rollback %s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 die() { log "ERROR: $*"; exit 1; }
@@ -70,24 +72,15 @@ TARGET="$(readlink -f "$TARGET")"
 [ "$TARGET" = "$(readlink -f "$CURRENT")" ] && { log "already on $(basename "$TARGET")"; exit 0; }
 
 log "switching $(readlink -f "$CURRENT") -> $TARGET"
-ln -sfn "$TARGET" "$CURRENT"
+# Flips `current` and repoints the unit at it; a pinned unit would otherwise
+# restart the release we are trying to leave.
+render_backend_unit "$TARGET" || die "could not point $MULTICA_BE_Z_UNIT at $TARGET"
+[ "$(readlink -f "$CURRENT")" = "$TARGET" ] || die "current does not resolve to $TARGET"
 systemctl --user restart "$MULTICA_BE_Z_UNIT"
 
 SHA="$(jq -r '.sha // empty' "$TARGET/release.json")"
-wait_http() { # $1=url $2=timeout $3=expected substring
-  local deadline=$((SECONDS + $2)) body
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    body="$(curl -fsS --max-time 3 "$1" 2>/dev/null || true)"
-    if [ -n "$body" ] && { [ -z "${3:-}" ] || printf '%s' "$body" | grep -q "$3"; }; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
 wait_http "http://127.0.0.1:$MULTICA_BE_Z_PORT/healthz" 120 '"status":"ok"' \
   || die "multica-be z /healthz did not answer ok after the rollback"
 commit="$(curl -fsS --max-time 5 http://127.0.0.1:3180/multica/health | jq -r '.commit // empty' || true)"
-[ "$commit" = "$SHA" ] || die "/multica/health reports '$commit', expected '$SHA'"
+commit_matches "$commit" "$SHA" || die "/multica/health reports '$commit', expected '$SHA'"
 log "lane z is back on ${SHA:0:9} ($(jq -r '.version // "unknown"' "$TARGET/release.json")); the database was NOT touched"

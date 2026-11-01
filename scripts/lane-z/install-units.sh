@@ -23,7 +23,12 @@ UNIT_DIR="$HOME/.config/systemd/user"
 log "scripts -> $AUTODEPLOY_BIN_DIR"
 mkdir -p "$AUTODEPLOY_BIN_DIR" "$AUTODEPLOY_LOG_DIR" "$AUTODEPLOY_BACKUP_DIR" \
   "$LANE_ROOT/data" /mnt/workspace/tmp/dsh-z-autodeploy /mnt/workspace/cache/xdg
-install -m 0755 "$SCRIPT_DIR/autodeploy.sh" "$SCRIPT_DIR/rollback.sh" "$AUTODEPLOY_BIN_DIR/"
+install -m 0755 "$SCRIPT_DIR/autodeploy.sh" "$SCRIPT_DIR/rollback.sh" "$SCRIPT_DIR/lane-lib.sh" \
+  "$AUTODEPLOY_BIN_DIR/"
+# The backend unit template travels with the scripts: a switch re-renders it
+# from here, so the timer never depends on a task checkout.
+install -d "$AUTODEPLOY_BIN_DIR/units"
+install -m 0644 "$REPO_ROOT/deploy/dsh-z/units/multica-be-z.service" "$AUTODEPLOY_BIN_DIR/units/"
 # The timer must not source anything out of a task checkout: the installed copy
 # carries the lane config with it.
 install -m 0644 "$REPO_ROOT/deploy/dsh-z/dsh-z.env" "$AUTODEPLOY_BIN_DIR/dsh-z.env"
@@ -37,23 +42,18 @@ for u in dsh-z-autodeploy.service dsh-z-autodeploy.timer; do
   chmod 600 "$UNIT_DIR/$u"
 done
 
-# Evidence comments go to the LIVE control plane with their own config, so the
-# timer never picks up the lane profile or a task's variables. The token is the
-# host user's existing login (the Owner's) — hence the **[autodeploy]** prefix
-# on every comment this bot posts.
-log "multica config -> $AUTODEPLOY_MULTICA_CONFIG"
-mkdir -p "$AUTODEPLOY_MULTICA_CONFIG"
-if [ ! -f "$AUTODEPLOY_MULTICA_CONFIG/config.json" ]; then
-  [ -f "$HOME/.multica/config.json" ] || die "no $HOME/.multica/config.json to seed the auto-deploy CLI config from"
-  install -m 0600 "$HOME/.multica/config.json" "$AUTODEPLOY_MULTICA_CONFIG/config.json"
-  ( cd "$LANE_ROOT" && env -i PATH="$PATH" HOME="$HOME" MULTICA_CONFIG_DIR="$AUTODEPLOY_MULTICA_CONFIG" \
-      multica workspace switch "$AUTODEPLOY_WORKSPACE_ID" ) \
-    || die "could not select workspace $AUTODEPLOY_WORKSPACE_ID for the auto-deploy CLI config"
+# Evidence delivery: the tick writes latest.md and calls the reporter
+# autopilot's webhook. There is no Multica CLI config on this host on purpose —
+# its token is the Owner's, and evidence comments must carry an agent identity.
+# The URL is a credential, so it is provisioned by hand and only checked here.
+if [ ! -s "$AUTODEPLOY_WEBHOOK_FILE" ]; then
+  die "no reporter webhook at $AUTODEPLOY_WEBHOOK_FILE; write the autopilot's webhook URL there (chmod 600) first"
 fi
-chmod 600 "$AUTODEPLOY_MULTICA_CONFIG/config.json"
-( cd "$LANE_ROOT" && env -i PATH="$PATH" HOME="$HOME" MULTICA_CONFIG_DIR="$AUTODEPLOY_MULTICA_CONFIG" \
-    multica issue list --limit 1 >/dev/null ) \
-  || die "the auto-deploy CLI config cannot read issues; evidence comments would be skipped"
+if [ "$(stat -c %a "$AUTODEPLOY_WEBHOOK_FILE")" != "600" ]; then
+  die "$AUTODEPLOY_WEBHOOK_FILE must be mode 0600"
+fi
+mkdir -p "$AUTODEPLOY_REPORT_DIR"
+log "reporter webhook present; evidence will go to $AUTODEPLOY_REPORT_DIR/latest.md"
 
 systemctl --user daemon-reload
 systemctl --user enable --now dsh-z-autodeploy.timer

@@ -45,8 +45,19 @@ ENV_FILE="$SCRIPT_DIR/dsh-z.env"
 [ -f "$ENV_FILE" ] || ENV_FILE="$SCRIPT_DIR/../../deploy/dsh-z/dsh-z.env"
 # shellcheck source=/dev/null
 . "$ENV_FILE"
+# shellcheck source=./lane-lib.sh
+. "$SCRIPT_DIR/lane-lib.sh"
 
 log() { printf '[autodeploy %s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
+
+# Every failure goes through fail(): it records why and returns non-zero so the
+# ERR trap runs the rollback and the red report. A bare `exit 1` skips the trap
+# and leaves a half-switched lane with nobody told.
+fail() { # $1 = reason
+  FAIL_REASON="$1"
+  log "FAILED: $1"
+  return 1
+}
 
 DRY_RUN=0
 DRILL_FAIL_HEALTH=0
@@ -70,6 +81,8 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 SHA=""
 RUN_ID=""
+LANE_COMMIT=""
+REPORT_FAILED=0
 SWITCHED=0
 FAILED=0
 FAIL_REASON=""
@@ -88,7 +101,9 @@ on_error() { # $1 = line
   else
     log "nothing was switched; lane z still runs ${PREV_REL:-the previous release}"
   fi
-  [ "$DRILL_FAIL_HEALTH" = 1 ] || report red
+  # report() prints instead of posting during a drill, so the red body is
+  # always visible — the drill exists to prove exactly that text.
+  report red
   log "log: $LOG_FILE"
   exit 1
 }
@@ -131,18 +146,6 @@ run_for_sha() { # $1 = sha; run id of the successful push run for that sha
     | jq -r --arg sha "$1" '[.[] | select(.headSha == $sha)][0].databaseId // empty'
 }
 
-wait_http() { # $1=url $2=timeout $3=expected substring
-  local deadline=$((SECONDS + $2)) body
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    body="$(curl -fsS --max-time 3 "$1" 2>/dev/null || true)"
-    if [ -n "$body" ] && { [ -z "${3:-}" ] || printf '%s' "$body" | grep -q "$3"; }; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
 assert_health() { # $1 = sha the lane must report
   local sha="$1" commit
   if [ "$DRILL_FAIL_HEALTH" = 1 ]; then
@@ -157,11 +160,11 @@ assert_health() { # $1 = sha the lane must report
     || { log "lane web /moct/status did not answer"; return 1; }
   commit="$(curl -fsS --max-time 5 http://127.0.0.1:3180/multica/health | jq -r '.commit // empty')" \
     || { log "lane web /multica/health did not answer"; return 1; }
-  # CI stamps main.commit with the short SHA (Makefile COMMIT); manual deploy.sh stamps the
-  # full SHA. Accept either form so a release built by either path passes.
-  if [ "$commit" != "${sha:0:7}" ] && [ "$commit" != "$sha" ]; then
-    log "/multica/health reports commit '$commit', expected '${sha:0:7}' (or full)"; return 1
-  fi
+  commit_matches "$commit" "$sha" \
+    || { log "/multica/health reports commit '$commit', expected '$sha'"; return 1; }
+  # CI-built releases answer with the short sha; the report quotes what the lane
+  # actually said, not what we expected it to say.
+  LANE_COMMIT="$commit"
   log "health ok: /multica/health commit=$commit"
 }
 
@@ -169,18 +172,6 @@ bundle_hash() { # content hash of a plugin bundle, node_modules included
   [ -d "$1" ] || { printf 'missing'; return; }
   [ -n "$(find "$1" -type f -print -quit)" ] || { printf 'empty'; return; }
   ( cd "$1" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 )
-}
-
-# The Multica CLI here talks to the LIVE control plane with its own config
-# (AUTODEPLOY_MULTICA_CONFIG). Strip every daemon/task variable first: this
-# script may be run by an agent inside a task, and those variables would point
-# the CLI at a task workspace instead of the lane's card.
-mc() {
-  env -u MULTICA_TOKEN -u MULTICA_SERVER_URL -u MULTICA_WORKSPACE_ID \
-      -u MULTICA_TASK_ID -u MULTICA_AGENT_ID -u MULTICA_TASK_CONFIG_ROOT \
-      -u MULTICA_TASK_WORKSPACES_ROOT -u MULTICA_TASK_SLOT \
-      MULTICA_CONFIG_DIR="$AUTODEPLOY_MULTICA_CONFIG" \
-      multica "$@"
 }
 
 resolve_card() { # $1 = sha; prints the issue identifier of the merged PR's card
@@ -193,24 +184,66 @@ resolve_card() { # $1 = sha; prints the issue identifier of the merged PR's card
   printf '%s' "$ident"
 }
 
-post_card_comment() { # $1 = body file
-  local body="$1" ident
-  ident="$(resolve_card "$SHA" || true)"
-  if [ -z "$ident" ]; then
-    log "no merged PR with an M-NNN reference for $SHA; card comment skipped"
+# ---------------------------------------------------------------------------
+# Evidence: latest.md plus the reporter autopilot's webhook
+# ---------------------------------------------------------------------------
+# This host holds the Owner's CLI token, so a comment posted from here would
+# carry the Owner's name. It must not: evidence comments are posted by the
+# "lane-z deploy reporter" autopilot under its own agent identity (Architect,
+# 2026-10-30). The tick writes latest.md and pokes that autopilot's webhook;
+# the URL is a credential, so it lives in a 0600 file — never in the repo, the
+# log, or a comment. A webhook that cannot be reached leaves the evidence on
+# disk and turns the tick red.
+
+CARD=""
+
+write_report() { # $1 = body file; sets CARD
+  local body="$1" out="$AUTODEPLOY_REPORT_DIR/latest.md" tmp
+  CARD="$(resolve_card "$SHA" || true)"
+  [ -n "$CARD" ] || log "no merged PR with an M-NNN reference for $SHA; latest.md names no card"
+  mkdir -p "$AUTODEPLOY_REPORT_DIR"
+  tmp="$out.tmp.$$"
+  {
+    printf 'card: %s\n' "$CARD"
+    printf 'sha: %s\n' "$SHA"
+    printf 'generated: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf -- '---\n'
+    cat "$body"
+  } > "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$out"
+  log "evidence written to $out (card ${CARD:-none})"
+}
+
+notify_reporter() { # no args; uses CARD. Non-zero means the evidence was not delivered.
+  local url attempt=1
+  if [ -z "$CARD" ]; then
+    log "no card to notify; the evidence stays at $AUTODEPLOY_REPORT_DIR/latest.md"
     return 0
   fi
-  if ! ( cd "$LANE_ROOT" && mc issue get "$ident" --output json >/dev/null 2>&1 ); then
-    log "card $ident is not readable with $AUTODEPLOY_MULTICA_CONFIG; comment skipped"
-    return 0
+  if [ ! -s "$AUTODEPLOY_WEBHOOK_FILE" ]; then
+    log "no reporter webhook at $AUTODEPLOY_WEBHOOK_FILE; evidence stays at $AUTODEPLOY_REPORT_DIR/latest.md"
+    return 1
   fi
-  ( cd "$LANE_ROOT" && mc issue comment add "$ident" --content-file "$body" --output table ) \
-    || { log "posting the comment on $ident failed"; return 1; }
-  log "evidence comment posted on $ident"
+  url="$(tr -d '\r\n' < "$AUTODEPLOY_WEBHOOK_FILE")"
+  while :; do
+    if curl -fsS --max-time 15 -X POST -H 'Content-Type: application/json' \
+         -H "Idempotency-Key: autodeploy-${SHA:0:9}-$RUN_ID" \
+         -d "{\"card\":\"$CARD\",\"sha\":\"$SHA\"}" "$url" >/dev/null; then
+      log "reporter autopilot notified for $CARD"
+      return 0
+    fi
+    if [ "$attempt" -ge 3 ]; then
+      log "reporter webhook failed after 3 attempts; evidence stays at $AUTODEPLOY_REPORT_DIR/latest.md"
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 5
+  done
 }
 
 report() { # $1 = green|red
-  # A dry run (or a drill) is not a deploy: it must never post on a card.
+  # A dry run is not a deploy: it must never leave evidence behind.
   if [ "$DRY_RUN" = 1 ]; then return 0; fi
   local kind="$1" body="$LANE_ROOT/data/autodeploy-comment.md" dur applied plugin_note
   dur=$(( $(date +%s) - STARTED ))
@@ -224,7 +257,7 @@ report() { # $1 = green|red
       printf -- '- version: `%s` (built %s)\n' "$(release_version)" "${BUILT_AT:-unknown}"
       printf -- '- CI: [run %s](%s), build %s\n' "$RUN_ID" "${RUN_URL:-n/a}" "${BUILD_TIME:-unknown}"
       printf -- '- migrations applied: %s\n' "$applied"
-      printf -- '- health: `/multica/health` commit `%s`, `/multica/healthz` ok, `/moct/status` ok\n' "$SHA"
+      printf -- '- health: `/multica/health` commit `%s`, `/multica/healthz` ok, `/moct/status` ok\n' "${LANE_COMMIT:-$SHA}"
       printf -- '- plugin: %s\n' "$plugin_note"
       printf -- '- DB backup: `%s` (never auto-restored)\n' "${DUMP:-none taken}"
       printf -- '- disk: `/mnt/workspace` %sG free before, %sG after\n' "$DF_BEFORE" "$(free_gb)"
@@ -242,12 +275,16 @@ report() { # $1 = green|red
   fi
 
   if [ "$DRILL_FAIL_HEALTH" = 1 ]; then
-    log "drill: report not posted. Body follows:"
+    log "drill: report not delivered. Body follows:"
     sed 's/^/  | /' "$body"
     return 0
   fi
-  post_card_comment "$body" || true
+  write_report "$body"
   rm -f "$body"
+  # A failed notification never fails the deploy: report() must not hand a
+  # healthy lane to the ERR trap and roll it back. It only marks the tick red.
+  notify_reporter || REPORT_FAILED=1
+  return 0
 }
 
 prune_releases() {
@@ -285,7 +322,7 @@ step "resolve-target"
 if [ -n "$FORCE_SHA" ]; then
   SHA="$FORCE_SHA"
   RUN_ID="$(run_for_sha "$SHA")"
-  [ -n "$RUN_ID" ] || { log "no successful push run of $AUTODEPLOY_WORKFLOW on $AUTODEPLOY_BRANCH for $SHA"; exit 1; }
+  [ -n "$RUN_ID" ] || fail "no successful push run of $AUTODEPLOY_WORKFLOW on $AUTODEPLOY_BRANCH for $SHA"
   RUN_JSON="$(gh run view "$RUN_ID" --repo "$AUTODEPLOY_REPO" --json headSha,url,createdAt,updatedAt,conclusion)"
 else
   # newest_green returns a one-element list; normalise it to the same object
@@ -302,6 +339,11 @@ if [ -n "$RUN_STARTED" ] && [ -n "$RUN_ENDED" ]; then
   BUILD_TIME="$(( ( $(date -d "$RUN_ENDED" +%s) - $(date -d "$RUN_STARTED" +%s) ) / 60 ))m$(( ( $(date -d "$RUN_ENDED" +%s) - $(date -d "$RUN_STARTED" +%s) ) % 60 ))s"
 else
   BUILD_TIME="unknown"
+fi
+
+if [ "$DRY_RUN" = 1 ] && [ "$(release_sha)" = "$SHA" ]; then
+  log "dry-run: lane z already runs ${SHA:0:9} (run $RUN_ID); a real tick exits here"
+  exit 0
 fi
 
 if [ "$(release_sha)" = "$SHA" ]; then
@@ -333,10 +375,7 @@ fi
 
 step "disk-guard"
 if [ "$DF_BEFORE" -lt "$AUTODEPLOY_MIN_FREE_GB" ]; then
-  FAIL_REASON="/mnt/workspace has ${DF_BEFORE}G free, below the ${AUTODEPLOY_MIN_FREE_GB}G floor"
-  log "$FAIL_REASON; refusing to download"
-  report red
-  exit 1
+  fail "/mnt/workspace has ${DF_BEFORE}G free, below the ${AUTODEPLOY_MIN_FREE_GB}G floor; refusing to download"
 fi
 
 step "download"
@@ -354,10 +393,10 @@ if gh run download "$RUN_ID" --repo "$AUTODEPLOY_REPO" -n "dsh-plugin-$SHA" -D "
 fi
 
 step "verify-artifact"
-[ -x "$ART/multica-be/bin/server" ] || { FAIL_REASON="multica-be artifact has no bin/server"; exit 1; }
-[ -d "$ART/multica-be/migrations" ] || { FAIL_REASON="multica-be artifact has no migrations/"; exit 1; }
+[ -x "$ART/multica-be/bin/server" ] || fail "multica-be artifact has no bin/server"
+[ -d "$ART/multica-be/migrations" ] || fail "multica-be artifact has no migrations/"
 ART_SHA="$(jq -r '.sha // empty' "$ART/multica-be/release.json")"
-[ "$ART_SHA" = "$SHA" ] || { FAIL_REASON="artifact release.json sha '$ART_SHA' != run sha '$SHA'"; exit 1; }
+[ "$ART_SHA" = "$SHA" ] || fail "artifact release.json sha '$ART_SHA' != run sha '$SHA'"
 BUILT_AT="$(jq -r '.builtAt // "unknown"' "$ART/multica-be/release.json")"
 log "artifact verified: sha $SHA, built $BUILT_AT"
 
@@ -377,7 +416,7 @@ DUMP="$AUTODEPLOY_BACKUP_DIR/multica_z-pre-${SHA:0:9}-$TS.dump"
 MIG_LIST_PRE="$AUTODEPLOY_BACKUP_DIR/multica_z-pre-${SHA:0:9}-migrations-$TS.txt"
 log "dumping $MULTICA_Z_DB_NAME to $DUMP"
 podman exec "$MULTICA_Z_DB_CONTAINER" pg_dump -U hydra -Fc "$MULTICA_Z_DB_NAME" > "$DUMP"
-[ -s "$DUMP" ] || { FAIL_REASON="pg_dump produced an empty file"; exit 1; }
+[ -s "$DUMP" ] || fail "pg_dump produced an empty file"
 podman exec "$MULTICA_Z_DB_CONTAINER" psql -U hydra -d "$MULTICA_Z_DB_NAME" -tAc \
   'select version from schema_migrations order by version' | sed '/^$/d' | sort > "$MIG_LIST_PRE"
 log "backup ok: $(du -h "$DUMP" | cut -f1), $(wc -l < "$MIG_LIST_PRE") migrations recorded"
@@ -393,7 +432,7 @@ log "release installed at $REL"
 step "migrate"
 # shellcheck source=/dev/null
 if [ -f "$LANE_RUNTIME_ENV" ]; then . "$LANE_RUNTIME_ENV"; fi
-[ -n "${MULTICA_Z_DB_PASSWORD:-}" ] || { FAIL_REASON="no MULTICA_Z_DB_PASSWORD in $LANE_RUNTIME_ENV"; exit 1; }
+[ -n "${MULTICA_Z_DB_PASSWORD:-}" ] || fail "no MULTICA_Z_DB_PASSWORD in $LANE_RUNTIME_ENV"
 DSN="${MULTICA_Z_DSN_TEMPLATE/PASSWORD/$MULTICA_Z_DB_PASSWORD}"
 ( cd "$REL" && DATABASE_URL="$DSN" "$REL/bin/migrate" up )
 podman exec "$MULTICA_Z_DB_CONTAINER" psql -U hydra -d "$MULTICA_Z_DB_NAME" -tAc \
@@ -402,19 +441,18 @@ comm -13 "$MIG_LIST_PRE" "$LANE_ROOT/data/autodeploy-migrations.post" > "$LANE_R
 log "migrations applied: $( [ -s "$LANE_ROOT/data/autodeploy-migrations.applied" ] && paste -sd', ' "$LANE_ROOT/data/autodeploy-migrations.applied" || echo none)"
 
 step "switch"
-ln -sfn "$REL" "$LANE_ROOT/multica-be/current"
+# The flip is what makes this a switch, so the rollback marker goes on first.
 SWITCHED=1
-# Make sure the service unit follows the `current` symlink instead of a stale
-# release dir, so the restart below actually runs the new binary (M-151).
-_UNIT="$HOME/.config/systemd/user/$MULTICA_BE_Z_UNIT"
-if [ -f "$_UNIT" ]; then
-  sed -i -E 's#/multica-be/releases/[^/]+/bin/server#/multica-be/current/bin/server#; s#WorkingDirectory=.*/multica-be/releases/[^/]+#WorkingDirectory='"$LANE_ROOT"'/multica-be/current#' "$_UNIT" 2>/dev/null || true
-  systemctl --user daemon-reload 2>/dev/null || true
-fi
+render_backend_unit "$REL" || fail "could not point $MULTICA_BE_Z_UNIT at releases/${SHA:0:9}"
+[ "$(readlink -f "$LANE_ROOT/multica-be/current")" = "$REL" ] || fail "current does not resolve to $REL"
+UNIT_REL="$(unit_release)"
+[ "$UNIT_REL" = "$LANE_ROOT/multica-be/current" ] \
+  || fail "$MULTICA_BE_Z_UNIT runs '$UNIT_REL', not the current symlink"
+log "$MULTICA_BE_Z_UNIT -> current -> releases/${SHA:0:9}; restarting"
 systemctl --user restart "$MULTICA_BE_Z_UNIT"
 
 step "health"
-assert_health "$SHA" || { FAIL_REASON="health check failed after the switch"; exit 1; }
+assert_health "$SHA" || fail "health check failed after the switch"
 
 step "plugin"
 if [ "$PLUGIN_PRESENT" = 1 ]; then
@@ -428,8 +466,8 @@ if [ "$PLUGIN_PRESENT" = 1 ]; then
     rsync -a --delete "$ART/dsh-plugin/" "$DSH_Z_PLUGIN_BUNDLE/"
     printf 'updated (dsh-z restarted)\n' > "$LANE_ROOT/data/autodeploy-plugin.note"
     systemctl --user restart "$DSH_Z_WEB_UNIT"
-    wait_http "http://127.0.0.1:3180/" 90 '' || { FAIL_REASON="lane web did not come back after the plugin update"; exit 1; }
-    assert_health "$SHA" || { FAIL_REASON="health check failed after the plugin update"; exit 1; }
+    wait_http "http://127.0.0.1:3180/" 90 '' || fail "lane web did not come back after the plugin update"
+    assert_health "$SHA" || fail "health check failed after the plugin update"
   fi
 else
   printf 'unchanged (no dsh-plugin artifact in this run)\n' > "$LANE_ROOT/data/autodeploy-plugin.note"
@@ -445,3 +483,9 @@ rm -f "$LANE_ROOT/data/autodeploy.failed"
 step "report"
 report green
 log "done in $(( $(date +%s) - STARTED ))s; /mnt/workspace $(free_gb)G free (was ${DF_BEFORE}G)"
+if [ "$REPORT_FAILED" = 1 ]; then
+  # The lane is healthy, so this must not roll back — but a deploy nobody was
+  # told about is a failed tick, and the unit status is how that surfaces.
+  log "deploy is UP but the evidence comment was not delivered; latest.md holds it"
+  exit 1
+fi
