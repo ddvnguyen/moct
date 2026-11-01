@@ -18,7 +18,7 @@ import {
 } from "@multica/core/issues/ask-plan";
 import { Button } from "@multica/ui/components/ui/button";
 import { Input } from "@multica/ui/components/ui/input";
-import { ClipboardList, Loader2, Plus, X } from "lucide-react";
+import { ClipboardList, Loader2, Plus, X } from "@multica/ui/icons";
 import { ReadonlyContent } from "../../editor";
 import { useT } from "../../i18n";
 import { AgentQuestionCard } from "./agent-question-card";

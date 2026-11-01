@@ -76,7 +76,7 @@ import {
   FilePlus,
   Loader2,
   MessageSquarePlus,
-} from "lucide-react";
+} from "@multica/ui/icons";
 
 // Helpers
 

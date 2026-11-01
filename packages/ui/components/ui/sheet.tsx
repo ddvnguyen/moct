@@ -6,7 +6,7 @@ import { Dialog as SheetPrimitive } from "@base-ui/react/dialog"
 import { cn } from "@multica/ui/lib/utils"
 import { Button } from "@multica/ui/components/ui/button"
 import { usePortalContainer } from "@multica/ui/components/ui/portal-container"
-import { XIcon } from "lucide-react"
+import { XIcon } from "@multica/ui/icons"
 
 function Sheet({ ...props }: SheetPrimitive.Root.Props) {
   return <SheetPrimitive.Root data-slot="sheet" {...props} />

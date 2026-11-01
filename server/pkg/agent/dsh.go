@@ -934,16 +934,24 @@ func renderDshQuestions(questions []dshQuestion) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// dshSupplementMessageMarker precedes the human's own words in the framed
-// instruction formatTaskSupplementInstruction builds. The framing exists for
-// ordinary steering; an answer must carry the member's words, not the frame.
-const dshSupplementMessageMarker = "Human message:\n"
+// dshSupplementMessageMarkers precede the author's own words in the framed
+// instruction formatTaskSupplementInstruction builds: one per author kind. The
+// framing exists for ordinary steering; an answer must carry the author's
+// words, not the frame.
+var dshSupplementMessageMarkers = []string{"Human message:\n", "Agent message:\n"}
 
 func dshSupplementContent(instruction string) string {
-	if _, after, ok := strings.Cut(instruction, dshSupplementMessageMarker); ok {
-		return strings.TrimSpace(after)
+	// The frame's own marker comes first; a marker inside the author's words must not win.
+	cut, markerLen := -1, 0
+	for _, marker := range dshSupplementMessageMarkers {
+		if i := strings.Index(instruction, marker); i >= 0 && (cut < 0 || i < cut) {
+			cut, markerLen = i, len(marker)
+		}
 	}
-	return strings.TrimSpace(instruction)
+	if cut < 0 {
+		return strings.TrimSpace(instruction)
+	}
+	return strings.TrimSpace(instruction[cut+markerLen:])
 }
 
 // dshSupplement delivers a human message to the bridge as an answer (when a

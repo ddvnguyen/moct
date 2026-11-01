@@ -1,4 +1,4 @@
-import { ExternalLink } from "lucide-react";
+import { ExternalLink } from "@multica/ui/icons";
 import { cn } from "@multica/ui/lib/utils";
 import {
   Tooltip,
