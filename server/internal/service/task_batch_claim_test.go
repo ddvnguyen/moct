@@ -287,9 +287,16 @@ func TestClaimTasksForRuntimes_EmptyReclaimDefersHintForRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read deferred hint: %v", err)
 	}
+	// The cache stores scores as Unix milliseconds, so the stored hint is
+	// floor_ms(claimTime + interval). Compare the lower bound at that
+	// resolution; a nanosecond bound can exceed the stored value when the claim
+	// runs within the same millisecond as now. The upper bound is unaffected
+	// because truncation only moves the stored value earlier.
 	retryAt := time.UnixMilli(int64(score))
-	if retryAt.Before(now.Add(ReclaimCheckRetryInterval)) || retryAt.After(time.Now().Add(ReclaimCheckRetryInterval+time.Second)) {
-		t.Fatalf("retry hint = %v, want approximately one retry interval after the check", retryAt)
+	lower := now.Add(ReclaimCheckRetryInterval).Truncate(time.Millisecond)
+	upper := time.Now().Add(ReclaimCheckRetryInterval + time.Second)
+	if retryAt.Before(lower) || retryAt.After(upper) {
+		t.Fatalf("retry hint = %v, want within [%v, %v] (one retry interval after the check)", retryAt, lower, upper)
 	}
 	if due := svc.ReclaimCheck.DueRuntimeIDs(ctx, []string{rt1}, retryAt.Add(-time.Millisecond)); len(due) != 0 {
 		t.Fatalf("hint retriggered before retry deadline: %v", due)
