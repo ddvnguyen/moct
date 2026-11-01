@@ -1,5 +1,5 @@
 import type { InboxWorkspaceUnread } from "../fork";
-import { UNREAD_SUMMARY_PATH } from "./config";
+import { islandConfig, UNREAD_SUMMARY_PATH } from "./config";
 
 /**
  * The unread count behind the rail's inbox dot, outside React.
@@ -98,6 +98,12 @@ let activePollStop: (() => void) | null = null;
  * transient outage must never read as "everything is read". Nothing escapes
  * the poller — it runs on a bare timer.
  *
+ * The request is workspace-scoped, and this half of the plugin runs before any
+ * island exists, so it cannot read the platform's current-workspace pointer.
+ * The slug therefore comes from the host's own config, and a host with no
+ * workspace configured is not polled at all: a slugless request is a 400 the
+ * server answers, not a count (M-198).
+ *
  * The timer only runs while `document.visibilityState` is not `hidden`; coming
  * back on screen polls immediately instead of waiting out the interval.
  */
@@ -111,9 +117,11 @@ export function startUnreadPoll(
 
   const poll = async (): Promise<void> => {
     try {
+      const slug = (await islandConfig()).workspaceSlug.trim();
+      if (slug === "") return;
       const response = await fetch(UNREAD_SUMMARY_PATH, {
         credentials: "same-origin",
-        headers: { accept: "application/json" },
+        headers: { accept: "application/json", "X-Workspace-Slug": slug },
       });
       if (!response.ok) return;
       const body: unknown = await response.json();

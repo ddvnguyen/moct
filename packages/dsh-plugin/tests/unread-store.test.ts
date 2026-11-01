@@ -1,5 +1,6 @@
 import type { InboxWorkspaceUnread } from "@multica/core/types/inbox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { islandConfig, resetIslandConfig } from "../src/client/config";
 import {
   attachUnreadBadge,
   getUnread,
@@ -104,14 +105,25 @@ describe("unread store", () => {
 describe("unread poller", () => {
   let stopPoll: (() => void) | null = null;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     setUnread(0);
     vi.useFakeTimers();
+    // The poller reads the host config once per page before its first request
+    // (M-198). Seed that read here so each test's own stub only sees the
+    // summary call it is about.
+    resetIslandConfig();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ wsPath: "/multica/ws", workspaceSlug: "demo", problem: null })),
+    );
+    await islandConfig();
+    vi.unstubAllGlobals();
   });
 
   afterEach(() => {
     stopPoll?.();
     stopPoll = null;
+    resetIslandConfig();
     Reflect.deleteProperty(document, "visibilityState");
     vi.useRealTimers();
     vi.unstubAllGlobals();
@@ -139,7 +151,32 @@ describe("unread poller", () => {
     const [url, init] = fetchMock.mock.calls[0] ?? [];
     expect(url).toBe("/multica/api/inbox/unread-summary");
     expect(init?.credentials).toBe("same-origin");
-    expect(init?.headers).toEqual({ accept: "application/json" });
+    // The summary is workspace-scoped; the host's slug is what the server
+    // resolves it from, and a request without it is a 400 (M-198).
+    expect(init?.headers).toEqual({
+      accept: "application/json",
+      "X-Workspace-Slug": "demo",
+    });
+  });
+
+  it("does not poll at all while the host has no workspace configured", async () => {
+    setUnread(3);
+    resetIslandConfig();
+    const fetchMock = vi.fn(async (url: string) =>
+      url === "/multica/config"
+        ? jsonResponse({ wsPath: "/multica/ws", workspaceSlug: "  ", problem: null })
+        : jsonResponse([{ workspace_id: "ws-1", count: 9 }]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    stopPoll = startUnreadPoll({ intervalMs: 1_000 });
+    await drained();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    // One config read, no summary call, and the count is left alone rather
+    // than read as "nothing unread".
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/multica/config"]);
+    expect(getUnread()).toBe(3);
   });
 
   it("leaves the stored count alone on a non-OK response", async () => {

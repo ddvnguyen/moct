@@ -15,6 +15,7 @@ import { shadowStyles } from "../src/client/popup-seat";
 import { BOARD_ROUTE, type IslandRoute } from "../src/client/navigation";
 import { attachSeat } from "../src/client/seat";
 import { useModalStore } from "../src/fork";
+import { resetIslandConfig } from "../src/client/config";
 import { zoomStore } from "../src/client/zoom-store";
 
 /**
@@ -25,6 +26,8 @@ import { zoomStore } from "../src/client/zoom-store";
  */
 
 const requests: string[] = [];
+/** Each request with the headers it carried, for the workspace-slug contract. */
+const calls: Array<{ url: string; headers: Record<string, string> }> = [];
 const mounted: HTMLElement[] = [];
 
 afterEach(() => {
@@ -35,8 +38,20 @@ afterEach(() => {
   resetIsland();
   document.body.replaceChildren();
   requests.length = 0;
+  calls.length = 0;
+  // The host config is read once per page; these tests are many pages.
+  resetIslandConfig();
   vi.unstubAllGlobals();
 });
+
+/** Request headers, lower-cased: `Headers` normalizes names, an object does not. */
+function headerRecord(init: RequestInit | undefined): Record<string, string> {
+  const headers: Record<string, string> = {};
+  new Headers(init?.headers).forEach((value, name) => {
+    headers[name] = value;
+  });
+  return headers;
+}
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -88,9 +103,10 @@ function stubBackend(
     projects?: unknown[];
   } = {},
 ) {
-  const handler = vi.fn(async (input: RequestInfo | URL) => {
+  const handler = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
     requests.push(url);
+    calls.push({ url, headers: headerRecord(init) });
     if (url.startsWith("/multica/config")) {
       return json({
         wsPath: "/multica/ws",
@@ -289,6 +305,38 @@ describe("mountIsland", () => {
       expect(text).toContain("Issues");
     });
     expect(requests.some((url) => url.startsWith("/multica/api/workspaces"))).toBe(true);
+  });
+
+  // Every page load used to open with a burst of 400s: the pages and the
+  // unread reporter queried from their own effects, before the gate's effect
+  // had told the API client which workspace it speaks as (M-198).
+  it("stamps every workspace-scoped request with the slug from the first frame", async () => {
+    stubBackend();
+    const host = hostElement();
+    act(() => mountIsland(host));
+
+    await settle(() => {
+      expect(host.shadowRoot?.textContent ?? "").toContain("Issues");
+    });
+
+    // Reads that legitimately carry no slug: the caller's identity, the
+    // workspace list that resolves the slug, and `/api/config`, a public route
+    // outside the workspace middleware (`server/cmd/server/router.go:1527`).
+    // Everything else the panel asks for is scoped by the slug, and the server
+    // answers 400 without it.
+    const scoped = calls.filter(
+      (call) =>
+        call.url.startsWith("/multica/api/") &&
+        !call.url.startsWith("/multica/api/workspaces") &&
+        !call.url.startsWith("/multica/api/me") &&
+        !call.url.startsWith("/multica/api/config"),
+    );
+    expect(scoped.length).toBeGreaterThan(0);
+    expect(
+      scoped
+        .filter((call) => call.headers["x-workspace-slug"] === undefined)
+        .map((call) => call.url),
+    ).toEqual([]);
   });
 
   it("renders one issue from the backend inside the panel", async () => {

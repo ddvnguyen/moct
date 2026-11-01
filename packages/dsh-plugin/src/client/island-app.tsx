@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useStore } from "zustand";
 import {
+  islandConfig,
   ISLAND_API_BASE,
   islandWebSocketUrl,
-  loadIslandConfig,
   type IslandConfig,
 } from "./config";
 import {
@@ -104,7 +104,7 @@ export function IslandBoot({
 
   useEffect(() => {
     let cancelled = false;
-    loadIslandConfig()
+    islandConfig()
       .then((next) => {
         if (!cancelled) setConfig(next);
       })
@@ -254,9 +254,20 @@ function WorkspaceGate({
 
   const slug = workspace?.slug;
   const id = workspace?.id;
-  useEffect(() => {
+  // The pointer every descendant request is stamped from, so it has to be set
+  // before the first descendant mounts. A passive effect here does not do that:
+  // child effects run before the parent's, so the pages' first queries — and
+  // the reporter's unread summary — used to leave without `X-Workspace-Slug`,
+  // and the server answered 400 to each of them until react-query retried
+  // (M-198). A layout effect runs after the DOM is committed and before any
+  // passive effect in the tree, and `armed` keeps the children out of the
+  // render that precedes it, so nothing below ever queries while the pointer
+  // still belongs to another workspace.
+  const [armed, setArmed] = useState<{ slug: string; id: string } | null>(null);
+  useLayoutEffect(() => {
     if (slug === undefined || id === undefined) return;
     setCurrentWorkspace(slug, id);
+    setArmed({ slug, id });
     return () => setCurrentWorkspace(null, null);
   }, [slug, id]);
 
@@ -272,6 +283,11 @@ function WorkspaceGate({
         }
       />
     );
+  }
+  // One frame, before the layout effect above has armed this workspace: the
+  // pages wait here rather than query against a pointer that is not theirs.
+  if (armed === null || armed.slug !== workspace.slug || armed.id !== workspace.id) {
+    return <IslandMessage title="Connecting to Multica…" />;
   }
   return (
     <WorkspaceSlugProvider slug={workspace.slug}>

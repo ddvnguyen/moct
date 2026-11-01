@@ -55,6 +55,32 @@ export async function loadIslandConfig(
   };
 }
 
+let cachedConfig: Promise<IslandConfig> | null = null;
+
+/**
+ * The host's boot config, read once per page.
+ *
+ * Two callers want it and neither can wait for the other: the island's boot
+ * gate, which decides which workspace the panel speaks as, and the rail dot's
+ * poller, which runs from `apply` before any island exists. One shared promise
+ * means one `/multica/config` request on load instead of two.
+ *
+ * A failed read is not cached: the next caller tries again, so a host that was
+ * still starting up when the shell booted is picked up by the next poll.
+ */
+export function islandConfig(): Promise<IslandConfig> {
+  cachedConfig ??= loadIslandConfig().catch((cause: unknown) => {
+    cachedConfig = null;
+    throw cause;
+  });
+  return cachedConfig;
+}
+
+/** Drop the cached read so the next caller fetches again. Tests only. */
+export function resetIslandConfig(): void {
+  cachedConfig = null;
+}
+
 /** Absolute WebSocket URL for a same-origin path. */
 export function islandWebSocketUrl(wsPath: string, location: Location): string {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";

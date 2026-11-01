@@ -187,6 +187,16 @@ There is no iframe and no loopback page: the board, the filters, the issue page
 and the other four views are the fork's own components, mounted under a fork
 `CoreProvider` whose `ApiClient` points at `/multica`.
 
+The one workspace the panel speaks as is set on the platform's
+current-workspace pointer *before* any page mounts: the gate arms itself in a
+layout effect and renders its children only once the pointer matches the
+workspace it resolved. A passive effect there would be too late — child effects
+run before the parent's — so the first queries of a load went out without
+`X-Workspace-Slug` and the server answered 400 to each until react-query
+retried (M-198). The rail dot's poller takes its slug from the host's own boot
+config for the same reason (it runs before any island exists), and a host with
+no workspace configured is not polled at all.
+
 What the plugin may import from the fork is deliberately narrow — see
 [`FORK.md`](FORK.md). One module, public exports only, enforced by `pnpm lint`.
 
