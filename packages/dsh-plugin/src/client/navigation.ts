@@ -169,8 +169,10 @@ export function islandPath(slug: string, route: IslandRoute): string {
 /**
  * Where a detail view returns to, or `null` for a family root.
  *
- * The island has no history stack: `back` is the detail page's own parent, and
- * a family root reports that there is nothing behind it.
+ * The window's history is the island's history (M-197); this is only the
+ * fallback behind a tab that has nowhere to go — a detail view restored from
+ * storage, whose family root was never visited — and a family root reports
+ * that there is nothing behind it.
  */
 export function islandParent(route: IslandRoute): IslandRoute | null {
   switch (route.view) {
@@ -255,39 +257,32 @@ export function createIslandNavigation({
 
   const route = currentRoute();
 
+  /**
+   * Announce where the window landed after a history move.
+   *
+   * Back and Forward walk the window's one history (M-197), which may land in
+   * another tab; the store has already pointed `activeId` at that tab and set
+   * its URL, so the route to announce is read back from the store rather than
+   * assumed to belong to the tab the move started in.
+   */
+  const announceActive = () => {
+    const landed = currentRoute();
+    onChange?.(landed);
+  };
+
   const back = () => {
-    const r = currentRoute();
-    if (tabs) {
-      const st = tabs.getState();
-      const active = st.tabs.find((t) => t.id === st.activeId);
-      if (active && active.history.index > 0) {
-        const moved = st.back();
-        if (moved) {
-          const newActive = st.activeTab();
-          if (newActive) {
-            const nr = parseIslandRoute(newActive.url);
-            if (nr !== null) onChange?.(nr);
-          }
-          return;
-        }
-      }
+    if (tabs && tabs.getState().back()) {
+      announceActive();
+      return;
     }
-    const p = islandParent(r);
+    // Nothing behind it in the window's history: a detail view still returns
+    // to its family root, which is the only Back a freshly restored tab has.
+    const p = islandParent(currentRoute());
     if (p !== null) onChange?.(p);
   };
 
   const forward = () => {
-    if (tabs) {
-      const st = tabs.getState();
-      const moved = st.forward();
-      if (moved) {
-        const newActive = st.activeTab();
-        if (newActive) {
-          const nr = parseIslandRoute(newActive.url);
-          if (nr !== null) onChange?.(nr);
-        }
-      }
-    }
+    if (tabs && tabs.getState().forward()) announceActive();
   };
 
   const canGoBackFn = () => {

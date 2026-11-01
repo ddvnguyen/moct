@@ -48,11 +48,15 @@ interface IslandHandle {
    * so a re-render that re-attaches the same seat does not reset the page.
    */
   route: IslandRoute;
+  /** Whether a seat holds the island; the tree knows, so it can be re-rendered. */
+  attached: boolean;
 }
 
 export interface MountIslandOptions {
   /** Which place to open first. The board unless a link named one issue. */
   initialRoute?: IslandRoute;
+  /** True when a seat already holds this host (see `attachIsland`). */
+  attached?: boolean;
 }
 
 const handles = new WeakMap<HTMLElement, IslandHandle>();
@@ -133,13 +137,18 @@ export function mountIsland(host: HTMLElement, options: MountIslandOptions = {})
 
   const route = options.initialRoute ?? BOARD_ROUTE;
   const root = createRoot(rootElement);
-  root.render(createElement(IslandBoot, { portalHost, route }));
+  // `attached` is the island's own knowledge of whether a seat holds it. The
+  // warm-up build has no seat, and the island must not drive the shell's rail
+  // while nobody can see it (M-197: the rail follows the active tab, and a
+  // detached island has none).
+  root.render(createElement(IslandBoot, { portalHost, route, attached: options.attached === true }));
   handles.set(host, {
     root,
     theme,
     seat,
     portalHost,
     route,
+    attached: options.attached === true,
   });
 }
 
@@ -200,17 +209,21 @@ export function attachIsland(seat: HTMLElement, route: IslandRoute): void {
 
   const handle = handles.get(host);
   if (handle === undefined) return;
-  if (islandRouteKey(handle.route) === islandRouteKey(route)) return;
+  const sameEntry = islandRouteKey(handle.route) === islandRouteKey(route);
+  // A seat re-render of the same entry changes nothing; the first claim of a
+  // warm-up island does — the tree has to learn a seat holds it (M-197).
+  if (sameEntry && handle.attached) return;
 
   // The panel is being asked for a different entry, so whatever dialog the
   // previous one opened goes with it. This is the rail-to-rail case: the host
   // moves to the new cell in the same commit, so `detachIsland` never runs and
   // the dialog would otherwise sit over the entry the reader moved to (M-146).
-  closeDialogs();
+  if (!sameEntry) closeDialogs();
 
   handle.route = route;
+  handle.attached = true;
   handle.root.render(
-    createElement(IslandBoot, { portalHost: handle.portalHost, route }),
+    createElement(IslandBoot, { portalHost: handle.portalHost, route, attached: true }),
   );
 }
 
@@ -226,6 +239,10 @@ export function detachIsland(): void {
   if (host === null) return;
   dismissOverlays(host);
   host.remove();
+  // No seat holds it now: the next claim re-renders the tree with one, which
+  // is what restarts the rail's follow-the-active-tab effect (M-197).
+  const handle = handles.get(host);
+  if (handle !== undefined) handle.attached = false;
 }
 
 /** The keep-alive host, for tests and diagnostics. */
@@ -307,6 +324,11 @@ export function unmountIsland(host: HTMLElement): void {
 export function resetIsland(): void {
   if (keepAlive !== null) unmountIsland(keepAlive);
   keepAlive = null;
+  try {
+    window.localStorage.removeItem("multica.dsh.tabs.v1");
+  } catch {
+    // ignore
+  }
 }
 
 /** True while an island is mounted on this element. For tests and diagnostics. */

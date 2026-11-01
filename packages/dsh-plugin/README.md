@@ -97,7 +97,8 @@ The row chooses where an island *opens*; from there the fork's pages navigate as
 they do in the web app — an inbox row that no longer resolves falls back to its
 issue, for instance — and the row keeps marking the entry the reader came
 through. dsh gives a plugin no way to move the shell's rail selection, so the
-island follows the reader instead of fighting the rail.
+island follows the reader, and moves the rail's selection with it (see
+"Keeping the shell in step" below).
 
 Not mapped: the creation flows (`agents/new`, the AI builder). They are real
 routes in the fork, but they are authoring surfaces rather than views of what
@@ -106,15 +107,41 @@ opening a page this cut does not cover.
 
 ## Header tabs
 
-The island now carries its own header row above the page: back/forward
-buttons, a horizontally scrolling tab strip, and an empty trailing slot
-reserved for card B. Every MMX view (board, issue, agents, agent, skills,
-skill, inbox, chat, settings) opens as a tab; each tab keeps its own
-back/forward history in `src/client/tabs.ts`. A rail click focuses that
-family's tab (or opens one), and closing the last tab opens the family
-root so the strip is never empty. The board's own title `PageHeader` is
-suppressed when the island hosts the chrome (`PageChromeProvider`), while
-its filter toolbar stays.
+The island carries its own header row above the page: back/forward buttons, a
+horizontally scrolling tab strip, and an empty trailing slot reserved for card
+B. Every MMX view (board, issue, agents, agent, skills, skill, inbox, chat,
+settings) opens as a tab. A rail click focuses that family's tab (or opens
+one), and closing the last tab opens the family root so the strip is never
+empty. The board's own title `PageHeader` is suppressed when the island hosts
+the chrome (`PageChromeProvider`), while its filter toolbar stays.
+
+Back and Forward are **one history for the whole window**, not one per tab
+(`src/client/tabs.ts`). A tab switch and a navigation inside a tab each record
+a visited location; the history stores which tab each location belonged to and
+is saved with the tabs (session), capped at 100. Back from a tab's first
+location therefore lands on the previous tab's last one, and the entries of a
+tab closed since are skipped rather than pruned.
+
+An issue tab is named by its identifier (`M-123`) with the full title in its
+tooltip; while the issue is still loading the name falls back to the URL's own
+segment, which the issue route rewrites to the identifier once it resolves.
+Every other tab keeps the name the fork resolves for it.
+
+## Keeping the shell in step
+
+The rail and the strip are two views of one state, so the island tells the
+shell which row is showing (`src/client/shell.ts`, through dsh's `ctx.layout`):
+whatever moves the active tab — a tab click, Back/Forward across tabs, closing
+the current tab, a restored session — also selects the rail row that owns the
+tab's family. Only a seated island does this; the warm-up build has no seat and
+leaves the shell's selection alone.
+
+The same module collapses the sidebar while an MMX view is active and gives the
+reader back the sidebar they had on leaving (`ctx.layout.toggleSidebar`, with
+the collapsed state read from the frame's own `data-sidebar-collapsed`). A
+sidebar that was already collapsed is left alone, and one the reader expands
+inside MMX is never collapsed again for them: the collapse happens once, on
+entering, and only that collapse is undone on leaving.
 
 ## How it renders
 

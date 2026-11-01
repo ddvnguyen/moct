@@ -10,12 +10,26 @@ import {
 } from "./navigation";
 
 export const TABS_CAP = 20;
-export const HISTORY_CAP = 50;
+
+/**
+ * Visited locations the window keeps, oldest dropped past this (M-197).
+ *
+ * One history for the whole window rather than one per tab, so Back and
+ * Forward walk the reader's actual path across tabs and the URLs inside them,
+ * the way a browser's session history does. 100 is the Owner's cap.
+ */
+export const HISTORY_CAP = 100;
 
 export interface IslandTab {
   id: string;
   url: string;
-  history: { stack: string[]; index: number };
+  pinned: boolean;
+}
+
+/** One visited location: the tab it belonged to, and where that tab stood. */
+export interface HistoryEntry {
+  readonly tabId: string;
+  readonly url: string;
 }
 
 export interface TabsGroup {
@@ -24,29 +38,51 @@ export interface TabsGroup {
   mru: string[];
 }
 
-export type TabsState = TabsGroup & {
-  // tab lifecycle
-  openTab: (url: string, options?: { activate?: boolean; insertAfterActive?: boolean }) => string;
-  open: (url: string, options?: { activate?: boolean; insertAfterActive?: boolean }) => string;
-  focusTab: (id: string) => void;
-  focus: (id: string) => void;
-  closeTab: (id: string) => void;
-  close: (id: string) => void;
-  // rail entry handling
-  railEntry: (entry: IslandRoute | string) => void;
-  onRailEntry: (entry: IslandRoute | string) => void;
-  openOrFocus: (url: string) => string;
-  openOrFocusUrl: (url: string) => string;
-  // history on the active tab
-  push: (path: string) => void;
-  replace: (path: string) => void;
-  back: () => boolean;
-  forward: () => boolean;
-  canGoBack: (route?: IslandRoute | null) => boolean;
-  // helpers
-  activeTab: () => IslandTab | null;
-  activeUrl: () => string | null;
-};
+/**
+ * The window's one history.
+ *
+ * `index` is the entry the window is standing on (`-1` before the first one),
+ * and every entry names the tab it was visited in. Back and Forward move the
+ * index, re-open the tab the entry belongs to at the entry's URL, and skip the
+ * entries of tabs that have since been closed.
+ */
+export interface HistoryGroup {
+  entries: HistoryEntry[];
+  index: number;
+}
+
+export type TabsState = TabsGroup &
+  HistoryGroup & {
+    // tab lifecycle
+    openTab: (url: string, options?: OpenTabOptions) => string;
+    open: (url: string, options?: OpenTabOptions) => string;
+    focusTab: (id: string) => void;
+    focus: (id: string) => void;
+    closeTab: (id: string) => void;
+    close: (id: string) => void;
+    togglePin: (id: string) => void;
+    // rail entry handling
+    railEntry: (entry: IslandRoute | string) => void;
+    onRailEntry: (entry: IslandRoute | string) => void;
+    openOrFocus: (url: string) => string;
+    openOrFocusUrl: (url: string) => string;
+    // navigation inside the active tab
+    push: (path: string) => void;
+    replace: (path: string) => void;
+    back: () => boolean;
+    forward: () => boolean;
+    canGoBack: (route?: IslandRoute | null) => boolean;
+    canGoForward: () => boolean;
+    // helpers
+    activeTab: () => IslandTab | null;
+    activeUrl: () => string | null;
+  };
+
+export interface OpenTabOptions {
+  activate?: boolean;
+  insertAfterActive?: boolean;
+  pinned?: boolean;
+}
 
 function newId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -81,8 +117,67 @@ export function familyOfUrl(url: string): string | null {
   return familyOfRoute(route);
 }
 
-function routeFromUrl(url: string): IslandRoute | null {
-  return parseIslandRoute(url);
+/** Dedup identity of a tab URL: its pathname (search/hash are view state). */
+export function resourceKeyForUrl(url: string): string {
+  const hash = url.indexOf("#");
+  const query = url.indexOf("?");
+  let cut = -1;
+  if (query !== -1 && (hash === -1 || query < hash)) cut = query;
+  else if (hash !== -1) cut = hash;
+  return cut === -1 ? url : url.slice(0, cut);
+}
+
+export const resourceKeyOfUrl = resourceKeyForUrl;
+export const resourceKey = resourceKeyForUrl;
+
+/** The root the last tab of a family falls back to when the strip empties. */
+function familyRootUrl(slug: string, url: string): string {
+  const family = familyOfUrl(url);
+  const root =
+    family === null
+      ? undefined
+      : (Object.entries(FAMILY_ROOTS).find(([name]) => name === family)?.[1] as
+          | IslandRoute
+          | undefined);
+  return root === undefined ? url : islandPath(slug, root);
+}
+
+/**
+ * Append a visited location, dropping anything the reader had gone Back from
+ * and the oldest entries past {@link HISTORY_CAP}.
+ *
+ * A repeat of the location already current (focusing the active tab, pressing
+ * a rail row that is already open) is not a second visit: it keeps one entry.
+ */
+function pushEntry(history: HistoryGroup, entry: HistoryEntry): HistoryGroup {
+  const kept = history.entries.slice(0, history.index + 1);
+  const last = kept[kept.length - 1];
+  if (last !== undefined && last.tabId === entry.tabId && last.url === entry.url) {
+    return { entries: kept, index: kept.length - 1 };
+  }
+  const next = [...kept, entry];
+  const overflow = Math.max(0, next.length - HISTORY_CAP);
+  const entries = overflow === 0 ? next : next.slice(overflow);
+  return { entries, index: entries.length - 1 };
+}
+
+/**
+ * The nearest entry in `step`'s direction whose tab is still open, or `-1`.
+ *
+ * Closed tabs are skipped rather than pruned: the index of the entry the
+ * window is standing on must not move when some other tab closes.
+ */
+function nearestLiveEntry(
+  history: HistoryGroup,
+  isOpen: (tabId: string) => boolean,
+  from: number,
+  step: 1 | -1,
+): number {
+  for (let at = from; at >= 0 && at < history.entries.length; at += step) {
+    const entry = history.entries[at];
+    if (entry !== undefined && isOpen(entry.tabId)) return at;
+  }
+  return -1;
 }
 
 export interface CreateTabsStoreOptions {
@@ -109,40 +204,61 @@ export function createTabsStore(
   const persistKey = "tabs.v1";
 
   const slice = (
-    set: (partial: Partial<TabsGroup> | ((s: TabsGroup) => Partial<TabsGroup>)) => void,
+    set: (partial: Partial<TabsState> | ((s: TabsState) => Partial<TabsState>)) => void,
     get: () => TabsState,
-  ): TabsGroup & Omit<TabsState, keyof TabsGroup> => {
-    const base: TabsGroup = { tabs: [], activeId: null, mru: [] };
+  ): TabsState => {
+    const base: TabsGroup & HistoryGroup = {
+      tabs: [],
+      activeId: null,
+      mru: [],
+      entries: [],
+      index: -1,
+    };
 
-    const update = (fn: (s: TabsGroup) => TabsGroup) => {
-      const current: TabsGroup = { tabs: get().tabs, activeId: get().activeId, mru: get().mru };
-      const next = fn(current);
-      set(next);
+    const update = (
+      fn: (s: TabsGroup & HistoryGroup) => TabsGroup & HistoryGroup,
+    ) => {
+      const state = get();
+      const current: TabsGroup & HistoryGroup = {
+        tabs: state.tabs,
+        activeId: state.activeId,
+        mru: state.mru,
+        entries: state.entries,
+        index: state.index,
+      };
+      set(fn(current));
     };
 
     const focusId = (id: string) => {
       update((s) => {
-        const mru = [id, ...s.mru.filter((x) => x !== id)];
-        return { ...s, activeId: id, mru };
+        const tab = s.tabs.find((t) => t.id === id);
+        if (tab === undefined) return s;
+        return {
+          ...s,
+          activeId: id,
+          mru: [id, ...s.mru.filter((x) => x !== id)],
+          ...pushEntry(s, { tabId: id, url: tab.url }),
+        };
       });
     };
 
-    const evictIfNeeded = (s: TabsGroup): TabsGroup => {
+    const evictIfNeeded = (s: TabsGroup & HistoryGroup): TabsGroup & HistoryGroup => {
       if (s.tabs.length < TABS_CAP) return s;
       // find least recently used unpinned tab that is not active
       const candidates = [...s.mru].reverse();
       let victim: string | null = null;
       for (const id of candidates) {
         if (id === s.activeId) continue;
-        if (s.tabs.some((t) => t.id === id)) {
+        const tab = s.tabs.find((t) => t.id === id);
+        if (tab && !tab.pinned) {
           victim = id;
           break;
         }
       }
       if (victim === null) {
-        // fall back to oldest tab not active
+        // fall back to oldest unpinned tab not active
         for (const t of s.tabs) {
-          if (t.id !== s.activeId) {
+          if (t.id !== s.activeId && !t.pinned) {
             victim = t.id;
             break;
           }
@@ -150,32 +266,54 @@ export function createTabsStore(
       }
       if (victim === null) return s;
       return {
+        ...s,
         tabs: s.tabs.filter((t) => t.id !== victim),
-        activeId: s.activeId === victim ? (s.tabs.find((t) => t.id !== victim)?.id ?? null) : s.activeId,
+        activeId:
+          s.activeId === victim
+            ? (s.tabs.find((t) => t.id !== victim)?.id ?? null)
+            : s.activeId,
         mru: s.mru.filter((x) => x !== victim),
       };
     };
 
-    const openTab = (url: string, options?: { activate?: boolean; insertAfterActive?: boolean }) => {
+    const openTab = (url: string, options?: OpenTabOptions) => {
       const activate = options?.activate !== false;
       const insertAfterActive = options?.insertAfterActive !== false;
+      const pinned = options?.pinned === true;
+      // Reuse an existing tab for the same resource (pathname), like upstream.
+      const existing = get().tabs.find(
+        (t) => resourceKeyForUrl(t.url) === resourceKeyForUrl(url),
+      );
+      if (existing) {
+        if (activate) focusId(existing.id);
+        return existing.id;
+      }
       const id = newId();
-      const tab: IslandTab = { id, url, history: { stack: [url], index: 0 } };
+      const tab: IslandTab = { id, url, pinned };
       update((s) => {
         const next = evictIfNeeded(s);
         const activeIndex = next.tabs.findIndex((t) => t.id === next.activeId);
-        const insertAt = insertAfterActive && activeIndex >= 0 ? activeIndex + 1 : next.tabs.length;
+        const insertAt =
+          insertAfterActive && activeIndex >= 0 ? activeIndex + 1 : next.tabs.length;
         const tabs = [...next.tabs];
         tabs.splice(insertAt, 0, tab);
         const mru = activate ? [id, ...next.mru.filter((x) => x !== id)] : next.mru;
         const activeId = activate ? id : next.activeId;
-        return { tabs, activeId, mru };
+        if (!activate) return { ...next, tabs, activeId, mru };
+        return {
+          ...next,
+          tabs,
+          activeId,
+          mru,
+          ...pushEntry(next, { tabId: id, url }),
+        };
       });
       return id;
     };
 
     const closeTab = (id: string) => {
       update((s) => {
+        const closed = s.tabs.find((t) => t.id === id);
         const tabs = s.tabs.filter((t) => t.id !== id);
         const mru = s.mru.filter((x) => x !== id);
         let activeId = s.activeId;
@@ -186,25 +324,27 @@ export function createTabsStore(
         }
         // close-last: open family root of closed tab
         if (tabs.length === 0) {
-          const closed = s.tabs.find((t) => t.id === id);
-          const fam = closed ? familyOfUrl(closed.url) : null;
-          let rootUrl = closed ? closed.url : `/${slug}/issues`;
-          if (fam !== null) {
-            // map family to root url
-            const rootRoute = Object.entries(FAMILY_ROOTS).find(([f]) => f === fam)?.[1] as IslandRoute | undefined;
-            if (rootRoute) rootUrl = islandPath(slug, rootRoute);
-          }
-          const newTab: IslandTab = { id: newId(), url: rootUrl, history: { stack: [rootUrl], index: 0 } };
-          tabs.push(newTab);
-          activeId = newTab.id;
-          mru.unshift(newTab.id);
+          const rootUrl =
+            closed === undefined ? `/${slug}/issues` : familyRootUrl(slug, closed.url);
+          const newTab: IslandTab = { id: newId(), url: rootUrl, pinned: false };
+          return {
+            ...s,
+            tabs: [newTab],
+            activeId: newTab.id,
+            mru: [newTab.id],
+            ...pushEntry(s, { tabId: newTab.id, url: rootUrl }),
+          };
         }
-        return { tabs, activeId, mru };
+        // The closed tab's own entries stay in the history: Back skips them
+        // rather than rewriting the path the reader walked.
+        return { ...s, tabs, activeId, mru };
       });
     };
 
     const openOrFocus = (url: string) => {
-      const existing = get().tabs.find((t) => t.url === url);
+      const existing = get().tabs.find(
+        (t) => resourceKeyForUrl(t.url) === resourceKeyForUrl(url),
+      );
       if (existing) {
         focusId(existing.id);
         return existing.id;
@@ -218,85 +358,27 @@ export function createTabsStore(
       if (route === null) return;
       const family = familyOfRoute(route);
       const entryUrl = typeof entry === "string" ? entry : islandPath(slug, entry);
-      update((s) => {
-        const active = s.tabs.find((t) => t.id === s.activeId);
-        if (active && familyOfUrl(active.url) === family) {
-          return s; // keep
-        }
-        // focus MRU tab of family
-        const familyTabIds = s.tabs.filter((t) => familyOfUrl(t.url) === family).map((t) => t.id);
-        const mruFamily = s.mru.filter((id) => familyTabIds.includes(id));
-        if (mruFamily.length > 0) {
-          const id = mruFamily[0]!;
-          const mru = [id, ...s.mru.filter((x) => x !== id)];
-          return { ...s, activeId: id, mru };
-        }
-        // open new tab at E
-        // reuse openTab logic inline to avoid recursion issues
-        const next = s;
-        if (next.tabs.length >= TABS_CAP) {
-          // evict
-          // simple: reuse evictIfNeeded by reconstructing
-        }
-        const id = newId();
-        const tab: IslandTab = { id, url: entryUrl, history: { stack: [entryUrl], index: 0 } };
-        // evict if needed
-        let tabs = next.tabs;
-        let activeId = next.activeId;
-        let mru = next.mru;
-        if (tabs.length >= TABS_CAP) {
-          // find victim
-          const candidates = [...mru].reverse();
-          let victim: string | null = null;
-          for (const cid of candidates) {
-            if (cid === activeId) continue;
-            if (tabs.some((t) => t.id === cid)) {
-              victim = cid;
-              break;
-            }
-          }
-          if (victim === null) {
-            for (const t of tabs) {
-              if (t.id !== activeId) {
-                victim = t.id;
-                break;
-              }
-            }
-          }
-          if (victim !== null) {
-            tabs = tabs.filter((t) => t.id !== victim);
-            mru = mru.filter((x) => x !== victim);
-            if (activeId === victim) activeId = tabs.length ? tabs[0]!.id : null;
-          }
-        }
-        const activeIndex = tabs.findIndex((t) => t.id === activeId);
-        const insertAt = activeIndex >= 0 ? activeIndex + 1 : tabs.length;
-        const newTabs = [...tabs];
-        newTabs.splice(insertAt, 0, tab);
-        mru = [id, ...mru.filter((x) => x !== id)];
-        activeId = id;
-        return { tabs: newTabs, activeId, mru };
-      });
+      const active = get().tabs.find((t) => t.id === get().activeId);
+      if (active !== undefined && familyOfUrl(active.url) === family) return;
+      // The rail row is a destination, not a new tab: an open tab of that
+      // family is re-focused, which visits it in the window's history.
+      const familyTabIds = get()
+        .tabs.filter((t) => familyOfUrl(t.url) === family)
+        .map((t) => t.id);
+      const mruFamily = get().mru.find((id) => familyTabIds.includes(id));
+      if (mruFamily !== undefined) {
+        focusId(mruFamily);
+        return;
+      }
+      openTab(entryUrl, { activate: true });
     };
 
     const push = (path: string) => {
       update((s) => {
         const active = s.tabs.find((t) => t.id === s.activeId);
         if (!active) return s;
-        const hist = active.history;
-        const stack = [...hist.stack.slice(0, hist.index + 1), path];
-        // cap
-        let index = stack.length - 1;
-        let finalStack = stack;
-        if (finalStack.length > HISTORY_CAP) {
-          const overflow = finalStack.length - HISTORY_CAP;
-          finalStack = finalStack.slice(overflow);
-          index = Math.max(0, index - overflow);
-        }
-        const tabs = s.tabs.map((t) =>
-          t.id === s.activeId ? { ...t, url: path, history: { stack: finalStack, index } } : t,
-        );
-        return { ...s, tabs };
+        const tabs = s.tabs.map((t) => (t.id === active.id ? { ...t, url: path } : t));
+        return { ...s, tabs, ...pushEntry(s, { tabId: active.id, url: path }) };
       });
     };
 
@@ -304,60 +386,67 @@ export function createTabsStore(
       update((s) => {
         const active = s.tabs.find((t) => t.id === s.activeId);
         if (!active) return s;
-        const hist = active.history;
-        const stack = [...hist.stack];
-        if (stack.length === 0) stack.push(path);
-        else stack[hist.index] = path;
-        const tabs = s.tabs.map((t) =>
-          t.id === s.activeId ? { ...t, url: path, history: { stack, index: hist.index } } : t,
-        );
-        return { ...s, tabs };
+        const tabs = s.tabs.map((t) => (t.id === active.id ? { ...t, url: path } : t));
+        // A replace stands for the entry the window is on, not a new visit:
+        // the canonical identifier of the issue it is on is the same page.
+        const current = s.entries[s.index];
+        const entries =
+          current !== undefined && current.tabId === active.id
+            ? s.entries.map((e, at) => (at === s.index ? { ...e, url: path } : e))
+            : s.entries;
+        return { ...s, tabs, entries };
       });
     };
 
+    const openEntry = (isOpen: (tabId: string) => boolean, at: number): boolean => {
+      const entry = get().entries[at];
+      if (entry === undefined || !isOpen(entry.tabId)) return false;
+      update((s) => ({
+        ...s,
+        tabs: s.tabs.map((t) => (t.id === entry.tabId ? { ...t, url: entry.url } : t)),
+        activeId: entry.tabId,
+        mru: [entry.tabId, ...s.mru.filter((x) => x !== entry.tabId)],
+        index: at,
+      }));
+      return true;
+    };
+
+    const isOpen = (tabId: string) => get().tabs.some((t) => t.id === tabId);
+
     const back = (): boolean => {
       const s = get();
-      const active = s.tabs.find((t) => t.id === s.activeId);
-      if (!active) return false;
-      if (active.history.index > 0) {
-        update((st) => {
-          const tabs = st.tabs.map((t) =>
-            t.id === st.activeId ? { ...t, history: { ...t.history, index: t.history.index - 1 }, url: t.history.stack[t.history.index - 1]! } : t,
-          );
-          return { ...st, tabs };
-        });
-        return true;
-      }
-      return false;
+      const at = nearestLiveEntry(s, isOpen, s.index - 1, -1);
+      return at === -1 ? false : openEntry(isOpen, at);
     };
 
     const forward = (): boolean => {
       const s = get();
-      const active = s.tabs.find((t) => t.id === s.activeId);
-      if (!active) return false;
-      if (active.history.index < active.history.stack.length - 1) {
-        update((st) => {
-          const tabs = st.tabs.map((t) =>
-            t.id === st.activeId ? { ...t, history: { ...t.history, index: t.history.index + 1 }, url: t.history.stack[t.history.index + 1]! } : t,
-          );
-          return { ...st, tabs };
-        });
-        return true;
-      }
-      return false;
+      const at = nearestLiveEntry(s, isOpen, s.index + 1, 1);
+      return at === -1 ? false : openEntry(isOpen, at);
     };
 
     const canGoBackFn = (route?: IslandRoute | null) => {
       const s = get();
+      if (nearestLiveEntry(s, isOpen, s.index - 1, -1) !== -1) return true;
       const active = s.tabs.find((t) => t.id === s.activeId);
-      const index = active?.history.index ?? 0;
-      if (index > 0) return true;
-      const r = route ?? (active ? routeFromUrl(active.url) : null);
+      const r = route ?? (active ? parseIslandRoute(active.url) : null);
       return r !== null && islandParent(r) !== null;
+    };
+
+    const canGoForwardFn = () => {
+      const s = get();
+      return nearestLiveEntry(s, isOpen, s.index + 1, 1) !== -1;
     };
 
     const activeTab = () => get().tabs.find((t) => t.id === get().activeId) ?? null;
     const activeUrl = () => activeTab()?.url ?? null;
+
+    const togglePin = (id: string) => {
+      update((s) => ({
+        ...s,
+        tabs: s.tabs.map((t) => (t.id === id ? { ...t, pinned: !t.pinned } : t)),
+      }));
+    };
 
     const actions = {
       openTab,
@@ -366,6 +455,7 @@ export function createTabsStore(
       focus: focusId,
       closeTab,
       close: closeTab,
+      togglePin,
       railEntry,
       onRailEntry: railEntry,
       openOrFocus,
@@ -375,6 +465,7 @@ export function createTabsStore(
       back,
       forward,
       canGoBack: canGoBackFn,
+      canGoForward: canGoForwardFn,
       activeTab,
       activeUrl,
     };
@@ -390,6 +481,10 @@ export function createTabsStore(
         tabs: state.tabs,
         activeId: state.activeId,
         mru: state.mru,
+        // The window's history is part of the session: a reload keeps the path
+        // Back walks, just as it keeps the tabs themselves (M-197).
+        entries: state.entries,
+        index: state.index,
       }),
     }),
   );

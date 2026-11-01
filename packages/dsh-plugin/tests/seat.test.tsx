@@ -12,6 +12,8 @@ import {
 import { resetIsland } from "../src/client/island";
 import { FAMILY_ROOTS } from "../src/client/navigation";
 import { createRailIcon, createSeatComponent } from "../src/client/seat";
+import { bindShell, selectShellPanel } from "../src/client/shell";
+import type { DshLayout } from "../src/dsh";
 import { setUnread, startUnreadPoll } from "../src/client/unread-store";
 
 // `apply` starts the page-lifetime unread poller; stop the one it started so
@@ -36,7 +38,7 @@ interface Registration {
   component: unknown;
 }
 
-function fakeSlots() {
+function fakeSlots(layout?: DshLayout) {
   const registrations: Registration[] = [];
   const injected: string[] = [];
   const ctx: DshClientContext = {
@@ -53,8 +55,39 @@ function fakeSlots() {
         return () => {};
       },
     },
+    ...(layout === undefined ? {} : { layout }),
   };
   return { registrations, injected, ctx };
+}
+
+/** The layout service as dsh offers it: a selection snapshot and a toggle. */
+function fakeLayout() {
+  let activePanelId: string | null = null;
+  const listeners = new Set<() => void>();
+  const selected: (string | null)[] = [];
+  let toggles = 0;
+  const layout: DshLayout = {
+    panelInfo: {
+      getSnapshot: () => ({ activePanelId }),
+      subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    },
+    selectPanel(panelId) {
+      selected.push(panelId);
+      activePanelId = panelId;
+      for (const listener of listeners) listener();
+    },
+    toggleSidebar() {
+      toggles += 1;
+    },
+  };
+  const select = (panelId: string | null) => {
+    activePanelId = panelId;
+    for (const listener of listeners) listener();
+  };
+  return { layout, selected, select, toggles: () => toggles };
 }
 
 function byName(registrations: Registration[], name: string): Registration[] {
@@ -66,7 +99,9 @@ describe("client apply", () => {
     const { ctx, registrations, injected } = fakeSlots();
     apply(ctx);
 
-    expect(inject).toEqual(["slots"]);
+    // `layout` is dsh's own ui-layout service: the rail follows the active tab
+    // and the sidebar collapses through it (M-197).
+    expect(inject).toEqual(["slots", "layout"]);
     // Two contributions per entry, and each waits for its own slot.
     expect(injected).toEqual(
       MULTICA_ENTRIES.flatMap(() => ["sidebar.panellist", "main"]),
@@ -98,6 +133,25 @@ describe("client apply", () => {
     for (const row of rows) expect(row.options.key).toBeUndefined();
     expect(new Set(rows.map((entry) => entry.options.id)).size).toBe(6);
     expect(rows[0]?.options.id).toBe(MULTICA_PANEL_ID);
+  });
+
+  it("binds the shell: the rail follows the active tab and MMX collapses the sidebar", () => {
+    const shell = fakeLayout();
+    const { ctx } = fakeSlots(shell.layout);
+    apply(ctx);
+
+    // The island's ask reaches the entry ids this module registered.
+    selectShellPanel("chat");
+    expect(shell.selected).toEqual(["multica-chat"]);
+
+    // The auto-collapse rides the same layout service: entering an MMX row
+    // collapses, leaving it restores.
+    shell.select(null);
+    const leaving = shell.toggles();
+    shell.select("multica-agents");
+    expect(shell.toggles()).toBe(leaving + 1);
+
+    bindShell(null);
   });
 
   it("addresses each rail row with a matching main cell", () => {

@@ -17,7 +17,8 @@ import {
   type IslandRoute,
 } from "./navigation";
 import { createIslandStorage } from "./storage";
-import { createTabsStore } from "./tabs";
+import { createTabsStore, familyOfRoute } from "./tabs";
+import { selectShellPanel } from "./shell";
 import { TabBar } from "./tab-bar";
 import { ProjectPicker } from "./project-picker";
 import { readProjectScope, writeProjectScope } from "./project-scope";
@@ -76,6 +77,8 @@ export interface IslandAppProps {
   problem: string | null;
   /** Entry the seat asked for; the board unless a deep link named one issue. */
   route?: IslandRoute;
+  /** True while a seat holds the island. */
+  attached?: boolean;
 }
 
 /**
@@ -89,9 +92,12 @@ export interface IslandAppProps {
 export function IslandBoot({
   portalHost,
   route,
+  attached = false,
 }: {
   portalHost: HTMLElement;
   route?: IslandRoute;
+  /** True while a seat holds the island; see `MountIslandOptions.attached`. */
+  attached?: boolean;
 }) {
   const [config, setConfig] = useState<IslandConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -137,6 +143,7 @@ export function IslandBoot({
       wsPath={config.wsPath}
       problem={config.problem}
       route={route}
+      attached={attached}
     />
   );
 }
@@ -148,6 +155,7 @@ export function IslandApp({
   wsPath,
   problem,
   route,
+  attached = false,
 }: IslandAppProps) {
   const storage = useMemo(() => createIslandStorage(), []);
   // The adapter is what the fork's Preferences page reads its Language row
@@ -193,6 +201,7 @@ export function IslandApp({
             wsPath={wsPath}
             problem={problem}
             route={route}
+            attached={attached}
           />
         </PortalContainerProvider>
       </CoreProvider>
@@ -228,11 +237,13 @@ function WorkspaceGate({
   wsPath,
   problem,
   route,
+  attached,
 }: {
   preferredSlug?: string;
   wsPath: string;
   problem: string | null;
   route?: IslandRoute;
+  attached: boolean;
 }) {
   const { workspaces, ready } = useWorkspaceList();
   const workspace = useMemo(() => {
@@ -274,6 +285,7 @@ function WorkspaceGate({
         wsPath={wsPath}
         problem={problem}
         route={route}
+        attached={attached}
       />
     </WorkspaceSlugProvider>
   );
@@ -287,9 +299,10 @@ function WorkspaceGate({
  * The rail row decides where an island opens; from there the fork's pages
  * navigate the way they do in the web app, so a link between two of these views
  * (an inbox row falling back to its issue, an agent's "message" link) lands on
- * the matching page instead of doing nothing. dsh gives a plugin no way to move
- * the shell's rail selection, so the row keeps marking the entry the reader came
- * through while the island follows the reader.
+ * the matching page instead of doing nothing. The island keeps the shell's rail
+ * selection on the row that owns the active tab's family (`selectShellPanel`),
+ * so a tab that moves the reader into another family moves the highlight with
+ * it (M-197).
  */
 function IslandPage({
   route,
@@ -331,12 +344,15 @@ export function IslandPages({
   wsPath,
   problem,
   route: entryRoute = BOARD_ROUTE,
+  attached = false,
 }: {
   slug: string;
   workspaceId: string;
   wsPath: string;
   problem: string | null;
   route?: IslandRoute;
+  /** True while a seat holds the island; the rail only follows a seated tab. */
+  attached?: boolean;
 }) {
   const storage = useMemo(() => createIslandStorage(), []);
   // One workspace, one tab set (M-173): the persisted key no longer varies by
@@ -386,6 +402,17 @@ export function IslandPages({
   const activeTab = tabsState.tabs.find((t) => t.id === tabsState.activeId) ?? null;
   const route: IslandRoute =
     activeTab !== null ? (parseIslandRoute(activeTab.url) ?? entryRoute) : entryRoute;
+
+  // The rail and the strip must never disagree (M-197): whatever the active
+  // tab shows — after a tab click, Back/Forward across tabs, a closed tab, or
+  // a restored session — the sidebar selects the row that owns its family.
+  // Only while a seat holds the island: the warm-up build has no seat, and the
+  // shell is showing whatever the reader left it on.
+  const family = familyOfRoute(route);
+  useEffect(() => {
+    if (!attached) return;
+    selectShellPanel(family);
+  }, [attached, family]);
 
   const viewStore = useState(() => createIssueViewStore("dsh-issues"))[0];
 

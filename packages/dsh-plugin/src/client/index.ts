@@ -3,6 +3,8 @@ import type { DshClientContext } from "../dsh";
 import { startIsland } from "./island";
 import type { IslandRoute } from "./navigation";
 import { FAMILY_ROOTS } from "./navigation";
+import { bindShell, startBoundSidebarAutoCollapse } from "./shell";
+import { familyOfRoute } from "./tabs";
 import {
   createRailIcon,
   createSeatComponent,
@@ -19,9 +21,9 @@ import { startUnreadPoll } from "./unread-store";
  * - `sidebar.panellist` (a `list`) renders one sidebar button per registration
  *   and addresses the matching `main` cell by list id. Each entry below is one
  *   of those rows; the sidebar owns the button, the label and the selection
- *   state, which is why the menu is five rows rather than a dropdown the plugin
+ *   state, which is why the menu is six rows rather than a dropdown the plugin
  *   would have to position inside someone else's column. The list has no
- *   grouping API, so the grouping is expressed by adjacent order (30–34) and a
+ *   grouping API, so the grouping is expressed by adjacent order (30–35) and a
  *   shared glyph family, and each label carries the product name because the
  *   collapsed rail shows only a glyph and a tooltip.
  * - `main` (a `keyed` slot) gets one cell per entry: the seat the React 19
@@ -32,6 +34,10 @@ import { startUnreadPoll } from "./unread-store";
  * does not render hidden and one MOCT group added. It is a rail row and not a
  * route inside another row because a settings page is a destination a reader
  * returns to, and the shell's rail is where destinations live.
+ *
+ * The rows are also the shell's record of which MMX view is showing: the island
+ * selects the row that owns the active tab's family (`client/shell.ts`), so the
+ * highlight can never disagree with the tab strip (M-197).
  */
 export interface MulticaEntry {
   /** `sidebar.panellist` list id, and the `main` cell key it addresses. */
@@ -90,8 +96,15 @@ export const MULTICA_PANEL_ID = "multica";
 /** First rail row's order; the entries follow in sequence. */
 const FIRST_ORDER = 30;
 
-/** dsh resolves `inject` before calling `apply`. */
-export const inject = ["slots"];
+/**
+ * Services dsh resolves before calling `apply`.
+ *
+ * `layout` is dsh's own ui-layout service: the package already declares that
+ * module as a client dependency, and injecting the service is what guarantees
+ * `ctx.layout` exists when `apply` binds it (M-197) instead of depending on
+ * which plugin was applied first.
+ */
+export const inject = ["slots", "layout"];
 
 let hostCreateElement: HostCreateElement | null = null;
 
@@ -113,6 +126,23 @@ export function apply(ctx: DshClientContext): void {
   // the store's own guard makes a repeated `apply` share it rather than start
   // a second timer.
   startUnreadPoll();
+
+  // The shell's own two surfaces this plugin keeps in step with the island
+  // (M-197): the rail row that must mark the active tab's family, and the
+  // sidebar that collapses while an MMX view is showing. One binding, read by
+  // the island and by the auto-collapse subscription below.
+  const layout = ctx.layout ?? null;
+  if (layout !== null) {
+    bindShell({
+      layout,
+      panelOfFamily: new Map(
+        MULTICA_ENTRIES.map((entry) => [familyOfRoute(entry.route), entry.id]),
+      ),
+    });
+    // Page-lifetime, like the rail dot's poller: `apply` returns void and the
+    // shell unloads a plugin with the page.
+    startBoundSidebarAutoCollapse();
+  }
 
   const createElement = hostCreateElement ?? (bundledCreateElement as HostCreateElement);
 

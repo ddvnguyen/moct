@@ -57,6 +57,31 @@ export interface DshSlotRegistration {
   label?: string;
 }
 
+/**
+ * The layout service's selection source (`ctx.layout.panelInfo`).
+ *
+ * A `HostObservable` in dsh's own terms: read the snapshot, subscribe to its
+ * invalidation. `activePanelId` is the selected rail row, `null` for the
+ * Conversation.
+ */
+export interface DshPanelInfo {
+  getSnapshot(): { readonly activePanelId: string | null };
+  subscribe(listener: () => void): () => void;
+}
+
+/**
+ * The layout service (`ctx.layout`, provided by ui-layout).
+ *
+ * Declared as the three members this plugin calls: the selection source, the
+ * panel selection itself, and the sidebar toggle. `selectPanel` throws for a
+ * `main` key that is not registered; the island's rail rows are.
+ */
+export interface DshLayout {
+  readonly panelInfo: DshPanelInfo;
+  selectPanel(panelId: string | null): void;
+  toggleSidebar(): void;
+}
+
 /** The browser half of a dsh plugin's context. */
 export interface DshClientContext {
   slots: {
@@ -64,6 +89,12 @@ export interface DshClientContext {
     inject(key: string, register: () => unknown): unknown;
     register(options: DshSlotRegistration, component: unknown): unknown;
   };
+  /**
+   * Panel geometry and selection, from dsh's ui-layout. Absent in a host built
+   * without it, which leaves the rail agreement and the auto-collapse inert
+   * (M-197) instead of failing the panel.
+   */
+  layout?: DshLayout;
 }
 
 /** The module values every dsh client bundle hands to the shell's loader. */

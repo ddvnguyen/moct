@@ -5,6 +5,7 @@ import type { StoreApi } from "zustand/vanilla";
 import type { TabsState } from "./tabs";
 import type { NavigationAdapter } from "../fork";
 import { useTabPresentation, ResourceLeadingVisual } from "../fork";
+import { tabLabel } from "./tab-label";
 
 export const headerTrailing = <div data-header-trailing="" />;
 
@@ -26,10 +27,17 @@ function TabItem({
   tabsStore: StoreApi<TabsState>;
 }) {
   const presentation = useTabPresentation(tab.url);
+  // An issue reads as `M-123` with its title in the tooltip; every other tab
+  // keeps the fork's own name and needs no tooltip (M-197).
+  const label = tabLabel(tab.url, presentation.title);
   return (
     <button
       ref={isActive ? activeRef : undefined}
       type="button"
+      title={label.tooltip}
+      // The strip's selected tab, marked for the shell's own readers and for
+      // the tests that walk it: the label alone cannot say which page shows.
+      data-active={isActive || undefined}
       onClick={() => tabsStore.getState().focusTab(tab.id)}
       onAuxClick={(e) => {
         if (e.button === 1) {
@@ -42,7 +50,7 @@ function TabItem({
       }`}
     >
       <ResourceLeadingVisual visual={presentation.visual} />
-      <span className="truncate">{presentation.title}</span>
+      <span className="truncate">{label.name}</span>
       <span
         role="button"
         aria-label="Close"
@@ -70,11 +78,11 @@ export function TabBar({
   const state = useStore(tabsStore);
   const tabs = state.tabs;
   const activeId = state.activeId;
-  const activeTab = tabs.find((t) => t.id === activeId) ?? null;
-  const activeIndex = activeTab ? activeTab.history.index : 0;
+  // One history for the whole window (M-197): Back and Forward cross tabs, so
+  // whether they have somewhere to go is the store's answer, not the active
+  // tab's own stack.
   const canGoBack = navigation.canGoBack?.() ?? false;
-  const canGoForward =
-    activeTab !== null && activeIndex < activeTab.history.stack.length - 1;
+  const canGoForward = state.canGoForward();
 
   const stripRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef<HTMLButtonElement>(null);
@@ -124,7 +132,13 @@ export function TabBar({
         ›
       </button>
       {projectPicker}
-      <div ref={stripRef} className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+      {/* `data-tab-strip` is the strip's own address: the tests walk it, and
+          nothing in the shell depends on the class names. */}
+      <div
+        ref={stripRef}
+        data-tab-strip=""
+        className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
+      >
         {tabs.map((tab) => (
           <TabItem
             key={tab.id}

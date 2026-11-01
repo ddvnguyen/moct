@@ -11,6 +11,8 @@ import {
   islandRouteKey,
   parseIslandRoute,
 } from "../src/client/navigation";
+import { createIslandStorage } from "../src/client/storage";
+import { createTabsStore } from "../src/client/tabs";
 
 describe("parseIslandRoute", () => {
   it("reads the board", () => {
@@ -201,5 +203,47 @@ describe("createIslandNavigation", () => {
     expect(chat.searchParams.get("session")).toBe("abc");
     chat.back();
     expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("createIslandNavigation over the window's history (M-197)", () => {
+  function tabs() {
+    const values = new Map<string, string>();
+    const backing = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+      key: (index: number) => [...values.keys()][index] ?? null,
+      get length() {
+        return values.size;
+      },
+    };
+    return createTabsStore(createIslandStorage(backing as any), "demo");
+  }
+
+  it("back crosses tabs and forward returns to the tab it left", () => {
+    const store = tabs();
+    const onChange = vi.fn();
+    const navigation = createIslandNavigation({ slug: "demo", tabs: store, onChange });
+    store.getState().openTab("/demo/issues");
+    store.getState().push("/demo/issues/MUL-1");
+    const agents = store.getState().openTab("/demo/agents");
+
+    navigation.back();
+    expect(store.getState().activeTab()?.url).toBe("/demo/issues/MUL-1");
+    expect(onChange).toHaveBeenLastCalledWith({ view: "issue", issueId: "MUL-1" });
+
+    navigation.forward?.();
+    expect(store.getState().activeId).toBe(agents);
+    expect(onChange).toHaveBeenLastCalledWith({ view: "agents" });
+  });
+
+  it("reports Back as available while the window has somewhere behind it", () => {
+    const store = tabs();
+    const navigation = createIslandNavigation({ slug: "demo", tabs: store, onChange: vi.fn() });
+    store.getState().openTab("/demo/issues");
+    expect(navigation.canGoBack?.()).toBe(false);
+    store.getState().push("/demo/issues/MUL-2");
+    expect(navigation.canGoBack?.()).toBe(true);
   });
 });
