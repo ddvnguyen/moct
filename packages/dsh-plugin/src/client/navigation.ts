@@ -1,6 +1,7 @@
 import type { NavigationAdapter } from "../fork";
 import type { StoreApi } from "zustand/vanilla";
 import type { TabsState } from "./tabs";
+import { resourceKeyForUrl } from "./tabs";
 
 /**
  * The island's own navigation, across the five places the sidebar menu opens.
@@ -210,6 +211,19 @@ export interface IslandNavigationOptions {
   onRefused?: (path: string) => void;
 }
 
+function focusExistingResourceTab(
+  tabs: StoreApi<TabsState>,
+  path: string,
+): void {
+  const state = tabs.getState();
+  const existing = state.tabs.find(
+    (tab) => resourceKeyForUrl(tab.url) === resourceKeyForUrl(path),
+  );
+  if (existing !== undefined && existing.id !== state.activeId) {
+    state.focusTab(existing.id);
+  }
+}
+
 export function createIslandNavigation({
   slug,
   route: initialRoute = BOARD_ROUTE,
@@ -236,6 +250,7 @@ export function createIslandNavigation({
       return;
     }
     if (tabs) {
+      focusExistingResourceTab(tabs, path);
       tabs.getState().push(path);
     }
     onChange?.(next);
@@ -248,6 +263,7 @@ export function createIslandNavigation({
       return;
     }
     if (tabs) {
+      focusExistingResourceTab(tabs, path);
       tabs.getState().replace(path);
     } else {
       // fallback: no-op history

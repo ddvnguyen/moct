@@ -18,6 +18,22 @@ import { useModalStore } from "../src/fork";
 import { resetIslandConfig } from "../src/client/config";
 import { zoomStore } from "../src/client/zoom-store";
 
+// The agent list virtualizes its rows; jsdom has no scroll viewport, so render
+// the complete row set while keeping the real list and detail components.
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({ count }: { count: number }) => ({
+    getVirtualItems: () =>
+      Array.from({ length: count }, (_, index) => ({
+        index,
+        key: index,
+        start: index * 64,
+        end: (index + 1) * 64,
+        size: 64,
+      })),
+    getTotalSize: () => count * 64,
+  }),
+}));
+
 /**
  * The island is a second React tree inside a shadow root, so these tests drive
  * it the way the shell does: mount into a host element and read the shadow DOM
@@ -93,11 +109,37 @@ const ISSUE = {
   updated_at: "2026-01-01T00:00:00Z",
 };
 
+const AGENT = {
+  id: "agent-1",
+  workspace_id: "ws-1",
+  runtime_id: "runtime-1",
+  name: "Test agent",
+  description: "",
+  instructions: "",
+  avatar_url: null,
+  runtime_mode: "local",
+  runtime_config: {},
+  custom_args: [],
+  visibility: "workspace",
+  permission_mode: "public_to",
+  invocation_targets: [{ target_type: "workspace", target_id: null }],
+  status: "idle",
+  max_concurrent_tasks: 1,
+  model: "",
+  owner_id: "user-1",
+  skills: [],
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+  archived_at: null,
+  archived_by: null,
+};
+
 function stubBackend(
   options: {
     workspaces?: unknown[];
     problem?: string | null;
     issues?: unknown[];
+    agents?: unknown[];
     /** Host-configured slug; `""` is an unconfigured host. */
     workspaceSlug?: string;
     projects?: unknown[];
@@ -199,7 +241,10 @@ function stubBackend(
     ) {
       return json([]);
     }
-    if (url.includes("assignee-frequency") || url.includes("/agents") || url.includes("/members")) {
+    if (url.includes("/agents")) {
+      return json(options.agents ?? []);
+    }
+    if (url.includes("assignee-frequency") || url.includes("/members")) {
       return json([]);
     }
     // Object-shaped singletons the board reads on mount.
@@ -350,6 +395,47 @@ describe("mountIsland", () => {
       expect(text).toContain(ISSUE.title);
     });
     expect(requests.some((url) => url.includes("issues"))).toBe(true);
+  });
+
+  it("keeps an agent route when its real Settings tab updates the view query", async () => {
+    stubBackend({ agents: [AGENT] });
+    const host = hostElement();
+    act(() =>
+      mountIsland(host, {
+        initialRoute: { view: "agents" },
+      }),
+    );
+
+    await settle(() => {
+      expect(host.shadowRoot?.textContent ?? "").toContain(AGENT.name);
+    });
+
+    const agentName = [...(host.shadowRoot?.querySelectorAll("span") ?? [])].find(
+      (span) => span.textContent?.trim() === AGENT.name,
+    );
+    expect(agentName).toBeDefined();
+    act(() => agentName?.dispatchEvent(new MouseEvent("click", { bubbles: true, button: 0 })));
+
+    await settle(() => {
+      expect(host.shadowRoot?.textContent ?? "").toContain("Assign work");
+    });
+
+    const settingsTab = [...(host.shadowRoot?.querySelectorAll<HTMLButtonElement>("[role='tab']") ?? [])].find(
+      (tab) => tab.textContent?.trim() === "Settings",
+    );
+    expect(settingsTab).toBeDefined();
+    act(() => settingsTab?.click());
+
+    await settle(() => {
+      const persisted = localStorage.getItem("multica.dsh.tabs.v1");
+      expect(persisted).not.toBeNull();
+      const state = JSON.parse(persisted ?? "{}").state as {
+        tabs: Array<{ id: string; url: string }>;
+        activeId: string;
+      };
+      const active = state.tabs.find((tab) => tab.id === state.activeId);
+      expect(active?.url).toBe(`/demo/agents/${AGENT.id}?view=general`);
+    });
   });
 
   // One row per rail entry: the island has to render each of the five views on

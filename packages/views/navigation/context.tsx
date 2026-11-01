@@ -45,6 +45,18 @@ export function NavigationProvider({
   const wrapped = useMemo<NavigationAdapter>(
     () => ({
       ...value,
+      // Adapters may expose location fields as getters over mutable router
+      // state. Object spread snapshots those fields here, so forward them as
+      // accessors and let each consumer read the current location at render.
+      get pathname() {
+        return value.pathname;
+      },
+      get searchParams() {
+        return value.searchParams;
+      },
+      get hash() {
+        return value.hash;
+      },
       push: (path: string) => startTransition(() => value.push(path)),
       replace: (path: string) => startTransition(() => value.replace(path)),
     }),

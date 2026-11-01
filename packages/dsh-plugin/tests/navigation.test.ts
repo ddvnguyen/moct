@@ -235,6 +235,24 @@ describe("createIslandNavigation over the window's history (M-197)", () => {
     expect(navigation.searchParams.get("view")).toBe("general");
   });
 
+  it("focuses an existing resource tab when a page pushes that resource", () => {
+    const store = tabs();
+    const agentsTab = store.getState().openTab("/demo/agents");
+    const agentTab = store.getState().openTab("/demo/agents/agent-7", {
+      activate: false,
+    });
+    const navigation = createIslandNavigation({ slug: "demo", tabs: store });
+
+    navigation.push("/demo/agents/agent-7?view=general");
+
+    expect(store.getState().activeId).toBe(agentTab);
+    expect(store.getState().activeUrl()).toBe(
+      "/demo/agents/agent-7?view=general",
+    );
+    expect(store.getState().tabs).toHaveLength(2);
+    expect(agentsTab).not.toBe(agentTab);
+  });
+
   it("back crosses tabs and forward returns to the tab it left", () => {
     const store = tabs();
     const onChange = vi.fn();
