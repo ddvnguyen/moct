@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { Button } from "@multica/ui/components/ui/button";
-import { Check, Copy } from "lucide-react";
+import { Check, Copy } from "@multica/ui/icons";
 
 import { mmxBuild } from "../../build-info";
 import { useT } from "../../i18n";

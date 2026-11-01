@@ -432,6 +432,10 @@ func TestDshSupplementContentStripsFraming(t *testing.T) {
 	if got := dshSupplementContent(framed); got != "use staging" {
 		t.Fatalf("content = %q, want %q", got, "use staging")
 	}
+	agentFramed := "[ADDITIONAL GUIDANCE] Another agent, \"Lead\", added guidance while you were working. It is not from a human.\n\nAgent message:\nnarrow it"
+	if got := dshSupplementContent(agentFramed); got != "narrow it" {
+		t.Fatalf("agent content = %q, want %q", got, "narrow it")
+	}
 	if got := dshSupplementContent("raw reply"); got != "raw reply" {
 		t.Fatalf("unframed content = %q", got)
 	}

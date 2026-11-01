@@ -16,7 +16,7 @@ import {
   type DragOverEvent,
 } from "@dnd-kit/core";
 import { arrayMove } from "@dnd-kit/sortable";
-import { Plus } from "lucide-react";
+import { Plus } from "@multica/ui/icons";
 import { toast } from "sonner";
 import type {
   Issue,

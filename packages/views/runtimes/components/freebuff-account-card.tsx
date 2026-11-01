@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Check, Copy, ExternalLink, Plus, Timer, Wallet } from "lucide-react";
+import { Check, Copy, ExternalLink, Plus, Timer, Wallet } from "@multica/ui/icons";
 import type { AgentRuntime, FreebuffAccount } from "@multica/core/types";
 // Deep import on purpose: the freebuff helpers live behind their own
 // entry point so a test that stubs the runtimes barrel does not have to

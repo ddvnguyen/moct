@@ -14,7 +14,7 @@ import { Button } from "@multica/ui/components/ui/button";
 import { Checkbox } from "@multica/ui/components/ui/checkbox";
 import { Input } from "@multica/ui/components/ui/input";
 import { cn } from "@multica/ui/lib/utils";
-import { Check, ClipboardList, HelpCircle, Loader2 } from "lucide-react";
+import { Check, ClipboardList, HelpCircle, Loader2 } from "@multica/ui/icons";
 import { ReadonlyContent } from "../../editor";
 import { useT } from "../../i18n";
 
