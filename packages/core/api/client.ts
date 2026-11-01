@@ -1,3 +1,4 @@
+import { DecisionDetailSchema, DecisionsPageSchema, type DecisionDetail, type DecisionsPage, type DecisionsParams } from "../decisions/schema";
 import type { ZodType } from "zod";
 import { AgentRuntimeSchema, EMPTY_RUNTIME } from "../runtimes/schema";
 import type { IssueWakeup, IssueWakeupInput, IssueWakeupSummaryRow, PausedWakeup, SystemWakeup, WakeupRun, WorkspaceSystemWakeup } from "../types/issue-wakeup";
@@ -1013,6 +1014,25 @@ export class ApiClient {
       return undefined as T;
     }
     return res.json() as Promise<T>;
+  }
+
+  async listDecisions(workspaceId: string, params: DecisionsParams = {}): Promise<DecisionsPage> {
+    const query = new URLSearchParams();
+    if (params.state) query.set("state", params.state);
+    if (params.project_id) query.set("project_id", params.project_id);
+    if (params.cursor) query.set("cursor", params.cursor);
+    if (params.limit !== undefined) query.set("limit", String(params.limit));
+    const raw = await this.fetch<unknown>(`/api/workspaces/${encodeURIComponent(workspaceId)}/decisions?${query}`);
+    const parsed = parseWithFallback<DecisionsPage | null>(raw, DecisionsPageSchema, null, { endpoint: "GET /api/workspaces/:id/decisions" });
+    if (!parsed) throw new Error("Invalid Decisions response");
+    return parsed;
+  }
+
+  async getDecisionDetail(workspaceId: string, kind: string, sourceId: string): Promise<DecisionDetail> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${encodeURIComponent(workspaceId)}/decisions/${encodeURIComponent(kind)}/${encodeURIComponent(sourceId)}`);
+    const parsed = parseWithFallback<DecisionDetail | null>(raw, DecisionDetailSchema, null, { endpoint: "GET /api/workspaces/:id/decisions/:kind/:sourceId" });
+    if (!parsed) throw new Error("Invalid Decision detail response");
+    return parsed;
   }
 
   // Auth

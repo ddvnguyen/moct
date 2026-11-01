@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
+import parityCases from "./__fixtures__/agent-question-cases.json";
 import type { TaskMessagePayload } from "../types/events";
 import {
   agentAnswerText,
@@ -201,4 +202,14 @@ describe("isAnsweredDraft", () => {
     expect(isAnsweredDraft({ selected: [0], text: "" })).toBe(true);
     expect(isAnsweredDraft({ selected: [], text: "ok" })).toBe(true);
   });
+});
+
+// Shared with the server projection test: both sides must agree on eligibility.
+describe("native decision parity", () => {
+  for (const entry of parityCases) {
+    it(entry.name, () => {
+      const messages = entry.messages.map((m) => ({ task_id: "task", issue_id: "issue", type: "text", ...m })) as TaskMessagePayload[];
+      expect(isAgentQuestionPending(latestAgentQuestion(messages), messages, entry.live, entry.delivered)).toBe(entry.pending);
+    });
+  }
 });

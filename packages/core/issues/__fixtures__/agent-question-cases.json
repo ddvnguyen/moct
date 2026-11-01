@@ -1,0 +1,414 @@
+[
+  {
+    "name": "parked ask",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Which checkout?"
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": true
+  },
+  {
+    "name": "later progress",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Which checkout?"
+            }
+          ]
+        }
+      },
+      {
+        "seq": 5
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "delivered answer",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Which checkout?"
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [
+      "2026-10-26T12:00:05Z"
+    ],
+    "pending": false
+  },
+  {
+    "name": "earlier steer",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Which checkout?"
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [
+      "2026-10-26T11:59:00Z"
+    ],
+    "pending": true
+  },
+  {
+    "name": "terminal run",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Which checkout?"
+            }
+          ]
+        }
+      }
+    ],
+    "live": false,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "missing timestamp",
+    "messages": [
+      {
+        "seq": 4,
+        "input": {
+          "questions": [
+            {
+              "question": "Which checkout?"
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "missing timestamp with steer",
+    "messages": [
+      {
+        "seq": 4,
+        "input": {
+          "questions": [
+            {
+              "question": "Which checkout?"
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [
+      "2026-10-26T12:00:05Z"
+    ],
+    "pending": false
+  },
+  {
+    "name": "no ask",
+    "messages": [
+      {
+        "seq": 1
+      },
+      {
+        "seq": 2
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "newest ask",
+    "messages": [
+      {
+        "seq": 1,
+        "created_at": "2026-10-26T11:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Approve?",
+              "intent": {
+                "kind": "plan-review",
+                "approve": "Approve"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Which checkout?"
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": true
+  },
+  {
+    "name": "blank prompt",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "  "
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "valid sibling",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "id": "empty"
+            },
+            {
+              "question": "Which branch?"
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": true
+  },
+  {
+    "name": "malformed question list",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": "not a list"
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "undefined input",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z"
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "null input",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": null
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "non-question input",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "command": "pnpm test"
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "blank unicode prompt",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": " 　"
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "question with invalid option",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick",
+              "options": [
+                {
+                  "label": "  "
+                },
+                {
+                  "label": "A",
+                  "description": " "
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": true
+  },
+  {
+    "name": "later progress after older plan",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Which checkout?"
+            }
+          ]
+        }
+      },
+      {
+        "seq": 1,
+        "created_at": "2026-10-26T11:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Approve?",
+              "intent": {
+                "kind": "plan-review",
+                "approve": "Approve"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "seq": 9
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": false
+  },
+  {
+    "name": "same sequence non-question",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Ready?"
+            }
+          ]
+        }
+      },
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:01Z"
+      }
+    ],
+    "live": true,
+    "delivered": [],
+    "pending": true
+  },
+  {
+    "name": "same millisecond delivery",
+    "messages": [
+      {
+        "seq": 4,
+        "created_at": "2026-10-26T12:00:00.000800Z",
+        "input": {
+          "questions": [
+            {
+              "question": "Ready?"
+            }
+          ]
+        }
+      }
+    ],
+    "live": true,
+    "delivered": [
+      "2026-10-26T12:00:00.000100Z"
+    ],
+    "pending": false
+  }
+]

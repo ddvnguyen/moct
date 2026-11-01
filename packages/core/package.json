@@ -38,6 +38,7 @@
     "./issue-workflows/queries": "./issue-workflows/queries.ts",
     "./issue-workflows/hooks": "./issue-workflows/hooks.ts",
     "./issue-workflows/mutations": "./issue-workflows/mutations.ts",
+    "./decisions": "./decisions/index.ts",
     "./issues": "./issues/index.ts",
     "./issues/batch": "./issues/batch.ts",
     "./issues/canonical-id": "./issues/canonical-id.ts",
