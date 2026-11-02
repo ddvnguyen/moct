@@ -23,6 +23,7 @@ const launchHeader = "x-freebuff-launch-id"
 type Client struct {
 	base     string
 	launchID string
+	pid      int
 	http     *http.Client
 }
 
@@ -31,6 +32,7 @@ func NewClient(ready Ready, launchID string) *Client {
 	return &Client{
 		base:     fmt.Sprintf("http://127.0.0.1:%d", ready.Port),
 		launchID: launchID,
+		pid:      ready.PID,
 		http:     &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -46,6 +48,9 @@ func NewClientForURL(base, launchID string) *Client {
 // LaunchID returns the process-local credential the bridge must send when it
 // calls this orchestrator. Callers must keep it in memory and task-local env.
 func (c *Client) LaunchID() string { return c.launchID }
+
+// PID is the process identifier announced by the managed orchestrator.
+func (c *Client) PID() int { return c.pid }
 
 // APIError is a non-2xx answer from the orchestrator.
 type APIError struct {

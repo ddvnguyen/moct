@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,6 +87,7 @@ func (f *fakeAccount) AuthStatus(context.Context) (freebuffrt.AuthStatus, error)
 }
 
 func (f *fakeAccount) LaunchID() string { return f.launchID }
+func (f *fakeAccount) PID() int         { return 123 }
 
 func TestManagedFreebuffDesktopEnvOverridesUserValues(t *testing.T) {
 	env := map[string]string{
@@ -351,8 +353,11 @@ func TestFreebuffDesktopRemovalWaitsForActiveTaskAndAcknowledgesRemoval(t *testi
 	}
 	stopped := false
 	fx.daemon.freebuffDesktopInstances.Store(freebuffDesktopLoginKey(rt.ID, "a1"), &freebuffDesktopInstance{
-		client: &fakeAccount{statuses: []freebuffrt.AuthStatus{{}}}, stop: func() { stopped = true },
+		client: &fakeAccount{statuses: []freebuffrt.AuthStatus{{}}, launchID: "test-launch"}, stop: func() { stopped = true }, connected: true,
 	})
+	if err := fx.daemon.writeFreebuffDesktopRegistryLocked(); err != nil {
+		t.Fatal(err)
+	}
 	fx.pending = `{"accounts":[{"id":"a1","state":"removing","active":true}]}`
 	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
 	if stopped {
@@ -365,6 +370,10 @@ func TestFreebuffDesktopRemovalWaitsForActiveTaskAndAcknowledgesRemoval(t *testi
 	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
 	if !stopped {
 		t.Fatal("account orchestrator was not stopped on removal")
+	}
+	registry, err := os.ReadFile(filepath.Join(profiles, "registry.json"))
+	if err != nil || strings.TrimSpace(string(registry)) != "[]" {
+		t.Fatalf("registry after removal: %s (%v)", registry, err)
 	}
 	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("account state still exists, stat error=%v", err)

@@ -22,8 +22,10 @@ func applyManagedFreebuffDesktopEnv(env map[string]string, endpoint, dir, launch
 }
 
 type freebuffDesktopInstance struct {
-	client freebuffAccount
-	stop   func()
+	client    freebuffAccount
+	stop      func()
+	connected bool
+	label     string
 }
 
 func freebuffDesktopLoginKey(runtimeID, accountID string) string { return runtimeID + "/" + accountID }
@@ -42,6 +44,7 @@ func (d *Daemon) ensureFreebuffDesktopInstance(ctx context.Context, rt Runtime, 
 		}
 		inst.stop()
 		d.freebuffDesktopInstances.Delete(key)
+		d.publishFreebuffDesktopLocked()
 	}
 	client, stop, err := startFreebuffAccount(d.daemonLifecycleCtx(), rt.ID, accountID)
 	if err != nil {
@@ -76,6 +79,9 @@ func (d *Daemon) freebuffDesktopRuntimes() []Runtime {
 
 func (d *Daemon) freebuffDesktopLoop(ctx context.Context) {
 	defer d.stopFreebuffDesktopInstances()
+	d.freebuffDesktopInstanceMu.Lock()
+	d.publishFreebuffDesktopLocked()
+	d.freebuffDesktopInstanceMu.Unlock()
 	pollTicker := time.NewTicker(freebuffDesktopConnectPollInterval)
 	defer pollTicker.Stop()
 	statusTicker := time.NewTicker(freebuffDesktopStatusInterval)
@@ -150,6 +156,7 @@ func (d *Daemon) syncFreebuffDesktopRuntime(ctx context.Context, rt Runtime) {
 			if v, ok := d.freebuffDesktopInstances.Load(key); ok {
 				v.(*freebuffDesktopInstance).stop()
 				d.freebuffDesktopInstances.Delete(key)
+				d.publishFreebuffDesktopLocked()
 			}
 			d.freebuffDesktopInstanceMu.Unlock()
 			cfg := agent.Config{RuntimeID: rt.ID}
@@ -170,6 +177,7 @@ func (d *Daemon) stopFreebuffDesktopInstances() {
 		d.freebuffDesktopInstances.Delete(key)
 		return true
 	})
+	d.publishFreebuffDesktopLocked()
 }
 
 func freebuffDesktopAccountDir(rt Runtime, accountID string) (string, error) {
@@ -194,6 +202,7 @@ func (d *Daemon) handleFreebuffDesktopLogin(ctx context.Context, rt Runtime, acc
 	}
 
 	if st, err := client.AuthStatus(runCtx); err == nil && st.Authed {
+		d.setFreebuffDesktopConnected(rt, accountID, client, true, freebuffAccountLabel(st.User))
 		dir, err := freebuffDesktopAccountDir(rt, accountID)
 		if err != nil {
 			fail(err.Error())
@@ -209,6 +218,7 @@ func (d *Daemon) handleFreebuffDesktopLogin(ctx context.Context, rt Runtime, acc
 		})
 		return
 	}
+	d.setFreebuffDesktopConnected(rt, accountID, client, false, "")
 
 	login, err := client.StartLogin(runCtx)
 	if err != nil {
@@ -255,6 +265,7 @@ func (d *Daemon) handleFreebuffDesktopLogin(ctx context.Context, rt Runtime, acc
 				continue
 			}
 			if st.Authed {
+				d.setFreebuffDesktopConnected(rt, accountID, client, true, freebuffAccountLabel(st.User))
 				dir, err := freebuffDesktopAccountDir(rt, accountID)
 				if err != nil {
 					fail(err.Error())
@@ -336,6 +347,7 @@ func (d *Daemon) reportFreebuffDesktopAccounts(ctx context.Context, rt Runtime) 
 		st, err := client.AuthStatus(statusCtx)
 		cancel()
 		if err != nil {
+			d.setFreebuffDesktopConnected(rt, id, client, false, "")
 			d.logger.Debug("freebuff-desktop auth status failed", "runtime_id", rt.ID, "account_id", id, "error", err)
 			entries[len(entries)-1] = map[string]any{"id": id, "state": "failed", "error": "Freebuff Desktop instance unavailable"}
 			continue
@@ -349,6 +361,7 @@ func (d *Daemon) reportFreebuffDesktopAccounts(ctx context.Context, rt Runtime) 
 			entry["state"] = "connected"
 			entry["label"] = freebuffAccountLabel(st.User)
 		}
+		d.setFreebuffDesktopConnected(rt, id, client, st.Authed, freebuffAccountLabel(st.User))
 		entries[len(entries)-1] = entry
 	}
 	d.reportFreebuffDesktopSnapshot(ctx, rt, entries)
