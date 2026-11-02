@@ -8,9 +8,13 @@ import {
   boundSessionId,
   disabledTooltip,
   folderForSelection,
+  isNoSessionSurfaceError,
   folderOfProjectResources,
+  NO_SESSION_SURFACE_NOTE,
   planSidebarOpen,
+  sessionSurfaceMounted,
   workspaceForFolder,
+  describe,
   type OpenIntent,
   type SidebarRightLike,
 } from "./shell-link";
@@ -124,7 +128,15 @@ function ShellButtonsInner({
       );
       setNote(null);
     } catch (cause: unknown) {
-      setNote(cause instanceof Error ? cause.message : String(cause));
+      // The M-159 no-session throw is a shell state, not a crash: say why like
+      // the disabled buttons do instead of erroring the page.
+      setNote(
+        isNoSessionSurfaceError(cause)
+          ? describe("no-session")
+          : cause instanceof Error
+            ? cause.message
+            : String(cause),
+      );
     } finally {
       setBusy(false);
     }
@@ -157,7 +169,7 @@ function ShellButtonsInner({
       >
         Terminal
       </button>
-      <SidebarToggle sidebarRight={shell.sidebarRight} />
+      <SidebarToggle sidebarRight={shell.sidebarRight} notify={setNote} />
       {note !== null && (
         // A failed open is a shell fact the reader should see, not a dialog.
         <span data-shell-note="" className="text-caption text-muted-foreground">
@@ -168,7 +180,13 @@ function ShellButtonsInner({
   );
 }
 
-function SidebarToggle({ sidebarRight }: { sidebarRight: SidebarRightLike | null }) {
+function SidebarToggle({
+  sidebarRight,
+  notify,
+}: {
+  sidebarRight: SidebarRightLike | null;
+  notify: (note: string) => void;
+}) {
   const [expanded, setExpanded] = useState<boolean>(() => {
     try {
       return sidebarRight?.isExpanded() ?? false;
@@ -177,20 +195,41 @@ function SidebarToggle({ sidebarRight }: { sidebarRight: SidebarRightLike | null
     }
   });
   if (sidebarRight === null) return null;
+  // The same no-session knowledge the disabled-tooltip logic already has: the
+  // face throws for every access while no session surface is mounted, so the
+  // toggle reads as a disabled button (with the explanatory title) there —
+  // MMX owning the main column is the situation it explains.
+  const surfaceMounted = sessionSurfaceMounted(sidebarRight);
+  const title = surfaceMounted
+    ? expanded
+      ? "Hide the dsh sidebar"
+      : "Show the dsh sidebar"
+    : NO_SESSION_SURFACE_NOTE;
   return (
     <button
       type="button"
       data-shell-button="toggle"
-      title={expanded ? "Hide the dsh sidebar" : "Show the dsh sidebar"}
+      disabled={!surfaceMounted}
+      title={title}
       className={shellButtonClassName}
       onClick={() => {
-        sidebarRight.toggleExpanded();
-        // The face has no expanded observable; the toggler's own click is the
-        // state change, and the next mount reconciles through `isExpanded()`.
-        setExpanded((current) => !current);
+        try {
+          sidebarRight.toggleExpanded();
+          // The face has no expanded observable; the toggler's own click is
+          // the state change, and the next mount reconciles via `isExpanded()`.
+          setExpanded((current) => !current);
+        } catch (cause) {
+          if (isNoSessionSurfaceError(cause)) {
+            notify(describe("no-session"));
+            return;
+          }
+          // Anything else is a real failure: state may not have changed, so
+          // leave the optimistic flip alone and surface it like the opens do.
+          notify(cause instanceof Error ? cause.message : String(cause));
+        }
       }}
     >
-      {expanded ? "Collapse" : "Expand"}
+      {surfaceMounted && expanded ? "Collapse" : "Expand"}
     </button>
   );
 }

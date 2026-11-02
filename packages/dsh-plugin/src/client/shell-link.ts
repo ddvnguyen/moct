@@ -100,14 +100,58 @@ export function folderForSelection(
   return { folder: fallback === "" ? null : fallback, reason: fallback === "" ? "no-folder" : "default" };
 }
 
+/**
+ * Whether the dsh sidebar has a session surface its commands can act on.
+ *
+ * The controller's own writes (`require()` in the ui-sidebar-right service)
+ * throw `no session surface is mounted` precisely when the mounted snapshot
+ * carries no Session, so this is the decision the buttons make instead of
+ * re-throwing: a false answer predicts the next write's throw. Reads stay
+ * available either way — `isExpanded` answers for the no-session case —
+ * which is why only writes check.
+ */
+export function sessionSurfaceMounted(
+  sidebarRight: { mounted: { getSnapshot(): string | undefined } } | null | undefined,
+): boolean {
+  return sidebarRight?.mounted.getSnapshot() !== undefined;
+}
+
+/** The words the dsh sidebar face rejects a write with when no surface is mounted. */
+export const SIDEBAR_NO_SESSION_MESSAGE = "no session surface is mounted";
+
+/**
+ * Whether an open or toggle died on exactly the no-session-surface state.
+ *
+ * Checked after the call, because a session can leave between the pre-check
+ * and the click; both outcomes mean the same user-facing note, so the caller
+ * maps this to the `no-session` tooltip copy instead of the raw error text.
+ */
+export function isNoSessionSurfaceError(cause: unknown): boolean {
+  return cause instanceof Error && cause.message.includes(SIDEBAR_NO_SESSION_MESSAGE);
+}
+
+export type DisabledReason = "project" | "default" | "project-no-folder" | "no-folder" | "no-session";
+
+/** The no-session copy the disabled toggle and a failed open both surface. */
+export const NO_SESSION_SURFACE_NOTE =
+  "MMX owns the main column, so the dsh sidebar has no session to open tabs in";
+
+/**
+ * The full notebook's copy for one reason, the way the disabled state reads.
+ *
+ * The M-159 no-session throw is shell state, not a glitch — MMX owning the
+ * main column leaves the sidebar with no session surface — so it says why the
+ * way the disabled buttons do, instead of the controller's raw error text
+ * leaking into the header.
+ */
+export function describe(reason: DisabledReason, folder: string | null = null): string {
+  if (reason === "no-session") return NO_SESSION_SURFACE_NOTE;
+  return disabledTooltip(reason, folder);
+}
+
 /** The tooltip for a disabled pair of buttons. */
 export function disabledTooltip(
-  reason:
-    | "project"
-    | "default"
-    | "project-no-folder"
-    | "no-folder"
-    | "no-session",
+  reason: DisabledReason,
   folder: string | null,
 ): string {
   switch (reason) {

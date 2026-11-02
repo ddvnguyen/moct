@@ -6,11 +6,15 @@
 import { describe, expect, it } from "vitest";
 import {
   boundSessionId,
+  describe as describeReason,
   disabledTooltip,
   folderForSelection,
   folderOfProjectResources,
+  isNoSessionSurfaceError,
   normalizePath,
+  NO_SESSION_SURFACE_NOTE,
   planSidebarOpen,
+  sessionSurfaceMounted,
   workspaceForFolder,
   type ProjectResourceLike,
   type WorkspaceLike,
@@ -141,6 +145,34 @@ describe("planSidebarOpen", () => {
     expect(
       planSidebarOpen({ hasHostPanel: false, boundSessionId: "s-1", mountedSessionId: undefined, tabKind: "files" }),
     ).toEqual({ kind: "fallback", tabKind: "files", selectFirst: true, sessionId: "s-1" });
+  });
+});
+
+describe("sessionSurfaceMounted", () => {
+  it("is mounted only when the snapshot carries a Session", () => {
+    expect(sessionSurfaceMounted({ mounted: { getSnapshot: () => "s-1" } })).toBe(true);
+    expect(sessionSurfaceMounted({ mounted: { getSnapshot: () => undefined } })).toBe(false);
+  });
+
+  it("answers false when there is no sidebar at all", () => {
+    expect(sessionSurfaceMounted(null)).toBe(false);
+    expect(sessionSurfaceMounted(undefined)).toBe(false);
+  });
+});
+
+describe("isNoSessionSurfaceError", () => {
+  it("matches the dsh face's no-session write rejection", () => {
+    expect(
+      isNoSessionSurfaceError(new Error("sidebarRight: no session surface is mounted")),
+    ).toBe(true);
+    expect(isNoSessionSurfaceError(new Error("openTab failed: boom"))).toBe(false);
+    expect(isNoSessionSurfaceError("not an error")).toBe(false);
+  });
+});
+
+describe("describe", () => {
+  it("explains no-session for a folder the reader follows into dsh", () => {
+    expect(describeReason("no-session")).toBe(NO_SESSION_SURFACE_NOTE);
   });
 });
 

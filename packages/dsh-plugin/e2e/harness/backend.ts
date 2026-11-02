@@ -145,6 +145,8 @@ export interface BackendOptions {
   workspaces?: unknown[];
   /** A boot problem the island renders instead of the app. */
   problem?: string | null;
+  /** The folder the "All projects" default addresses (M-159); empty means none. */
+  workspaceFolder?: string;
 }
 
 declare global {
@@ -182,9 +184,12 @@ export function installBackend(options: BackendOptions = {}): void {
     if (url.startsWith("/multica/config")) {
       // M-173: the host's slug is the only source the WorkspaceGate reads;
       // an empty slug boots every page into the no-workspace boundary.
+      // M-159: workspaceFolder is the "All projects" default the header's
+      // Files/Terminal buttons address; the shell harness page names/srv/demo.
       return json({
         wsPath: "/multica/ws",
         workspaceSlug: "demo",
+        workspaceFolder: options.workspaceFolder ?? "",
         problem: options.problem ?? null,
       });
     }
