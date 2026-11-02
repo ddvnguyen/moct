@@ -10,18 +10,20 @@ import { defineConfig } from "@playwright/test";
  * apart there. The dev server is the harness vite config; nothing else must
  * be running.
  */
+const port = Number(process.env.HARNESS_PORT ?? 4173);
+
 export default defineConfig({
   testDir: "./e2e",
   timeout: 60_000,
   workers: 1,
   retries: 0,
   use: {
-    baseURL: "http://127.0.0.1:4173",
+    baseURL: `http://127.0.0.1:${port}`,
     headless: true,
   },
   webServer: {
     command: "pnpm exec vite --config e2e/vite.harness.config.ts",
-    url: "http://127.0.0.1:4173",
+    url: `http://127.0.0.1:${port}`,
     reuseExistingServer: true,
     timeout: 60_000,
   },

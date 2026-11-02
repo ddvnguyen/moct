@@ -236,6 +236,7 @@ function TabItem({
   tab,
   isActive,
   isOnly,
+  isDragging,
   activeRef,
   tabsStore,
   openContextMenu,
@@ -243,6 +244,8 @@ function TabItem({
   tab: { id: string; url: string; pinned?: boolean };
   isActive: boolean;
   isOnly: boolean;
+  /** Strip-owned drag state: this tab is the one being dragged (M-174). */
+  isDragging: boolean;
   activeRef: React.RefObject<HTMLButtonElement | null> | null;
   tabsStore: StoreApi<TabsState>;
   /** Context-menu host above `TabItem` (strip-level placement state). */
@@ -265,95 +268,6 @@ function TabItem({
     tabsStore.getState().closeTab(tab.id);
   };
 
-  // Drag-to-reorder (M-174). The store's `moveTab` clamps the drop inside
-  // the pinned / unpinned zones, so this handler never has to know about
-  // them. A pointer press that never crosses the threshold stays a click.
-  const dragState = useRef<{
-    pointerId: number;
-    startX: number;
-    startY: number;
-    dragTarget: HTMLElement | null; // the strip, when capture is held on it
-  } | null>(null);
-  const [dragging, setDragging] = useState(false);
-
-  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (e.button !== 0) return;
-    if ((e.target as HTMLElement).closest('[role="button"][aria-label]')) {
-      // A knob (Pin / Close) owns the press, not the tab.
-      return;
-    }
-    dragState.current = {
-      pointerId: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      dragTarget: null,
-    };
-  };
-
-  const handlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
-    const drag = dragState.current;
-    if (drag === null || e.pointerId !== drag.pointerId) return;
-    if (
-      !drag.dragTarget &&
-      Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < 4
-    ) {
-      return;
-    }
-    const strip = drag.dragTarget ?? e.currentTarget.closest("[data-tab-strip]");
-    if (strip === null) {
-      dragState.current = null;
-      setDragging(false);
-      return;
-    }
-    // Hold capture on the strip once a real drag starts, so the moves keep
-    // arriving when the pointer leaves the pressed tab (and edge-scroll at
-    // the strip's ends stays possible later if the cap is ever lifted).
-    if (drag.dragTarget === null) {
-      try {
-        strip.setPointerCapture(e.pointerId);
-      } catch {
-        // Capture is an optimization here, not a requirement: without it a
-        // pointer that leaves the strip ends the drag on the next move.
-      }
-      drag.dragTarget = strip;
-      setDragging(true);
-    }
-    // Drop-before rule: land before the first tab whose midpoint the
-    // pointer has passed; past the last midpoint, land at the end.
-    const s = tabsStore.getState();
-    const fromIndex = s.tabs.findIndex((t) => t.id === tab.id);
-    if (fromIndex < 0) return;
-    let targetIndex = s.tabs.length - 1;
-    const rows = strip.querySelectorAll<HTMLElement>("[data-tab-id]");
-    for (const row of rows) {
-      const rect = row.getBoundingClientRect();
-      if (e.clientX < rect.left + rect.width / 2) {
-        const rowId = row.getAttribute("data-tab-id");
-        const rowIndex = s.tabs.findIndex((t) => t.id === rowId);
-        if (rowIndex >= 0) targetIndex = rowIndex;
-        break;
-      }
-    }
-    // `moveTab` removes-then-inserts, so a rightward drag targeting the
-    // hovered tab's slot must drop one narrower — before it, not through it.
-    const toIndex = fromIndex < targetIndex ? targetIndex - 1 : targetIndex;
-    s.moveTab(fromIndex, toIndex);
-  };
-
-  const endDrag = (e: React.PointerEvent<HTMLButtonElement>) => {
-    const drag = dragState.current;
-    if (drag === null) return;
-    if (drag.dragTarget !== null) {
-      try {
-        drag.dragTarget.releasePointerCapture(e.pointerId);
-      } catch {
-        // Already released by the browser on pointerup.
-      }
-    }
-    dragState.current = null;
-    setDragging(false);
-  };
-
   return (
     <div
       data-tab-id={tab.id}
@@ -364,7 +278,7 @@ function TabItem({
         type="button"
         title={label.tooltip}
         data-active={isActive || undefined}
-        data-dragging={dragging || undefined}
+        data-dragging={isDragging || undefined}
         onClick={() => tabsStore.getState().focusTab(tab.id)}
         onAuxClick={(e) => {
           if (e.button === 1 && showCloseButton) {
@@ -376,16 +290,12 @@ function TabItem({
           e.preventDefault();
           openContextMenu({ x: e.clientX, y: e.clientY }, tab.id);
         }}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
         className={cn(
           "group relative flex size-full min-w-0 items-center gap-1.5 px-2.5 pb-1 text-caption transition-colors select-none cursor-default",
           isActive
             ? "font-medium text-foreground"
             : "text-muted-foreground hover:text-sidebar-accent-foreground",
-          dragging && "opacity-60",
+          isDragging && "opacity-60",
         )}
       >
         <ResourceLeadingVisual visual={presentation.visual} />
@@ -528,6 +438,106 @@ export function TabBar({
   const canGoBack = navigation.canGoBack?.() ?? false;
   const canGoForward = state.canGoForward();
 
+  // Drag-to-reorder (M-174). The drag lives on the strip, not the pressed
+  // tab: once capture engages the browser retargets every pointer event to
+  // the strip, so handlers a level below go silent mid-drag (a tab would
+  // freeze in its dragging state and never reorder). The drop order lives
+  // in the store: `moveTab` clamps into the pinned / unpinned zones and
+  // removes-then-inserts, so a rightward drag targeting the hovered tab's
+  // slot must drop one narrower — before it, not through it.
+  const dragRef = useRef<{
+    pointerId: number;
+    tabId: string;
+    startX: number;
+    startY: number;
+    engaged: boolean;
+  } | null>(null);
+  const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
+
+  const endStripDrag = () => {
+    dragRef.current = null;
+    setDraggingTabId(null);
+  };
+
+  const handleStripPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest('[role="button"][aria-label]')) {
+      // A knob (Pin / Close) owns the press, not the tab.
+      return;
+    }
+    const row = (e.target as HTMLElement).closest<HTMLElement>("[data-tab-id]");
+    const tabId = row?.getAttribute("data-tab-id");
+    if (!tabId) return;
+    dragRef.current = {
+      pointerId: e.pointerId,
+      tabId,
+      startX: e.clientX,
+      startY: e.clientY,
+      engaged: false,
+    };
+  };
+
+  const handleStripPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (drag === null || e.pointerId !== drag.pointerId) return;
+    if (
+      !drag.engaged &&
+      Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < 4
+    ) {
+      return; // a press that never crosses the threshold stays a click
+    }
+    // Hold capture on the strip once a real drag starts, so the moves keep
+    // arriving when the pointer leaves the strip's rows (edge-scroll at
+    // the strip's ends stays possible later if the cap is ever lifted).
+    if (!drag.engaged) {
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // Capture is an optimization here, not a requirement: without it a
+        // pointer that leaves the strip ends the drag on the next move.
+      }
+      drag.engaged = true;
+      setDraggingTabId(drag.tabId);
+    }
+    const strip = e.currentTarget;
+    // Drop-before rule: land before the first tab whose midpoint the
+    // pointer has passed; past the last midpoint, land at the end. The
+    // slot is pre-removal (0..tabs.length), and `toIndex` maps it into the
+    // post-removal index `moveTab` consumes: initialising the target at
+    // `tabs.length - 1` read the trailing slot one short, so dragging past
+    // every midpoint never reached the end.
+    const s = tabsStore.getState();
+    const fromIndex = s.tabs.findIndex((t) => t.id === drag.tabId);
+    if (fromIndex < 0) {
+      endStripDrag();
+      return;
+    }
+    let targetIndex = s.tabs.length;
+    const rows = strip.querySelectorAll<HTMLElement>("[data-tab-id]");
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect();
+      if (e.clientX < rect.left + rect.width / 2) {
+        const rowId = row.getAttribute("data-tab-id");
+        const rowIndex = s.tabs.findIndex((t) => t.id === rowId);
+        if (rowIndex >= 0) targetIndex = rowIndex;
+        break;
+      }
+    }
+    const toIndex = fromIndex < targetIndex ? targetIndex - 1 : targetIndex;
+    if (fromIndex !== toIndex) s.moveTab(fromIndex, toIndex);
+  };
+
+  const handleStripPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (drag === null || e.pointerId !== drag.pointerId) return;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // Already released by the browser on pointerup.
+    }
+    endStripDrag();
+  };
+
   const stripRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef<HTMLButtonElement>(null);
 
@@ -591,6 +601,10 @@ export function TabBar({
       <div
         ref={stripRef}
         data-tab-strip=""
+        onPointerDown={handleStripPointerDown}
+        onPointerMove={handleStripPointerMove}
+        onPointerUp={handleStripPointerUp}
+        onPointerCancel={handleStripPointerUp}
         className="no-scrollbar flex h-full min-w-0 flex-1 items-end overflow-x-auto overflow-y-hidden overscroll-x-contain px-4"
       >
         {tabs.map((tab) => (
@@ -599,6 +613,7 @@ export function TabBar({
             tab={tab}
             isActive={tab.id === activeId}
             isOnly={tabs.length === 1}
+            isDragging={draggingTabId === tab.id}
             activeRef={tab.id === activeId ? activeRef : null}
             tabsStore={tabsStore}
             openContextMenu={(at, tabId) => {

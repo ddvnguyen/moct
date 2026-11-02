@@ -180,9 +180,11 @@ export function installBackend(options: BackendOptions = {}): void {
     const path = url.split("?")[0] ?? "";
 
     if (url.startsWith("/multica/config")) {
+      // M-173: the host's slug is the only source the WorkspaceGate reads;
+      // an empty slug boots every page into the no-workspace boundary.
       return json({
         wsPath: "/multica/ws",
-        workspaceSlug: "",
+        workspaceSlug: "demo",
         problem: options.problem ?? null,
       });
     }

@@ -28,7 +28,9 @@ export default defineConfig({
     __MMX_BUILD__: JSON.stringify(mmxBuild),
   },
   server: {
-    port: 4173,
+    // HARNESS_PORT lets a second checkout run the suite when another copy
+    // already holds 4173 (strictPort keeps collisions loud by default).
+    port: Number(process.env.HARNESS_PORT ?? 4173),
     strictPort: true,
     host: "127.0.0.1",
   },
