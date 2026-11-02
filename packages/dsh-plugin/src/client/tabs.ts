@@ -1,6 +1,53 @@
 import { createStore, type StoreApi } from "zustand/vanilla";
 import { createJSONStorage, persist } from "zustand/middleware";
 import type { IslandStorage } from "./storage";
+
+/**
+ * One captured scroll offset (desktop 0.7.2 parity: the platform's
+ * `ScrollRestorationEntry`). `contentKey` is optional only so external
+ * capture sources can carry a content fingerprint; plain containers leave
+ * it out and compare by identity.
+ */
+export interface MementoScrollEntry {
+  top: number;
+  height: number;
+  contentKey?: string;
+}
+
+/**
+ * A tab's memento: what a re-mount of its views should come back as.
+ *
+ * Both maps are keyed `${routeKey}::${containerKey}` — scoping by route so
+ * in-tab Back/Forward restore each route's own state and same-named
+ * containers on different routes never collide (desktop 0.7.2 semantics).
+ * `scroll` is captured from the DOM before a tab or its route goes away;
+ * `view` is written by views through the restoration adapter at the moment
+ * their restorable state changes.
+ */
+export interface TabMemento {
+  scroll: Record<string, MementoScrollEntry>;
+  view: Record<string, string>;
+}
+
+export function emptyMemento(): TabMemento {
+  return { scroll: {}, view: {} };
+}
+
+export function scrollMementoKey(
+  routeKey: string,
+  containerKey: string,
+): string {
+  return `${routeKey}::${containerKey}`;
+}
+
+/**
+ * Upper bound on a tab's view-state entries. Scroll entries are bounded by
+ * the per-route REPLACE, but view entries are only cleared by the views that
+ * own them; a long-lived persisted tab would otherwise accumulate one entry
+ * per thing ever opened in it. Oldest-written entries evict first — losing
+ * one merely re-runs a deep-link landing that old (desktop parity).
+ */
+export const VIEW_MEMENTO_MAX_ENTRIES = 100;
 import {
   FAMILY_ROOTS,
   islandParent,
@@ -24,6 +71,7 @@ export interface IslandTab {
   id: string;
   url: string;
   pinned: boolean;
+  memento: TabMemento;
 }
 
 /** One visited location: the tab it belonged to, and where that tab stood. */
@@ -36,6 +84,13 @@ export interface TabsGroup {
   tabs: IslandTab[];
   activeId: string | null;
   mru: string[];
+  /**
+   * Reload = remount the active tab in place: every bump (a) key-remounts
+   * the page (island-app) and (b) marks its live queries stale. Runtime
+   * state of the window; not persisted — after a restart a fresh mount is
+   * a reload by construction.
+   */
+  mountGeneration: number;
 }
 
 /**
@@ -73,10 +128,123 @@ export type TabsState = TabsGroup &
     forward: () => boolean;
     canGoBack: (route?: IslandRoute | null) => boolean;
     canGoForward: () => boolean;
+    /** Jump to one entry of the window's history (context menu; M-174). */
+    goToHistoryIndex: (index: number) => boolean;
+    // view-state persistence (M-174; desktop 0.7.2 memento semantics)
+    commitScrollMemento: (
+      tabId: string,
+      routeKey: string,
+      entries: Record<string, MementoScrollEntry>,
+    ) => void;
+    commitViewState: (
+      tabId: string,
+      routeKey: string,
+      entryKey: string,
+      value: string | undefined,
+    ) => void;
+    // ordering and lifecycle
+    /**
+     * Reorder. Clamped so a tab can never cross the pinned / unpinned
+     * boundary — a drag that would is dropped at the boundary instead —
+     * which keeps the "pinned tabs first" invariant without callers having
+     * to know about it (desktop 0.7.2).
+     */
+    moveTab: (fromIndex: number, toIndex: number) => void;
+    /**
+     * Close every unpinned tab except the named one. Pinned tabs are never
+     * closed by this (desktop 0.7.2); a no-op when nothing would close.
+     */
+    closeOtherTabs: (tabId: string) => void;
+    /** Force-remount the active tab at the same URL: bump mountGeneration. */
+    reloadActiveTab: () => void;
     // helpers
     activeTab: () => IslandTab | null;
     activeUrl: () => string | null;
   };
+
+/**
+ * Islands newer than the pinned-first invariant (a v1 payload written by a
+ * build whose togglePin did not reorder) still rehydrate into store whose
+ * strip always shows pinned tabs before unpinned ones.
+ */
+function withPinnedFirst(tabs: IslandTab[]): IslandTab[] {
+  let anyUnpinned = false;
+  for (const tab of tabs) {
+    if (!tab.pinned) anyUnpinned = true;
+    else if (anyUnpinned) return [...tabs.filter((t) => t.pinned), ...tabs.filter((t) => !t.pinned)];
+  }
+  return tabs;
+}
+
+/**
+ * Persisted payloads are untrusted: keep only the fields the store owns and
+ * always attach a memento, so every consumer of `tab.memento` can bet on it.
+ */
+function sanitizeTab(raw: unknown): IslandTab | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const id = (raw as { id?: unknown }).id;
+  const url = (raw as { url?: unknown }).url;
+  if (typeof id !== "string" || typeof url !== "string") return null;
+  const source = raw as Record<string, unknown>;
+  const memento = emptyMemento();
+  const rawScroll = source.memento as Record<string, unknown> | undefined;
+  if (
+    rawScroll !== null &&
+    typeof rawScroll === "object" &&
+    rawScroll.scroll !== null &&
+    typeof rawScroll.scroll === "object"
+  ) {
+    for (const [key, entry] of Object.entries(
+      rawScroll.scroll as Record<string, unknown>,
+    )) {
+      if (entry === null || typeof entry !== "object") continue;
+      const top = (entry as { top?: unknown }).top;
+      const height = (entry as { height?: unknown }).height;
+      if (typeof top !== "number" || typeof height !== "number") continue;
+      const contentKey = (entry as { contentKey?: unknown }).contentKey;
+      memento.scroll[key] =
+        typeof contentKey === "string"
+          ? { top, height, contentKey }
+          : { top, height };
+    }
+  }
+  if (
+    rawScroll !== null &&
+    typeof rawScroll === "object" &&
+    rawScroll.view !== null &&
+    typeof rawScroll.view === "object"
+  ) {
+    for (const [key, value] of Object.entries(
+      rawScroll.view as Record<string, unknown>,
+    )) {
+      if (typeof value === "string") memento.view[key] = value;
+    }
+  }
+  return { id, url, pinned: source.pinned === true, memento };
+}
+
+function sanitizeState(persisted: Record<string, unknown>) {
+  const tabs = withPinnedFirst(
+    (Array.isArray(persisted.tabs) ? persisted.tabs : [])
+      .map((raw) => sanitizeTab(raw))
+      .filter((tab): tab is IslandTab => tab !== null),
+  );
+  const byId = new Set(tabs.map((t) => t.id));
+  const activeId =
+    typeof persisted.activeId === "string" && byId.has(persisted.activeId)
+      ? (persisted.activeId as string)
+      : (tabs[0]?.id ?? null);
+  const mru = Array.isArray(persisted.mru)
+    ? persisted.mru.filter(
+        (id: unknown): id is string => typeof id === "string" && byId.has(id),
+      )
+    : [];
+  const index =
+    typeof persisted.index === "number" && persisted.index >= 0
+      ? Math.min(Math.trunc(persisted.index), Math.max((persisted.entries as unknown[])?.length ?? 0, 0) - 1)
+      : -1;
+  return { tabs, activeId, mru, entries: Array.isArray(persisted.entries) ? persisted.entries : [], index };
+}
 
 export interface OpenTabOptions {
   activate?: boolean;
@@ -213,6 +381,7 @@ export function createTabsStore(
       mru: [],
       entries: [],
       index: -1,
+      mountGeneration: 0,
     };
 
     const update = (
@@ -225,8 +394,15 @@ export function createTabsStore(
         mru: state.mru,
         entries: state.entries,
         index: state.index,
+        mountGeneration: state.mountGeneration,
       };
-      set(fn(current));
+      const next = fn(current);
+      // An action that returns the slice it was handed is a no-op — do not
+      // rebuild the state object (and do not notify) for an empty change.
+      // This is what lets the memento commit sit inside the store's own
+      // subscription during capture without re-entering itself.
+      if (next === current) return;
+      set(next);
     };
 
     const focusId = (id: string) => {
@@ -240,6 +416,13 @@ export function createTabsStore(
           ...pushEntry(s, { tabId: id, url: tab.url }),
         };
       });
+    };
+
+    /** Index of the first unpinned tab in a strip (== pinned count). */
+    const pinnedBoundary = (tabs: IslandTab[]): number => {
+      let at = 0;
+      while (at < tabs.length && tabs[at]?.pinned) at++;
+      return at;
     };
 
     const evictIfNeeded = (s: TabsGroup & HistoryGroup): TabsGroup & HistoryGroup => {
@@ -289,7 +472,7 @@ export function createTabsStore(
         return existing.id;
       }
       const id = newId();
-      const tab: IslandTab = { id, url, pinned };
+      const tab: IslandTab = { id, url, pinned, memento: emptyMemento() };
       update((s) => {
         const next = evictIfNeeded(s);
         const activeIndex = next.tabs.findIndex((t) => t.id === next.activeId);
@@ -326,7 +509,12 @@ export function createTabsStore(
         if (tabs.length === 0) {
           const rootUrl =
             closed === undefined ? `/${slug}/issues` : familyRootUrl(slug, closed.url);
-          const newTab: IslandTab = { id: newId(), url: rootUrl, pinned: false };
+          const newTab: IslandTab = {
+            id: newId(),
+            url: rootUrl,
+            pinned: false,
+            memento: emptyMemento(),
+          };
           return {
             ...s,
             tabs: [newTab],
@@ -441,11 +629,177 @@ export function createTabsStore(
     const activeTab = () => get().tabs.find((t) => t.id === get().activeId) ?? null;
     const activeUrl = () => activeTab()?.url ?? null;
 
+    /**
+     * Flip a tab's pinned state, mobile-desktop parity: pinning moves it to
+     * the end of the pinned zone (just before the first unpinned tab);
+     * unpinning moves it to the start of the unpinned zone. Both keep the
+     * "pinned tabs before unpinned tabs" invariant.
+     */
     const togglePin = (id: string) => {
-      update((s) => ({
-        ...s,
-        tabs: s.tabs.map((t) => (t.id === id ? { ...t, pinned: !t.pinned } : t)),
-      }));
+      update((s) => {
+        const index = s.tabs.findIndex((t) => t.id === id);
+        const current = s.tabs[index];
+        if (current === undefined) return s;
+        const nextTab = { ...current, pinned: !current.pinned };
+        const without = [
+          ...s.tabs.slice(0, index),
+          ...s.tabs.slice(index + 1),
+        ];
+        const insertAt = pinnedBoundary(without);
+        const tabs = [
+          ...without.slice(0, insertAt),
+          nextTab,
+          ...without.slice(insertAt),
+        ];
+        return { ...s, tabs };
+      });
+    };
+
+    const moveTab = (fromIndex: number, toIndex: number) => {
+      update((s) => {
+        if (fromIndex === toIndex) return s;
+        if (fromIndex < 0 || fromIndex >= s.tabs.length) return s;
+        // Clamp the drop position to within the source tab's zone (pinned
+        // vs unpinned) so the "pinned tabs first" invariant survives a drag.
+        const boundary = pinnedBoundary(s.tabs);
+        const source = s.tabs[fromIndex];
+        if (source === undefined) return s;
+        const clampedTo = source.pinned
+          ? Math.max(0, Math.min(toIndex, boundary - 1))
+          : Math.max(boundary, Math.min(toIndex, s.tabs.length - 1));
+        if (clampedTo === fromIndex) return s;
+        const tabs = [...s.tabs];
+        const [moved] = tabs.splice(fromIndex, 1);
+        tabs.splice(clampedTo, 0, moved as IslandTab);
+        return { ...s, tabs };
+      });
+    };
+
+    const closeOtherTabs = (tabId: string) => {
+      update((s) => {
+        const keep = s.tabs.find((t) => t.id === tabId);
+        if (keep === undefined) return s;
+        const closing = s.tabs.filter((t) => !t.pinned && t.id !== tabId);
+        if (closing.length === 0) return s;
+        const closingIds = new Set(closing.map((t) => t.id));
+        return {
+          ...s,
+          tabs: s.tabs.filter((t) => !closingIds.has(t.id)),
+          mru: s.mru.filter((id) => !closingIds.has(id)),
+          activeId: s.activeId !== null && closingIds.has(s.activeId) ? tabId : s.activeId,
+        };
+      });
+    };
+
+    const reloadActiveTab = () => {
+      update((s) =>
+        s.activeId === null ? s : { ...s, mountGeneration: s.mountGeneration + 1 },
+      );
+    };
+
+    const commitScrollMemento = (
+      tabId: string,
+      routeKey: string,
+      entries: Record<string, MementoScrollEntry>,
+    ) => {
+      update((s) => {
+        const current = s.tabs.find((t) => t.id === tabId);
+        if (current === undefined) return s;
+        const memento = current.memento;
+        // REPLACE per route: a container whose capture is absent (scrolled
+        // back to 0) loses its stale offset instead of resurrecting it on
+        // the next visit.
+        const prefix = `${routeKey}::`;
+        const nextScroll: Record<string, MementoScrollEntry> = {};
+        for (const [key, entry] of Object.entries(memento.scroll)) {
+          if (!key.startsWith(prefix)) nextScroll[key] = entry;
+        }
+        for (const [containerKey, entry] of Object.entries(entries)) {
+          nextScroll[scrollMementoKey(routeKey, containerKey)] = entry;
+        }
+        // Skip the write when nothing changed — the common case is an
+        // unscrolled route captured as empty over an already-empty route
+        // scope, and the capture host commits inside the store's own
+        // subscription, so a redundant write would re-enter it.
+        const prevKeys = Object.keys(memento.scroll);
+        const nextKeys = Object.keys(nextScroll);
+        const unchanged =
+          prevKeys.length === nextKeys.length &&
+          prevKeys.every((key) => {
+            const prev = memento.scroll[key];
+            const next = nextScroll[key];
+            return (
+              prev !== undefined &&
+              next !== undefined &&
+              prev.top === next.top &&
+              prev.height === next.height &&
+              prev.contentKey === next.contentKey
+            );
+          });
+        if (unchanged) return s;
+        return {
+          ...s,
+          tabs: s.tabs.map((t) =>
+            t.id === tabId
+              ? { ...t, memento: { ...memento, scroll: nextScroll } }
+              : t,
+          ),
+        };
+      });
+    };
+
+    const commitViewState = (
+      tabId: string,
+      routeKey: string,
+      entryKey: string,
+      value: string | undefined,
+    ) => {
+      update((s) => {
+        const current = s.tabs.find((t) => t.id === tabId);
+        if (current === undefined) return s;
+        const memento = current.memento;
+        const key = scrollMementoKey(routeKey, entryKey);
+        if (value === undefined) {
+          if (!(key in memento.view)) return s;
+          const view = { ...memento.view };
+          delete view[key];
+          return {
+            ...s,
+            tabs: s.tabs.map((t) =>
+              t.id === tabId
+                ? { ...t, memento: { ...memento, view } }
+                : t,
+            ),
+          };
+        }
+        if (memento.view[key] === value) return s;
+        // Re-bake so a re-written key counts as the newest one.
+        const view = { ...memento.view };
+        delete view[key];
+        view[key] = value;
+        const overflow =
+          Object.keys(view).length - VIEW_MEMENTO_MAX_ENTRIES;
+        if (overflow > 0) {
+          // Insertion order is the write order: oldest written evicts first.
+          for (const stale of Object.keys(view).slice(0, overflow)) {
+            delete view[stale];
+          }
+        }
+        return {
+          ...s,
+          tabs: s.tabs.map((t) =>
+            t.id === tabId
+              ? { ...t, memento: { ...memento, view } }
+              : t,
+          ),
+        };
+      });
+    };
+
+    const goToHistoryIndex = (at: number): boolean => {
+      const s = get();
+      if (at < 0 || at >= s.entries.length) return false;
+      return openEntry(isOpen, at);
     };
 
     const actions = {
@@ -456,6 +810,12 @@ export function createTabsStore(
       closeTab,
       close: closeTab,
       togglePin,
+      moveTab,
+      closeOtherTabs,
+      reloadActiveTab,
+      commitScrollMemento,
+      commitViewState,
+      goToHistoryIndex,
       railEntry,
       onRailEntry: railEntry,
       openOrFocus,
@@ -486,6 +846,14 @@ export function createTabsStore(
         entries: state.entries,
         index: state.index,
       }),
+      // Persisted payloads pass through sanitizeState: the pinned-first
+      // invariant, valid ids, and a memento on every tab — the payload was
+      // written by a previous build's rules.
+      merge: (persisted, current) => ({
+        ...current,
+        ...sanitizeState((persisted ?? {}) as Record<string, unknown>),
+        mountGeneration: 0,
+      }) as typeof current,
     }),
   );
 

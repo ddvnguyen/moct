@@ -39,6 +39,12 @@ export { PageChromeProvider } from "@multica/views/layout";
 export type { NavigationAdapter } from "@multica/views/navigation";
 export { ViewStoreProvider } from "@multica/core/issues/stores/view-store-context";
 export { createIssueViewStore } from "@multica/core/issues/stores/view-store";
+// The pull-based state-restoration channel the island serves its tabs'
+// mementos through (M-174): the platform adapter interface the fork's views
+// already consume on desktop, so the island mounts the same plumbing rather
+// than a rival one.
+export { ScrollRestorationProvider } from "@multica/views/platform";
+export type { ScrollRestorationAdapter, ScrollRestorationEntry } from "@multica/views/platform";
 
 // The five surfaces the sidebar menu opens, plus their detail depth.
 export {

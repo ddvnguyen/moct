@@ -1,10 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type * as React from "react";
 import { useStore } from "zustand";
 import type { StoreApi } from "zustand/vanilla";
 import type { TabsState } from "./tabs";
-import type { NavigationAdapter } from "../fork";
-import { useTabPresentation, ResourceLeadingVisual } from "../fork";
+import { tabLabel } from "./tab-label";
+import {
+  BOARD_ROUTE,
+  islandPath,
+  parseIslandRoute,
+} from "./navigation";
 import {
   ArrowLeft,
   ArrowRight,
@@ -17,13 +21,215 @@ import {
   cn,
   useSearchStore,
 } from "../fork";
-import { tabLabel } from "./tab-label";
-import { BOARD_ROUTE, islandPath } from "./navigation";
-
+import { useTabPresentation, ResourceLeadingVisual } from "../fork";
+import type { NavigationAdapter } from "../fork";
 export const headerTrailing = <div data-header-trailing="" />;
 
 export function HeaderTrailing() {
   return <div data-header-trailing="" />;
+}
+
+// ─── Strip context menus (M-174) ─────────────────────────────────────────
+//
+// Both menus are the island's own small popovers, not the fork's dialog
+// machinery: they position against the pointer, live in the strip's own
+// render tree (the popup seat's portal host is for Base UI popups), and
+// close on an outside pointerdown, another right-click, or Escape.
+//
+// A transparent backdrop under the menu is the click-away, rather than a
+// window listener: inside the island's shadow root a window listener sees
+// retargeted hosts, which would give `contains()` nothing to compare and
+// close the menu under its own pointerdown.
+
+const menuSurfaceClassName =
+  "fixed z-70 min-w-44 overflow-hidden rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none";
+
+const menuItemClassName =
+  "flex w-full cursor-default select-none items-center rounded-sm px-2 py-1.5 text-caption outline-none hover:bg-popover-accent hover:text-popover-accent-foreground disabled:pointer-events-none disabled:opacity-40";
+
+function FloatingMenu({
+  at,
+  onClose,
+  ariaLabel,
+  children,
+}: {
+  at: { x: number; y: number };
+  onClose: () => void;
+  ariaLabel: string;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    ref.current?.focus();
+  }, []);
+  // Keep the surface on screen against the pointer (the strip sits at the
+  // top of a panel, so the menu's own growth heads downward; clamp both
+  // axes against the viewport and read them back on every open).
+  const left = Math.max(4, Math.min(at.x - 4, window.innerWidth - 184));
+  const top = Math.max(4, Math.min(at.y + 2, window.innerHeight - 160));
+  return (
+    // The backdrop closes on outside pointerdown and outside right-click;
+    // the menu stops its own pointerdown so choosing an item survives.
+    <div
+      className="fixed inset-0 z-70"
+      onPointerDown={onClose}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onClose();
+      }}
+    >
+      <div
+        ref={ref}
+        role="menu"
+        aria-label={ariaLabel}
+        tabIndex={-1}
+        onPointerDown={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            onClose();
+          }
+        }}
+        style={{ left, top }}
+        className={menuSurfaceClassName}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+const VIEW_FALLBACK_NAMES = {
+  board: "Issues",
+  issue: "Issue",
+  agents: "Agents",
+  agent: "Agent",
+  skills: "Skills",
+  skill: "Skill",
+  inbox: "Inbox",
+  chat: "Chat",
+  settings: "Settings",
+} as const;
+
+/** A history entry's label: live titles when resolvable, route names otherwise. */
+function HistoryEntryLabel({ url }: { url: string }) {
+  const presentation = useTabPresentation(url);
+  const label = tabLabel(
+    url,
+    presentation.title ||
+      (VIEW_FALLBACK_NAMES as Record<string, string | undefined>)[
+        parseIslandRoute(url)?.view ?? ""
+      ] ||
+      url,
+  );
+  return <span className="truncate">{label.name}</span>;
+}
+
+function HistoryContextMenu({
+  at,
+  tabsStore,
+  onClose,
+}: {
+  at: { x: number; y: number };
+  tabsStore: StoreApi<TabsState>;
+  onClose: () => void;
+}) {
+  const state = useStore(tabsStore);
+  // Newest at the bottom, like the browser's own long-press menu.
+  const items = state.entries.map((entry, index) => ({ entry, index }));
+  if (items.length === 0) return null;
+  return (
+    <FloatingMenu at={at} onClose={onClose} ariaLabel="Tab history">
+      {items.map(({ entry, index }) => {
+        const live = state.tabs.some((t) => t.id === entry.tabId);
+        return (
+          <button
+            key={`${entry.tabId}:${index}`}
+            type="button"
+            role="menuitem"
+            aria-current={index === state.index ? "true" : undefined}
+            disabled={!live}
+            title={live ? undefined : "Closed tab — unavailable from history"}
+            onClick={() => {
+              tabsStore.getState().goToHistoryIndex(index);
+              onClose();
+            }}
+            className={cn(
+              menuItemClassName,
+              "gap-2 text-left",
+              index === state.index && "font-medium",
+            )}
+          >
+            <span
+              className={cn(
+                "size-1 shrink-0 rounded-full bg-current",
+                index !== state.index && "opacity-0",
+              )}
+            />
+            <HistoryEntryLabel url={entry.url} />
+          </button>
+        );
+      })}
+    </FloatingMenu>
+  );
+}
+
+function TabContextMenu({
+  at,
+  tabId,
+  isActive,
+  tabsStore,
+  onClose,
+}: {
+  at: { x: number; y: number };
+  tabId: string;
+  isActive: boolean;
+  tabsStore: StoreApi<TabsState>;
+  onClose: () => void;
+}) {
+  const pinned = tabsStore.getState().tabs.find((t) => t.id === tabId)?.pinned === true;
+  const closingOther = tabsStore
+    .getState()
+    .tabs.some((t) => t.id !== tabId && !t.pinned);
+  const item = (
+    label: string,
+    onClick: () => void,
+    disabled = false,
+  ) => (
+    <button
+      key={label}
+      type="button"
+      role="menuitem"
+      disabled={disabled}
+      onClick={() => {
+        onClick();
+        onClose();
+      }}
+      className={menuItemClassName}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <FloatingMenu at={at} onClose={onClose} ariaLabel="Tab actions">
+      {item(
+        pinned ? "Unpin tab" : "Pin tab",
+        () => tabsStore.getState().togglePin(tabId),
+      )}
+      {item(
+        "Reload",
+        () => tabsStore.getState().reloadActiveTab(),
+        !isActive,
+      )}
+      {item("Close", () => tabsStore.getState().closeTab(tabId))}
+      {item(
+        "Close other tabs",
+        () => tabsStore.getState().closeOtherTabs(tabId),
+        !closingOther,
+      )}
+    </FloatingMenu>
+  );
 }
 
 function TabItem({
@@ -32,12 +238,15 @@ function TabItem({
   isOnly,
   activeRef,
   tabsStore,
+  openContextMenu,
 }: {
   tab: { id: string; url: string; pinned?: boolean };
   isActive: boolean;
   isOnly: boolean;
   activeRef: React.RefObject<HTMLButtonElement | null> | null;
   tabsStore: StoreApi<TabsState>;
+  /** Context-menu host above `TabItem` (strip-level placement state). */
+  openContextMenu: (at: { x: number; y: number }, tabId: string) => void;
 }) {
   const presentation = useTabPresentation(tab.url);
   // An issue reads as `M-123` with its title in the tooltip; every other tab
@@ -56,6 +265,95 @@ function TabItem({
     tabsStore.getState().closeTab(tab.id);
   };
 
+  // Drag-to-reorder (M-174). The store's `moveTab` clamps the drop inside
+  // the pinned / unpinned zones, so this handler never has to know about
+  // them. A pointer press that never crosses the threshold stays a click.
+  const dragState = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    dragTarget: HTMLElement | null; // the strip, when capture is held on it
+  } | null>(null);
+  const [dragging, setDragging] = useState(false);
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest('[role="button"][aria-label]')) {
+      // A knob (Pin / Close) owns the press, not the tab.
+      return;
+    }
+    dragState.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      dragTarget: null,
+    };
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragState.current;
+    if (drag === null || e.pointerId !== drag.pointerId) return;
+    if (
+      !drag.dragTarget &&
+      Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < 4
+    ) {
+      return;
+    }
+    const strip = drag.dragTarget ?? e.currentTarget.closest("[data-tab-strip]");
+    if (strip === null) {
+      dragState.current = null;
+      setDragging(false);
+      return;
+    }
+    // Hold capture on the strip once a real drag starts, so the moves keep
+    // arriving when the pointer leaves the pressed tab (and edge-scroll at
+    // the strip's ends stays possible later if the cap is ever lifted).
+    if (drag.dragTarget === null) {
+      try {
+        strip.setPointerCapture(e.pointerId);
+      } catch {
+        // Capture is an optimization here, not a requirement: without it a
+        // pointer that leaves the strip ends the drag on the next move.
+      }
+      drag.dragTarget = strip;
+      setDragging(true);
+    }
+    // Drop-before rule: land before the first tab whose midpoint the
+    // pointer has passed; past the last midpoint, land at the end.
+    const s = tabsStore.getState();
+    const fromIndex = s.tabs.findIndex((t) => t.id === tab.id);
+    if (fromIndex < 0) return;
+    let targetIndex = s.tabs.length - 1;
+    const rows = strip.querySelectorAll<HTMLElement>("[data-tab-id]");
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect();
+      if (e.clientX < rect.left + rect.width / 2) {
+        const rowId = row.getAttribute("data-tab-id");
+        const rowIndex = s.tabs.findIndex((t) => t.id === rowId);
+        if (rowIndex >= 0) targetIndex = rowIndex;
+        break;
+      }
+    }
+    // `moveTab` removes-then-inserts, so a rightward drag targeting the
+    // hovered tab's slot must drop one narrower — before it, not through it.
+    const toIndex = fromIndex < targetIndex ? targetIndex - 1 : targetIndex;
+    s.moveTab(fromIndex, toIndex);
+  };
+
+  const endDrag = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragState.current;
+    if (drag === null) return;
+    if (drag.dragTarget !== null) {
+      try {
+        drag.dragTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        // Already released by the browser on pointerup.
+      }
+    }
+    dragState.current = null;
+    setDragging(false);
+  };
+
   return (
     <div
       data-tab-id={tab.id}
@@ -66,6 +364,7 @@ function TabItem({
         type="button"
         title={label.tooltip}
         data-active={isActive || undefined}
+        data-dragging={dragging || undefined}
         onClick={() => tabsStore.getState().focusTab(tab.id)}
         onAuxClick={(e) => {
           if (e.button === 1 && showCloseButton) {
@@ -73,11 +372,20 @@ function TabItem({
             tabsStore.getState().closeTab(tab.id);
           }
         }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          openContextMenu({ x: e.clientX, y: e.clientY }, tab.id);
+        }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
         className={cn(
           "group relative flex size-full min-w-0 items-center gap-1.5 px-2.5 pb-1 text-caption transition-colors select-none cursor-default",
           isActive
             ? "font-medium text-foreground"
             : "text-muted-foreground hover:text-sidebar-accent-foreground",
+          dragging && "opacity-60",
         )}
       >
         <ResourceLeadingVisual visual={presentation.visual} />
@@ -202,6 +510,18 @@ export function TabBar({
   const state = useStore(tabsStore);
   const tabs = state.tabs;
   const activeId = state.activeId;
+
+  // Strip context menus (M-174): one kind at a time, positioned against the
+  // pointer that opened them. The tab menu opens on a tab's own
+  // contextmenu; the history menu opens on a right-click of either
+  // history button, the strip-local equivalent of the browser's
+  // long-press-on-Back.
+  const [tabMenu, setTabMenu] = useState<
+    { at: { x: number; y: number }; tabId: string } | null
+  >(null);
+  const [historyMenu, setHistoryMenu] = useState<
+    { at: { x: number; y: number } } | null
+  >(null);
   // One history for the whole window (M-197): Back and Forward cross tabs, so
   // whether they have somewhere to go is the store's answer, not the active
   // tab's own stack.
@@ -242,6 +562,11 @@ export function TabBar({
         aria-label="Back"
         disabled={!canGoBack}
         onClick={() => navigation.back()}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setTabMenu(null);
+          setHistoryMenu({ at: { x: e.clientX, y: e.clientY } });
+        }}
         className={navButtonClassName}
       >
         <ArrowLeft className="size-4" />
@@ -251,6 +576,11 @@ export function TabBar({
         aria-label="Forward"
         disabled={!canGoForward}
         onClick={() => navigation.forward?.()}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setTabMenu(null);
+          setHistoryMenu({ at: { x: e.clientX, y: e.clientY } });
+        }}
         className={navButtonClassName}
       >
         <ArrowRight className="size-4" />
@@ -271,12 +601,32 @@ export function TabBar({
             isOnly={tabs.length === 1}
             activeRef={tab.id === activeId ? activeRef : null}
             tabsStore={tabsStore}
+            openContextMenu={(at, tabId) => {
+              setHistoryMenu(null);
+              setTabMenu({ at, tabId });
+            }}
           />
         ))}
       </div>
       {slug && <NewTabButton tabsStore={tabsStore} slug={slug} />}
       <SearchButton />
       {headerTrailing}
+      {tabMenu !== null && (
+        <TabContextMenu
+          at={tabMenu.at}
+          tabId={tabMenu.tabId}
+          isActive={tabMenu.tabId === activeId}
+          tabsStore={tabsStore}
+          onClose={() => setTabMenu(null)}
+        />
+      )}
+      {historyMenu !== null && (
+        <HistoryContextMenu
+          at={historyMenu.at}
+          tabsStore={tabsStore}
+          onClose={() => setHistoryMenu(null)}
+        />
+      )}
     </div>
   );
 }

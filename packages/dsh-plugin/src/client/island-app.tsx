@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useStore } from "zustand";
 import {
   islandConfig,
@@ -18,6 +18,10 @@ import {
 } from "./navigation";
 import { createIslandStorage } from "./storage";
 import { createTabsStore, familyOfRoute } from "./tabs";
+import {
+  createIslandScrollRestorationAdapter,
+  watchScrollMemento,
+} from "./memento-capture";
 import { selectShellPanel } from "./shell";
 import { TabBar } from "./tab-bar";
 import { ProjectPicker } from "./project-picker";
@@ -46,6 +50,7 @@ import {
   PageChromeProvider,
   NavigationProvider,
   PortalContainerProvider,
+  ScrollRestorationProvider,
   projectListOptions,
   RESOURCES,
   setCurrentWorkspace,
@@ -465,6 +470,34 @@ export function IslandPages({
     );
   }, [refused]);
 
+  // What a re-mounted tab's views come back as (M-174): the capture pass
+  // above serves offsets from the store at mount, straight through the fork's
+  // own restoration protocol — no rival scroll store to keep in step.
+  const restoration = useMemo(
+    () => createIslandScrollRestorationAdapter(tabsStore),
+    [tabsStore],
+  );
+  const pageRootRef = useRef<HTMLDivElement | null>(null);
+  useEffect(
+    () => watchScrollMemento(tabsStore, () => pageRootRef.current),
+    [tabsStore],
+  );
+
+  // Reload (M-174) = remount + mark the current page's queries stale.
+  // `type: "active"` is exactly the mounted observers — the current page and
+  // its shared header queries — and `refetchType: "none"` avoids fetching
+  // into the tree that is about to unmount; the remounted page refetches its
+  // now-stale queries. desktop's Coordinator does the same on generation
+  // change.
+  const queryClient = useQueryClient();
+  const seenGeneration = useRef(tabsState.mountGeneration);
+  useEffect(() => {
+    const generation = tabsState.mountGeneration;
+    if (generation === seenGeneration.current) return;
+    seenGeneration.current = generation;
+    queryClient.invalidateQueries({ type: "active", refetchType: "none" });
+  }, [tabsState.mountGeneration, tabsStore, queryClient]);
+
   return (
     <ViewStoreProvider store={viewStore}>
       <NavigationProvider value={navigation}>
@@ -482,9 +515,25 @@ export function IslandPages({
             }
           />
           <IssueOpeningCapabilityProvider supportsTabs supportsPeek={false}>
+            <ScrollRestorationProvider adapter={restoration}>
             <ErrorBoundary
-              resetKeys={[tabsState.activeId ?? "none", islandRouteKey(route)]}
+              resetKeys={[
+                tabsState.activeId ?? "none",
+                islandRouteKey(route),
+                tabsState.mountGeneration,
+              ]}
             >
+              {/* The page the active tab mounts into. The key re-mounts the
+                  page on reload (mountGeneration), and `contents` keeps every
+                  layout property the pages had as direct children of the
+                  island's flex column. The capture pass reads only this
+                  element, so the strip and rail never pollute a capture. */}
+              <div
+                ref={pageRootRef}
+                key={`${tabsState.activeId ?? "none"}:${tabsState.mountGeneration}`}
+                className="contents"
+                data-island-page-root=""
+              >
               {route.view === "settings" ? (
                 // The fork's page, scoped to what this shell can actually render:
                 // no billing, integrations, plugins or shortcut reference, plus the
@@ -497,7 +546,9 @@ export function IslandPages({
               ) : (
                 <IslandPage route={route} extraAgentSections={agentMemorySections} />
               )}
+              </div>
             </ErrorBoundary>
+            </ScrollRestorationProvider>
           </IssueOpeningCapabilityProvider>
           {/* The fork's pages ask for a dialog through `useModalStore` and one
               component renders whatever it names; the web and desktop layouts
