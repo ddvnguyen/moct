@@ -4,6 +4,8 @@ import { startIsland } from "./island";
 import type { IslandRoute } from "./navigation";
 import { FAMILY_ROOTS } from "./navigation";
 import { bindShell, startBoundSidebarAutoCollapse } from "./shell";
+import { configureHostShell } from "./shell-runtime";
+import type { SidebarRightLike, WorkspacesLike, SessionsLike } from "./shell-link";
 import { familyOfRoute } from "./tabs";
 import {
   createRailIcon,
@@ -103,10 +105,27 @@ const FIRST_ORDER = 30;
  * module as a client dependency, and injecting the service is what guarantees
  * `ctx.layout` exists when `apply` binds it (M-197) instead of depending on
  * which plugin was applied first.
+ *
+ * `sidebarRight`, `workspaces` and `sessions` are the Files/Terminal bridge's
+ * sources (M-159). Injecting them documents the edge the loader reads for
+ * ordering; the apply body still reads each one tolerantly, so a host built
+ * without the right sidebar keeps the rail rows anyway.
  */
-export const inject = ["slots", "layout"];
+export const inject = ["slots", "layout", "sidebarRight", "workspaces", "sessions"];
 
 let hostCreateElement: HostCreateElement | null = null;
+
+/** A face the shell context carries: undefined when the host does not provide it. */
+type Face = Record<string, unknown>;
+
+/** Read one service off the shell context without assuming it exists. */
+function face(ctx: DshClientContext, name: string): unknown {
+  const source = ctx as unknown as { get?: (name: string) => unknown } & Face;
+  if (typeof source.get === "function") {
+    return source.get(name);
+  }
+  return (source as Face)[name];
+}
 
 /**
  * Hand this module the shell's `createElement`.
@@ -120,6 +139,36 @@ export function configureHostRuntime(createElement: HostCreateElement | null): v
 }
 
 export function apply(ctx: DshClientContext): void {
+  // The Files/Terminal bridge (M-159): the sidebar faces, read tolerantly so a
+  // host without the right sidebar still reaches the rail registration below.
+  const sidebarRight = (face(ctx, "sidebarRight") ?? null) as SidebarRightLike | null;
+  const workspaces = (face(ctx, "workspaces") ?? null) as WorkspacesLike | null;
+  const sessions = (face(ctx, "sessions") ?? null) as SessionsLike | null;
+  configureHostShell({
+    sidebarRight,
+    workspaces,
+    sessions,
+    daemonId: "",
+    selectPanel: ctx.layout?.selectPanel ?? null,
+  });
+
+  // Card C's opt-in: the right sidebar may render beside a hosted `main`
+  // panel. Register every MMX panel id inside `ctx.effect` — the disposer is
+  // the plugin's teardown — so an MMX view keeps the sidebar next to it. A
+  // face without `hostPanel` is the fallback: the buttons drop the main panel
+  // (`layout.selectPanel(null)`) before `openTab`, and the island's tabs
+  // survive through keep-alive.
+  if (sidebarRight !== null && typeof sidebarRight.hostPanel === "function") {
+    ctx.effect?.(() => {
+      const disposers = MULTICA_ENTRIES.map((entry) =>
+        sidebarRight.hostPanel?.(entry.id) ?? null,
+      ).filter((dispose): dispose is () => void => dispose !== null);
+      return () => {
+        for (const dispose of disposers) dispose();
+      };
+    }, "multica: sidebarRight.hostPanel for the six MMX panels");
+  }
+
   // The rail dot's baseline count. The browser half has no teardown path —
   // `apply` returns void and the slot registrations below are unregistered by
   // the shell, not by this module — so the poller lives as long as the page;

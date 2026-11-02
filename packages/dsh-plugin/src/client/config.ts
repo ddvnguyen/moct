@@ -17,6 +17,11 @@ export interface IslandConfig {
   wsPath: string;
   /** Workspace the panel opens; empty selects the first readable one. */
   workspaceSlug: string;
+  /**
+   * Default folder for "All projects" (M-159); empty means none configured.
+   * A selected project addresses its own `local_directory` resource instead.
+   */
+  workspaceFolder: string;
   /** Why the host cannot proxy, when it cannot. Never a credential. */
   problem: string | null;
 }
@@ -24,6 +29,7 @@ export interface IslandConfig {
 export const DEFAULT_ISLAND_CONFIG: IslandConfig = {
   wsPath: "/multica/ws",
   workspaceSlug: "",
+  workspaceFolder: "",
   problem: null,
 };
 
@@ -51,6 +57,8 @@ export async function loadIslandConfig(
         : DEFAULT_ISLAND_CONFIG.wsPath,
     workspaceSlug:
       typeof body?.workspaceSlug === "string" ? body.workspaceSlug : "",
+    workspaceFolder:
+      typeof body?.workspaceFolder === "string" ? body.workspaceFolder : "",
     problem: typeof body?.problem === "string" ? body.problem : null,
   };
 }

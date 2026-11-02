@@ -57,6 +57,9 @@ export function apply(ctx: DshHostContext, config?: unknown): void {
         sendJson(res, 200, {
           wsPath: PROXY_WS_PATH,
           workspaceSlug: settings?.workspaceSlug ?? "",
+          // The "All projects" default folder (M-159); a project addresses its
+          // own local_directory resource instead. Not a credential.
+          workspaceFolder: settings?.workspaceFolder ?? "",
           problem,
         });
       },

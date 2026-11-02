@@ -101,7 +101,9 @@ export {
 export { usePageScope } from "@multica/views/layout";
 export type { PageScope } from "@multica/views/layout";
 export { projectListOptions } from "@multica/core/projects/queries";
+export { projectResourcesOptions } from "@multica/core/projects";
 export type { Project } from "@multica/core/types/project";
+export type { ProjectResource } from "@multica/core/types/project";
 
 // Search: reuse the fork's command palette for results instead of a second search.
 export { SearchCommand, useSearchStore } from "@multica/views/search";

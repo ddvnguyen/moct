@@ -410,12 +410,15 @@ export function TabBar({
   navigation,
   projectPicker,
   slug,
+  headerExtras,
 }: {
   tabsStore: StoreApi<TabsState>;
   navigation: NavigationAdapter;
   /** Host-owned project filter rendered between back/forward and the strip. */
   projectPicker?: React.ReactNode;
   slug?: string;
+  /** Host integration buttons (M-159 Files/Terminal), at the strip's right end. */
+  headerExtras?: React.ReactNode;
 }) {
   const state = useStore(tabsStore);
   const tabs = state.tabs;
@@ -625,7 +628,7 @@ export function TabBar({
       </div>
       {slug && <NewTabButton tabsStore={tabsStore} slug={slug} />}
       <SearchButton />
-      {headerTrailing}
+      {headerExtras ?? headerTrailing}
       {tabMenu !== null && (
         <TabContextMenu
           at={tabMenu.at}

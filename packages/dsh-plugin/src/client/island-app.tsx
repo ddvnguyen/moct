@@ -30,6 +30,7 @@ import { createIslandLocaleAdapter, resolveIslandLocale } from "./locale";
 import { PanelZoomRow } from "./zoom-row";
 import { useZoom } from "./zoom-store";
 import { createMoctGroup, HIDDEN_SETTINGS_TABS } from "./moct-settings";
+import { ShellButtons } from "./shell-buttons";
 import { createAgentMemorySections } from "./moct-agent-memory";
 import { UnreadReporter } from "./unread-reporter";
 import { IslandVersionBadge } from "./version-badge";
@@ -82,6 +83,8 @@ export interface IslandAppProps {
   wsPath: string;
   /** Why the host cannot proxy, when it cannot; shown in settings. */
   problem: string | null;
+  /** Default folder for "All projects" (M-159); empty means none configured. */
+  workspaceFolder?: string;
   /** Entry the seat asked for; the board unless a deep link named one issue. */
   route?: IslandRoute;
   /** True while a seat holds the island. */
@@ -149,6 +152,7 @@ export function IslandBoot({
       wsUrl={islandWebSocketUrl(config.wsPath, window.location)}
       wsPath={config.wsPath}
       problem={config.problem}
+      workspaceFolder={config.workspaceFolder}
       route={route}
       attached={attached}
     />
@@ -161,6 +165,7 @@ export function IslandApp({
   wsUrl,
   wsPath,
   problem,
+  workspaceFolder = "",
   route,
   attached = false,
 }: IslandAppProps) {
@@ -207,6 +212,7 @@ export function IslandApp({
             preferredSlug={preferredSlug}
             wsPath={wsPath}
             problem={problem}
+            workspaceFolder={workspaceFolder}
             route={route}
             attached={attached}
           />
@@ -243,12 +249,14 @@ function WorkspaceGate({
   preferredSlug,
   wsPath,
   problem,
+  workspaceFolder,
   route,
   attached,
 }: {
   preferredSlug?: string;
   wsPath: string;
   problem: string | null;
+  workspaceFolder?: string;
   route?: IslandRoute;
   attached: boolean;
 }) {
@@ -307,6 +315,7 @@ function WorkspaceGate({
         workspaceId={workspace.id}
         wsPath={wsPath}
         problem={problem}
+        workspaceFolder={workspaceFolder}
         route={route}
         attached={attached}
       />
@@ -366,6 +375,7 @@ export function IslandPages({
   workspaceId,
   wsPath,
   problem,
+  workspaceFolder = "",
   route: entryRoute = BOARD_ROUTE,
   attached = false,
 }: {
@@ -373,6 +383,8 @@ export function IslandPages({
   workspaceId: string;
   wsPath: string;
   problem: string | null;
+  /** Default folder for "All projects" (M-159); empty means none configured. */
+  workspaceFolder?: string;
   route?: IslandRoute;
   /** True while a seat holds the island; the rail only follows a seated tab. */
   attached?: boolean;
@@ -440,12 +452,12 @@ export function IslandPages({
   const viewStore = useState(() => createIssueViewStore("dsh-issues"))[0];
 
   const moctGroup = useMemo(
-    () => createMoctGroup({ workspaceSlug: slug, workspaceId, wsPath, problem }),
-    [slug, workspaceId, wsPath, problem],
+    () => createMoctGroup({ workspaceSlug: slug, workspaceId, wsPath, workspaceFolder, problem }),
+    [slug, workspaceId, wsPath, workspaceFolder, problem],
   );
   const agentMemorySections = useMemo(
-    () => createAgentMemorySections({ workspaceSlug: slug, workspaceId, wsPath, problem }),
-    [slug, workspaceId, wsPath, problem],
+    () => createAgentMemorySections({ workspaceSlug: slug, workspaceId, wsPath, workspaceFolder, problem }),
+    [slug, workspaceId, wsPath, workspaceFolder, problem],
   );
 
   const navigation = useMemo(
@@ -511,6 +523,14 @@ export function IslandPages({
                 projects={projects ?? []}
                 projectId={projectId}
                 onSelect={selectProject}
+              />
+            }
+            headerExtras={
+              <ShellButtons
+                workspaceId={workspaceId}
+                projects={projects}
+                projectId={projectId}
+                workspaceFolder={workspaceFolder}
               />
             }
           />

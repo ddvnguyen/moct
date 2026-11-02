@@ -39,6 +39,8 @@ export interface MoctConnection {
   workspaceId: string;
   /** Same-origin realtime path. */
   wsPath: string;
+  /** Default folder for "All projects" (M-159); empty means none configured. */
+  workspaceFolder: string;
   /** Why the host cannot proxy, when it cannot. Never a credential. */
   problem: string | null;
 }

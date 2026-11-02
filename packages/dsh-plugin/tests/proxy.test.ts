@@ -51,7 +51,7 @@ async function startFixture(): Promise<Fixture> {
   const proxy = new MulticaProxy({
     serverUrl: `http://127.0.0.1:${upstreamPort}`,
     token: TOKEN,
-    workspaceSlug: "",
+    workspaceSlug: "", workspaceFolder: "",
   });
 
   const front = createServer((req, res) => {
@@ -89,6 +89,7 @@ describe("resolveSettings", () => {
       serverUrl: "http://127.0.0.1:8080",
       token: TOKEN,
       workspaceSlug: "demo",
+      workspaceFolder: "",
     });
   });
 
@@ -101,6 +102,23 @@ describe("resolveSettings", () => {
     expect(settings?.token).toBe(TOKEN);
   });
 
+  // M-159: the "All projects" folder round-trips with the rest of the row.
+  it("carries workspaceFolder with the env fallback", () => {
+    const fromRow = resolveSettings({
+      serverUrl: "http://127.0.0.1:8080",
+      token: TOKEN,
+      workspaceFolder: " /srv/demo ",
+    });
+    expect(fromRow.settings?.workspaceFolder).toBe("/srv/demo");
+    const fromEnv = resolveSettings(
+      { serverUrl: "http://x", token: TOKEN },
+      { MULTICA_DSH_WORKSPACE_FOLDER: "/srv/env" },
+    );
+    expect(fromEnv.settings?.workspaceFolder).toBe("/srv/env");
+    const without = resolveSettings({ serverUrl: "http://x", token: TOKEN });
+    expect(without.settings?.workspaceFolder).toBe("");
+  });
+
   it("names what is missing instead of throwing", () => {
     expect(resolveSettings({}).problem).toBe("serverUrl is not set");
     expect(resolveSettings({ serverUrl: "http://x" }).problem).toBe("token is not set");
@@ -111,7 +129,7 @@ describe("resolveSettings", () => {
 });
 
 describe("upstreamTarget", () => {
-  const settings = { serverUrl: "http://be", token: TOKEN, workspaceSlug: "" };
+  const settings = { serverUrl: "http://be", token: TOKEN, workspaceSlug: "", workspaceFolder: "" };
   it("strips the prefix and keeps the query", () => {
     expect(upstreamTarget(settings, "/multica/api/issues?limit=2")?.url.toString()).toBe(
       "http://be/api/issues?limit=2",

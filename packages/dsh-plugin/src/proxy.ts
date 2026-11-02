@@ -41,6 +41,14 @@ export interface MulticaProxySettings {
   token: string;
   /** Workspace the island opens; empty selects the first readable one. */
   workspaceSlug: string;
+  /**
+   * Default dsh workspace folder for "All projects" (M-159).
+   *
+   * A project's folder comes from the project's `local_directory` resource
+   * instead; this is only the folder the Files/Terminal buttons address when
+   * no project is selected. Empty means none: the buttons say what is missing.
+   */
+  workspaceFolder: string;
 }
 
 /** Headers that describe one hop and must not be forwarded. */
@@ -98,6 +106,10 @@ export function resolveSettings(
         token,
         workspaceSlug:
           typeof raw.workspaceSlug === "string" ? raw.workspaceSlug.trim() : "",
+        workspaceFolder:
+          typeof raw.workspaceFolder === "string"
+            ? raw.workspaceFolder.trim()
+            : (env.MULTICA_DSH_WORKSPACE_FOLDER ?? "").trim(),
       },
       problem: null,
     };

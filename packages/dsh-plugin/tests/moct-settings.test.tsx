@@ -22,6 +22,7 @@ const CONNECTION: MoctConnection = {
   workspaceSlug: "demo",
   workspaceId: WORKSPACE_ID,
   wsPath: "/multica/ws",
+  workspaceFolder: "/srv/demo",
   problem: null,
 };
 

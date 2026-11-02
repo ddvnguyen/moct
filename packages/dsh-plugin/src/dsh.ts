@@ -95,6 +95,12 @@ export interface DshClientContext {
    * (M-197) instead of failing the panel.
    */
   layout?: DshLayout;
+  /**
+   * Run `fn` under the plugin's page lifetime, when the shell gives the
+   * browser context one (the host face always has it). Optional: the absence
+   * reads as "no teardown surface", which only shortens hostPanel's cleanup.
+   */
+  effect?(fn: () => (() => void) | void, label: string): unknown;
 }
 
 /** The module values every dsh client bundle hands to the shell's loader. */

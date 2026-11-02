@@ -100,8 +100,10 @@ describe("client apply", () => {
     apply(ctx);
 
     // `layout` is dsh's own ui-layout service: the rail follows the active tab
-    // and the sidebar collapses through it (M-197).
-    expect(inject).toEqual(["slots", "layout"]);
+    // and the sidebar collapses through it (M-197). `sidebarRight`, `workspaces`
+    // and `sessions` feed the Files/Terminal bridge (M-159); each is read
+    // tolerantly in `apply`.
+    expect(inject).toEqual(["slots", "layout", "sidebarRight", "workspaces", "sessions"]);
     // Two contributions per entry, and each waits for its own slot.
     expect(injected).toEqual(
       MULTICA_ENTRIES.flatMap(() => ["sidebar.panellist", "main"]),

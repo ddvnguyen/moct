@@ -15,6 +15,12 @@
         # Workspace the island opens. Empty selects the first workspace the
         # token can read.
         workspaceSlug: ''
+        # Default dsh workspace folder for "All projects" (M-159): what the
+        # Files/Terminal buttons address when no project is selected. Empty
+        # disables them with "Choose a project". Leave empty and set
+        # MULTICA_DSH_WORKSPACE_FOLDER in the dsh process instead. A selected
+        # project addresses its own local_directory resource instead of this.
+        workspaceFolder: ''
         # moct-be, for the browser's memory seam (docs/moct-seam.md out-path 3).
         # Leave empty and set MOCT_BASE_URL in the dsh process instead; with
         # neither set, /moct answers 503 and the memory surfaces stay hidden.

@@ -305,6 +305,15 @@ export function MoctConnectionTab({ connection }: { connection: MoctConnection }
           <SettingsRow label="Realtime channel">
             <Status value={connection.wsPath} />
           </SettingsRow>
+          <SettingsRow label="Workspace folder">
+            <Status
+              value={
+                connection.workspaceFolder === ""
+                  ? "None configured"
+                  : connection.workspaceFolder
+              }
+            />
+          </SettingsRow>
           {connection.problem === null ? null : (
             <SettingsRow label="Unavailable">
               <Status value={connection.problem} />

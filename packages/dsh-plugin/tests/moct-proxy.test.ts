@@ -93,6 +93,7 @@ async function startFixture(overrides: Partial<FixtureOptions> = {}): Promise<Fi
       serverUrl: `http://127.0.0.1:${port(multicaServer)}`,
       token: TOKEN,
       workspaceSlug: "dsh-z",
+      workspaceFolder: "",
     },
   });
   const front = createServer((req, res) => {
@@ -237,7 +238,7 @@ describe("matchMoctRoute", () => {
 });
 
 describe("resolveMoctSettings", () => {
-  const multica = { serverUrl: "http://127.0.0.1:4390", token: TOKEN, workspaceSlug: "dsh-z" };
+  const multica = { serverUrl: "http://127.0.0.1:4390", token: TOKEN, workspaceSlug: "dsh-z", workspaceFolder: "" };
 
   it("reads the row, then the environment", () => {
     expect(resolveMoctSettings({ moctUrl: "http://127.0.0.1:8310/" }, multica, {}).settings).toEqual({
