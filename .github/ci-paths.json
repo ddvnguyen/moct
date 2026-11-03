@@ -59,6 +59,8 @@
     ".github/ci-paths.json"
   ],
   "scripts": [
+    "scripts/deploy-main.sh",
+    "scripts/deploy-main.test.sh",
     "scripts/generate-attachment-text-preview.mjs",
     "scripts/generate-reserved-slugs.mjs",
     "scripts/selfhost-config.test.sh",

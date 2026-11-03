@@ -1,0 +1,185 @@
+name: Deploy main Multica
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Immutable image tag to build or use from the host
+        required: true
+        type: string
+      source_ref:
+        description: Source branch or single-component tag (multica-moct or refs/tags/<tag>)
+        required: true
+        default: multica-moct
+        type: string
+      drain_timeout_seconds:
+        description: Maximum time to wait for active daemon tasks
+        required: true
+        default: "600"
+        type: string
+      image_source:
+        description: Build images on this host or use images already staged there
+        required: true
+        default: build
+        type: choice
+        options:
+          - build
+          - staged
+      force:
+        description: Stop the daemon and cancel remaining tasks after the drain timeout
+        required: true
+        default: false
+        type: boolean
+      dry_run:
+        description: Run preflight and print the complete plan without changing the stack
+        required: true
+        default: false
+        type: boolean
+
+run-name: Deploy main ${{ inputs.image_tag }} from ${{ inputs.source_ref }} (force=${{ inputs.force }}, dry_run=${{ inputs.dry_run }})
+
+concurrency:
+  group: multica-main-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate dispatch inputs and refs
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Reject disallowed dispatch ref and invalid inputs
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          DRAIN_TIMEOUT: ${{ inputs.drain_timeout_seconds }}
+          IMAGE_SOURCE: ${{ inputs.image_source }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          [[ "$DISPATCH_REF" == "refs/heads/multica-moct" || "$DISPATCH_REF" =~ ^refs/tags/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+            echo "::error::dispatch only from multica-moct or a tag"; exit 1;
+          }
+          if [[ "$SOURCE_REF" != "multica-moct" ]]; then
+            [[ "$SOURCE_REF" =~ ^refs/tags/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+              echo "::error::source_ref must be multica-moct or refs/tags/<tag>"; exit 1;
+            }
+            git check-ref-format "$SOURCE_REF" || {
+              echo "::error::source_ref is not a valid Git ref"; exit 1;
+            }
+          fi
+          [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || {
+            echo "::error::image_tag is invalid"; exit 1;
+          }
+          [[ "$DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] && (( DRAIN_TIMEOUT > 0 )) || {
+            echo "::error::drain_timeout_seconds must be a positive integer"; exit 1;
+          }
+          if [[ "$DRY_RUN" == "true" && "$IMAGE_SOURCE" != "staged" ]]; then
+            echo "::error::dry_run requires image_source=staged so it does not build or mutate host images"; exit 1
+          fi
+
+  deploy:
+    name: Deploy main (force=${{ inputs.force }})
+    needs: validate
+    if: ${{ needs.validate.result == 'success' }}
+    runs-on: [self-hosted, linux, x64, multica-main]
+    timeout-minutes: 180
+    environment:
+      name: main-prod
+    env:
+      TMPDIR: /mnt/workspace/tmp/multica-main-actions
+    steps:
+      - name: Prepare workspace temp directory
+        run: mkdir -p "$TMPDIR"
+
+      - name: Checkout selected source ref
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Resolve expected commit and compose image names
+        id: buildmeta
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          IMAGE_SOURCE: ${{ inputs.image_source }}
+          FORCE: ${{ inputs.force }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          stack_env="$HOME/.local/share/multica/.env"
+          test -f "$stack_env"
+          read_value() {
+            local key="$1" value
+            value="$(awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; found++} END {if (found > 1) exit 2}' "$stack_env")"
+            value="${value%\"}"; value="${value#\"}"
+            value="${value%\'}"; value="${value#\'}"
+            printf '%s' "$value"
+          }
+          backend="$(read_value MULTICA_BACKEND_IMAGE)"
+          web="$(read_value MULTICA_WEB_IMAGE)"
+          backend="${backend:-ghcr.io/multica-ai/multica-backend}"
+          web="${web:-ghcr.io/multica-ai/multica-web}"
+          [[ "$backend" =~ ^[A-Za-z0-9./:_-]+$ ]] || { echo "::error::invalid backend image repository"; exit 1; }
+          [[ "$web" =~ ^[A-Za-z0-9./:_-]+$ ]] || { echo "::error::invalid web image repository"; exit 1; }
+          printf 'commit=%s\nbackend=%s\nweb=%s\n' "$commit" "$backend" "$web" >> "$GITHUB_OUTPUT"
+          {
+            printf '### Main deployment approval summary\n\n'
+            printf -- '- Image tag: `%s`\n- Source ref: `%s`\n- Commit: `%s`\n- Image source: `%s`\n- Force (cancel remaining tasks after drain timeout): `%s`\n- Dry run: `%s`\n' \
+              "$IMAGE_TAG" "$SOURCE_REF" "$commit" "$IMAGE_SOURCE" "$FORCE" "$DRY_RUN"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and tag backend and web images
+        if: ${{ inputs.image_source == 'build' && !inputs.dry_run }}
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          COMMIT: ${{ steps.buildmeta.outputs.commit }}
+          BACKEND_REPO: ${{ steps.buildmeta.outputs.backend }}
+          WEB_REPO: ${{ steps.buildmeta.outputs.web }}
+        run: |
+          set -euo pipefail
+          podman build -f Dockerfile \
+            --build-arg VERSION="$IMAGE_TAG" --build-arg COMMIT="$COMMIT" \
+            --label "org.opencontainers.image.revision=$COMMIT" \
+            --label "org.opencontainers.image.version=$IMAGE_TAG" \
+            -t "$BACKEND_REPO:$IMAGE_TAG" .
+          podman build -f Dockerfile.web \
+            --build-arg NEXT_PUBLIC_APP_VERSION="$IMAGE_TAG" \
+            --label "org.opencontainers.image.revision=$COMMIT" \
+            --label "org.opencontainers.image.version=$IMAGE_TAG" \
+            -t "$WEB_REPO:$IMAGE_TAG" .
+
+      - name: Confirm staged images
+        if: ${{ inputs.image_source == 'staged' || inputs.dry_run }}
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          COMMIT: ${{ steps.buildmeta.outputs.commit }}
+          BACKEND_REPO: ${{ steps.buildmeta.outputs.backend }}
+          WEB_REPO: ${{ steps.buildmeta.outputs.web }}
+        run: |
+          set -euo pipefail
+          for image in "$BACKEND_REPO:$IMAGE_TAG" "$WEB_REPO:$IMAGE_TAG"; do
+            podman image exists "$image"
+            test "$(podman image inspect --format '{{ index .Labels "org.opencontainers.image.revision" }}' "$image")" = "$COMMIT"
+            test "$(podman image inspect --format '{{ index .Labels "org.opencontainers.image.version" }}' "$image")" = "$IMAGE_TAG"
+          done
+
+      - name: Deploy, verify, and roll back on failure
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          EXPECTED_COMMIT: ${{ steps.buildmeta.outputs.commit }}
+          DRAIN_TIMEOUT: ${{ inputs.drain_timeout_seconds }}
+          FORCE: ${{ inputs.force }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=("$IMAGE_TAG" "$EXPECTED_COMMIT" "$DRAIN_TIMEOUT")
+          if [[ "$FORCE" == "true" ]]; then args+=(--force); fi
+          if [[ "$DRY_RUN" == "true" ]]; then args+=(--dry-run); fi
+          bash scripts/deploy-main.sh "${args[@]}"

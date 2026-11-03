@@ -1114,6 +1114,9 @@ jobs:
       - name: Test backend entrypoint signals
         run: bash scripts/entrypoint.test.sh
 
+      - name: Test main deploy script with stubbed host commands
+        run: bash scripts/deploy-main.test.sh
+
       - name: Test build output naming
         run: bash scripts/makefile-build.test.sh
 
