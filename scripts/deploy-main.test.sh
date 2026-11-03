@@ -34,7 +34,7 @@ case "$1 $2" in
       *) exit 2 ;;
     esac
     ;;
-  'compose ps') printf 'compose ps:%s\n' "$PWD" >> "$STUB_LOG"; printf 'db-id\n' ;;
+  'ps -q') printf 'ps -q:%s\n' "$PWD" >> "$STUB_LOG"; printf 'db-id\n' ;;
   'compose up') printf 'compose up\n' >> "$STUB_LOG" ;;
   'exec db-id') printf 'database dump bytes\n' ;;
   'run --rm') printf 'new daemon binary\n' ;;
@@ -127,7 +127,7 @@ assert grep -q '^MULTICA_IMAGE_TAG=old-tag$' "$STACK_DIR/.env"
 assert grep -q 'old daemon binary' "$HOME/.local/bin/multica"
 assert grep -q 'systemctl --user start multica-daemon.service' "$STUB_LOG"
 assert test "$(grep -c '^compose up$' "$STUB_LOG")" -ge 2
-assert grep -q "compose ps:$STACK_DIR" "$STUB_LOG"
+assert grep -q "ps -q:$STACK_DIR" "$STUB_LOG"
 dump="$(find "$MULTICA_MAIN_BACKUP_ROOT" -name database.dump -type f -print -quit)"
 assert test -s "$dump"
 

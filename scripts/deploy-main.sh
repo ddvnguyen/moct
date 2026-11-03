@@ -208,7 +208,7 @@ if [ "$active_count" -gt 0 ]; then
 fi
 DAEMON_WAS_STOPPED=1
 systemctl --user stop multica-daemon.service
-db_container="$(cd "$STACK_DIR" && podman compose ps -q postgres)" || die "could not locate postgres container"
+db_container="$(cd "$STACK_DIR" && podman ps -q --filter "label=com.docker.compose.service=postgres" --filter "label=com.docker.compose.project=multica")" || die "could not locate postgres container"
 [ -n "$db_container" ] || die "postgres container is not running"
 podman exec "$db_container" sh -c 'pg_dump -U "$POSTGRES_USER" -Fc "$POSTGRES_DB"' > "$BACKUP_DIR/database.dump" || die "database backup failed"
 [ -s "$BACKUP_DIR/database.dump" ] || die "database dump is empty"
