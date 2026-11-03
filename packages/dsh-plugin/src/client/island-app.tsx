@@ -30,6 +30,7 @@ import { createIslandLocaleAdapter, resolveIslandLocale } from "./locale";
 import { PanelZoomRow } from "./zoom-row";
 import { useZoom } from "./zoom-store";
 import { createMoctGroup, HIDDEN_SETTINGS_TABS } from "./moct-settings";
+import { runtimesDeviceTab } from "./moct-runtimes";
 import { ShellButtons } from "./shell-buttons";
 import { createAgentMemorySections } from "./moct-agent-memory";
 import { UnreadReporter } from "./unread-reporter";
@@ -560,6 +561,11 @@ export function IslandPages({
                 // one group that only exists here.
                 <SettingsPage
                   extraGroups={[moctGroup]}
+                  // Runtimes (M-174): the panel's only door to what the
+                  // workspace runs on. The desktop keeps this page in its
+                  // sidebar; a dsh panel has no such navigation, so it takes
+                  // the fork's host-supplied device slot instead.
+                  extraDeviceTabs={[runtimesDeviceTab]}
                   hiddenTabs={HIDDEN_SETTINGS_TABS}
                   preferencesExtraRows={<PanelZoomRow />}
                 />

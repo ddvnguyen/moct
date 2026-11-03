@@ -85,7 +85,19 @@ export type { ExtraSettingsGroup } from "@multica/views/settings";
 export { Input } from "@multica/ui/components/ui/input";
 export { Switch } from "@multica/ui/components/ui/switch";
 export { cn } from "@multica/ui/lib/utils";
-export { ArrowLeft, ArrowRight, Plus, X, Pin, PinOff, Search } from "@multica/ui/icons";
+export {
+  ArrowLeft,
+  ArrowRight,
+  ListX,
+  Plus,
+  RefreshCw,
+  Server,
+  X,
+  Pin,
+  PinOff,
+  Search,
+} from "@multica/ui/icons";
+export { useScrollFade } from "@multica/ui/hooks/use-scroll-fade";
 export { TruncatedTooltip } from "@multica/ui/components/common/truncated-tooltip";
 export {
   Select,
@@ -120,6 +132,12 @@ export type { LocaleAdapter } from "@multica/core/i18n";
 export { RESOURCES } from "@multica/views/locales";
 export { ErrorBoundary } from "@multica/ui/components/common/error-boundary";
 export { PortalContainerProvider } from "@multica/ui/components/ui/portal-container";
+
+// The runtimes surface (M-174): the same page the desktop and web apps render,
+// so the island's Settings can manage what the workspace actually runs on
+// instead of only what it stores. The desktop's own wrapper adds daemon state
+// its shell owns; a dsh panel has no local daemon, so the props stay unset.
+export { RuntimesPage } from "@multica/views/runtimes";
 
 // The stamped build identity (M-155): one string for one build, injected by
 // this package's vite config, so the island's badge, the Settings row and the

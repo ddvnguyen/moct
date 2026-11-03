@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type * as React from "react";
 import { useStore } from "zustand";
 import type { StoreApi } from "zustand/vanilla";
@@ -12,13 +12,16 @@ import {
 import {
   ArrowLeft,
   ArrowRight,
+  ListX,
   Plus,
   X,
   Pin,
   PinOff,
+  RefreshCw,
   Search,
   TruncatedTooltip,
   cn,
+  useScrollFade,
   useSearchStore,
 } from "../fork";
 import { useTabPresentation, ResourceLeadingVisual } from "../fork";
@@ -41,11 +44,26 @@ export function HeaderTrailing() {
 // retargeted hosts, which would give `contains()` nothing to compare and
 // close the menu under its own pointerdown.
 
+/** How far the strip's fade reaches from each edge, in px (desktop: 24). */
+const TAB_SCROLL_FADE_SIZE = 24;
+
+// The surface and item classes are the fork's own context menu
+// (`packages/ui/components/ui/context-menu.tsx`), copied rather than
+// imported: the popup is hand-rolled here for the shadow-root reasons above,
+// but it has to paint like every other menu in the app.
 const menuSurfaceClassName =
-  "fixed z-70 min-w-44 overflow-hidden rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none";
+  "fixed z-70 min-w-36 max-h-(--available-height) overflow-x-hidden overflow-y-auto rounded-xl bg-surface-raised p-1.5 text-popover-foreground shadow-[var(--menu-shadow)] ring-1 ring-surface-border outline-none";
 
 const menuItemClassName =
-  "flex w-full cursor-default select-none items-center rounded-sm px-2 py-1.5 text-caption outline-none hover:bg-popover-accent hover:text-popover-accent-foreground disabled:pointer-events-none disabled:opacity-40";
+  "relative flex w-full cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-body outline-hidden focus:bg-accent focus:text-accent-foreground disabled:pointer-events-none disabled:opacity-50";
+
+const menuItemDestructiveClassName =
+  "relative flex w-full cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-body text-destructive outline-hidden focus:bg-destructive/10 focus:text-destructive dark:focus:bg-destructive/20 disabled:pointer-events-none disabled:opacity-50";
+
+/** The fork's menu hairline: full-bleed against the surface's own padding. */
+function MenuSeparator() {
+  return <div role="separator" className="-mx-1.5 my-1.5 h-px bg-border" />;
+}
 
 function FloatingMenu({
   at,
@@ -179,12 +197,15 @@ function TabContextMenu({
   at,
   tabId,
   isActive,
+  isOnly,
   tabsStore,
   onClose,
 }: {
   at: { x: number; y: number };
   tabId: string;
   isActive: boolean;
+  /** The strip holds this tab and nothing else. */
+  isOnly: boolean;
   tabsStore: StoreApi<TabsState>;
   onClose: () => void;
 }) {
@@ -194,8 +215,9 @@ function TabContextMenu({
     .tabs.some((t) => t.id !== tabId && !t.pinned);
   const item = (
     label: string,
+    icon: React.ReactNode,
     onClick: () => void,
-    disabled = false,
+    { disabled = false, destructive = false }: { disabled?: boolean; destructive?: boolean } = {},
   ) => (
     <button
       key={label}
@@ -206,27 +228,43 @@ function TabContextMenu({
         onClick();
         onClose();
       }}
-      className={menuItemClassName}
+      className={cn(
+        destructive ? menuItemDestructiveClassName : menuItemClassName,
+      )}
     >
+      {icon}
       {label}
     </button>
   );
+  // Desktop order and rules: pin first, then the destructive pair, with Close
+  // refused on a pinned tab (closing one requires unpinning it first) and on
+  // the last tab of the strip. Reload is the island's own item — the desktop
+  // offers "open in a window" instead, which a dsh panel cannot do.
   return (
     <FloatingMenu at={at} onClose={onClose} ariaLabel="Tab actions">
       {item(
         pinned ? "Unpin tab" : "Pin tab",
+        pinned ? <PinOff className="size-4" /> : <Pin className="size-4" />,
         () => tabsStore.getState().togglePin(tabId),
       )}
+      <MenuSeparator />
       {item(
         "Reload",
+        <RefreshCw className="size-4" />,
         () => tabsStore.getState().reloadActiveTab(),
-        !isActive,
+        { disabled: !isActive },
       )}
-      {item("Close", () => tabsStore.getState().closeTab(tabId))}
+      {item(
+        "Close",
+        <X className="size-4" />,
+        () => tabsStore.getState().closeTab(tabId),
+        { disabled: pinned || isOnly, destructive: true },
+      )}
       {item(
         "Close other tabs",
+        <ListX className="size-4" />,
         () => tabsStore.getState().closeOtherTabs(tabId),
-        !closingOther,
+        { disabled: !closingOther, destructive: true },
       )}
     </FloatingMenu>
   );
@@ -270,9 +308,25 @@ function TabItem({
 
   return (
     <div
+      data-tab-frame=""
       data-tab-id={tab.id}
-      className={cn("h-9 w-40 min-w-32", isActive && "z-10")}
+      className={cn("h-full w-40 min-w-32", isActive && "z-10")}
     >
+      <div className="group/tab relative size-full">
+        {/* Every tab is a pill on the strip (desktop main, `d24044c40`); the
+            active one is made of the content surface so it reads as selected
+            without having to join the page below it. The v0.7.2 merged cap
+            needs a card to hand its keyline to, and a dsh panel has none. */}
+        <span
+          aria-hidden
+          className={cn(
+            "pointer-events-none absolute inset-x-0 inset-y-1.5 rounded-lg transition-colors",
+            isActive
+              ? "bg-page-canvas shadow-[var(--surface-shadow)] ring-1 ring-surface-border"
+              : "bg-page-canvas/50 group-hover/tab:bg-page-canvas/80",
+            isDragging && "opacity-60",
+          )}
+        />
       <button
         ref={isActive ? activeRef : undefined}
         type="button"
@@ -291,10 +345,10 @@ function TabItem({
           openContextMenu({ x: e.clientX, y: e.clientY }, tab.id);
         }}
         className={cn(
-          "group relative flex size-full min-w-0 items-center gap-1.5 px-2.5 pb-1 text-caption transition-colors select-none cursor-default",
+          "group relative flex size-full min-w-0 items-center gap-1.5 px-2.5 text-caption transition-colors select-none cursor-default",
           isActive
-            ? "font-medium text-foreground"
-            : "text-muted-foreground hover:text-sidebar-accent-foreground",
+            ? "text-foreground"
+            : "text-muted-foreground hover:text-foreground",
           isDragging && "opacity-60",
         )}
       >
@@ -335,6 +389,7 @@ function TabItem({
           </span>
         )}
       </button>
+      </div>
     </div>
   );
 }
@@ -543,6 +598,11 @@ export function TabBar({
 
   const stripRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef<HTMLButtonElement>(null);
+  // The strip's edges fade where tabs continue past them (desktop puts the
+  // same hook on the same scroller); without it the last visible tab just
+  // stops at the clip edge and the strip looks truncated rather than scrollable.
+  const stripFadeStyle = useScrollFade(stripRef, TAB_SCROLL_FADE_SIZE, "horizontal");
+  const pinnedCount = tabs.filter((t) => t.pinned).length;
 
   useEffect(() => {
     activeRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -568,7 +628,7 @@ export function TabBar({
   return (
     <div
       ref={containerRef}
-      className="flex h-10 shrink-0 items-center gap-0.5 border-b border-border px-2"
+      className="flex h-10 shrink-0 items-center gap-1.5 border-b border-border px-2"
     >
       <button
         type="button"
@@ -608,22 +668,33 @@ export function TabBar({
         onPointerMove={handleStripPointerMove}
         onPointerUp={handleStripPointerUp}
         onPointerCancel={handleStripPointerUp}
-        className="no-scrollbar flex h-full min-w-0 flex-1 items-end overflow-x-auto overflow-y-hidden overscroll-x-contain px-4"
+        style={stripFadeStyle}
+        className="no-scrollbar flex h-full min-w-0 flex-1 items-center gap-1.5 overflow-x-auto overflow-y-hidden overscroll-x-contain px-px"
       >
-        {tabs.map((tab) => (
-          <TabItem
-            key={tab.id}
-            tab={tab}
-            isActive={tab.id === activeId}
-            isOnly={tabs.length === 1}
-            isDragging={draggingTabId === tab.id}
-            activeRef={tab.id === activeId ? activeRef : null}
-            tabsStore={tabsStore}
-            openContextMenu={(at, tabId) => {
-              setHistoryMenu(null);
-              setTabMenu({ at, tabId });
-            }}
-          />
+        {tabs.map((tab, index) => (
+          <Fragment key={tab.id}>
+            <TabItem
+              tab={tab}
+              isActive={tab.id === activeId}
+              isOnly={tabs.length === 1}
+              isDragging={draggingTabId === tab.id}
+              activeRef={tab.id === activeId ? activeRef : null}
+              tabsStore={tabsStore}
+              openContextMenu={(at, tabId) => {
+                setHistoryMenu(null);
+                setTabMenu({ at, tabId });
+              }}
+            />
+            {/* The pinned zone is closed with a hairline when unpinned tabs
+                follow it, so the two zones read as zones and not as ordering. */}
+            {tab.pinned && index === pinnedCount - 1 && tabs.length > pinnedCount && (
+              <div
+                aria-hidden
+                data-tab-zone-divider=""
+                className="h-4 w-px shrink-0 bg-surface-border"
+              />
+            )}
+          </Fragment>
         ))}
       </div>
       {slug && <NewTabButton tabsStore={tabsStore} slug={slug} />}
@@ -634,6 +705,7 @@ export function TabBar({
           at={tabMenu.at}
           tabId={tabMenu.tabId}
           isActive={tabMenu.tabId === activeId}
+          isOnly={tabs.length === 1}
           tabsStore={tabsStore}
           onClose={() => setTabMenu(null)}
         />

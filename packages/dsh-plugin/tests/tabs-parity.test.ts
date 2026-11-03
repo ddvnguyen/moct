@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { createIslandStorage } from "../src/client/storage";
+import { STORAGE_PREFIX, createIslandStorage } from "../src/client/storage";
 import {
   VIEW_MEMENTO_MAX_ENTRIES,
   createTabsStore,
@@ -261,5 +261,64 @@ describe("goToHistoryIndex (M-174)", () => {
     const s = store();
     s.getState().openTab("/demo/issues");
     expect(s.getState().goToHistoryIndex(99)).toBe(false);
+  });
+});
+
+// The brief asked for a `tabs.v2` key with a migration; the store keeps
+// `tabs.v1` and migrates inside the rehydrator instead. These tests are that
+// migration contract: a payload written before pinning existed still loads
+// (every tab unpinned), and a payload whose pinned flags arrive out of order is
+// re-sorted to the pinned-first invariant on the way in.
+describe("tabs.v1 payload migration (M-174)", () => {
+  function seeded(payload: unknown) {
+    const backing = memoryBacking();
+    backing.setItem(`${STORAGE_PREFIX}tabs.v1`, JSON.stringify(payload));
+    return store([backing]);
+  }
+
+  it("loads a pre-pin payload with every tab unpinned and a memento attached", () => {
+    const s = seeded({
+      state: {
+        tabs: [
+          { id: "a", url: "/demo/issues" },
+          { id: "b", url: "/demo/issues/MUL-1" },
+        ],
+        activeId: "b",
+        mru: ["b", "a"],
+        entries: [
+          { tabId: "a", url: "/demo/issues" },
+          { tabId: "b", url: "/demo/issues/MUL-1" },
+        ],
+        index: 1,
+      },
+      version: 0,
+    });
+    const tabs = s.getState().tabs;
+    expect(tabs.map((t) => t.id)).toEqual(["a", "b"]);
+    expect(tabs.every((t) => t.pinned === false)).toBe(true);
+    expect(
+      tabs.every((t) => Object.keys(t.memento.scroll).length === 0 && Object.keys(t.memento.view).length === 0),
+    ).toBe(true);
+    expect(s.getState().activeId).toBe("b");
+    expect(s.getState().index).toBe(1);
+  });
+
+  it("re-sorts a payload whose pinned flags arrived out of order", () => {
+    const s = seeded({
+      state: {
+        tabs: [
+          { id: "a", url: "/demo/issues" },
+          { id: "b", url: "/demo/issues/MUL-1", pinned: true },
+          { id: "c", url: "/demo/issues/MUL-2" },
+        ],
+        activeId: "a",
+        mru: ["a", "b", "c"],
+        entries: [],
+        index: -1,
+      },
+      version: 0,
+    });
+    expect(s.getState().tabs.map((t) => t.id)).toEqual(["b", "a", "c"]);
+    expect(s.getState().tabs[0]?.pinned).toBe(true);
   });
 });
