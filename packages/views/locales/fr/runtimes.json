@@ -571,7 +571,12 @@
     "credit_title": "Crédits",
     "credit_daily": "{{remaining}} Freebucks restants sur {{limit}} aujourd'hui",
     "credit_total": "{{total}} Freebucks au total",
-    "prices_title": "Prix par modèle"
+    "prices_title": "Prix par modèle",
+    "engine_title": "Version du moteur",
+    "engine_default": "Par défaut",
+    "engine_none": "Aucune version du moteur installée. Installez-en une sur la machine du runtime avec `multica runtime freebuff install-version`.",
+    "engine_pinned_note": "Appliqué à la prochaine exécution.",
+    "engine_select_failed": "Impossible de définir la version du moteur"
   },
   "accounts": {
     "title": "Comptes",

@@ -851,6 +851,9 @@ type FreebuffPending struct {
 	} `json:"accounts"`
 	// DefaultAccountID is the account tasks run on.
 	DefaultAccountID string `json:"default_account_id"`
+	// EngineVersion pins the orchestrator bundle version tasks run on.
+	// Empty means the daemon's default bundle.
+	EngineVersion string `json:"engine_version"`
 }
 
 // GetFreebuffPending asks the server what the user wants done to a Freebuff

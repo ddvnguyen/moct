@@ -69,4 +69,13 @@ export function useSetFreebuffDefaultAccount() {
   });
 }
 
+export function useSetFreebuffEngineVersion() {
+  const invalidate = useInvalidateAccounts();
+  return useMutation({
+    mutationFn: (v: { runtimeId: string; version: string }) =>
+      api.setFreebuffEngineVersion(v.runtimeId, v.version),
+    onSettled: (_data, _error, v) => invalidate(v.runtimeId),
+  });
+}
+
 export type { FreebuffAccount, FreebuffAccounts };

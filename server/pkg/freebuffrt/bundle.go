@@ -21,6 +21,19 @@ func (b Bundle) OrchestratorPath() string {
 	return filepath.Join(b.ResourcesDir, "orchestrator", "orchestrator.js")
 }
 
+// Version reports which bundle version this is: its manifest's version, or
+// the store directory name when the bundle sits in a version store without a
+// manifest. Empty for a bundle outside a version store.
+func (b Bundle) Version() (version, commit string) {
+	if m, ok := readBundleManifest(b.ResourcesDir); ok {
+		return m.Version, m.Commit
+	}
+	if parent := filepath.Base(filepath.Dir(b.ResourcesDir)); parent == versionsDirName {
+		return filepath.Base(b.ResourcesDir), readBuildCommit(b.ResourcesDir)
+	}
+	return "", ""
+}
+
 // UIDir is the directory of static UI assets the orchestrator serves.
 func (b Bundle) UIDir() string { return filepath.Join(b.ResourcesDir, "orchestrator", "ui") }
 
@@ -41,7 +54,15 @@ var ErrBundleNotFound = errors.New("freebuff orchestrator bundle not found")
 
 // ResolveBundle finds the orchestrator bundle. env is consulted before the
 // well-known install locations; home is the user's home directory.
+//
+// A FREEBUFF_APP_VERSION pin overrides the search: the bundle must be the
+// pinned entry of the runtime dir's version store (see versions.go). An
+// unknown pin fails closed with the installed versions; an unset pin keeps
+// the legacy resolution order unchanged.
 func ResolveBundle(env map[string]string, home string) (Bundle, error) {
+	if version := strings.TrimSpace(env[EnvAppVersion]); version != "" {
+		return PinnedBundle(strings.TrimSpace(env[EnvRuntimeDir]), version)
+	}
 	var candidates []string
 	if dir := strings.TrimSpace(env[EnvRuntimeDir]); dir != "" {
 		candidates = append(candidates, dir)

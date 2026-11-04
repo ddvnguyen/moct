@@ -554,7 +554,12 @@
     "credit_title": "クレジット",
     "credit_daily": "本日は {{limit}} 中 {{remaining}} Freebucks 残存",
     "credit_total": "合計 {{total}} Freebucks",
-    "prices_title": "モデルごとの価格"
+    "prices_title": "モデルごとの価格",
+    "engine_title": "エンジンバージョン",
+    "engine_default": "デフォルト",
+    "engine_none": "インストール済みのエンジンバージョンがありません。ランタイムマシンで `multica runtime freebuff install-version` を実行してインストールしてください。",
+    "engine_pinned_note": "次回の実行時に適用されます。",
+    "engine_select_failed": "エンジンバージョンを設定できませんでした"
   },
   "accounts": {
     "title": "アカウント",

@@ -38,6 +38,10 @@ const (
 	FreebuffEnvProfilesDir = "FREEBUFF_PROFILES_DIR"
 	// FreebuffEnvBunPath overrides the Bun executable the orchestrator runs on.
 	FreebuffEnvBunPath = "FREEBUFF_BUN_PATH"
+	// FreebuffEnvAppVersion pins which installed orchestrator bundle version
+	// runs (see freebuffrt.EnvAppVersion). Empty means the legacy resolution
+	// order.
+	FreebuffEnvAppVersion = freebuffrt.EnvAppVersion
 )
 
 const (
@@ -102,6 +106,13 @@ func FreebuffProfileDir(cfg Config) (string, error) {
 	return filepath.Join(root, name), nil
 }
 
+// FreebuffBundleDir returns the bundle root the runtime env (or the daemon's
+// own environment) points at, or "" when neither does. The version store
+// lives under it (see freebuffrt.VersionsDir).
+func FreebuffBundleDir(cfg Config) string {
+	return freebuffSetting(cfg, freebuffrt.EnvRuntimeDir)
+}
+
 func freebuffBunPath(cfg Config) (string, error) {
 	if p := freebuffSetting(cfg, FreebuffEnvBunPath); p != "" {
 		return p, nil
@@ -130,9 +141,18 @@ func StartFreebuffOrchestrator(ctx context.Context, cfg Config, profileDir strin
 	bundle, err := freebuffrt.ResolveBundle(map[string]string{
 		freebuffrt.EnvRuntimeDir: freebuffSetting(cfg, freebuffrt.EnvRuntimeDir),
 		freebuffrt.EnvAppPath:    freebuffSetting(cfg, freebuffrt.EnvAppPath),
+		freebuffrt.EnvAppVersion: freebuffSetting(cfg, freebuffrt.EnvAppVersion),
 	}, home)
 	if err != nil {
 		return nil, err
+	}
+	// Record which bundle version serves the run: the manifest's version and
+	// build commit when the bundle carries one, else its directory name.
+	version, commit := bundle.Version()
+	if version != "" {
+		cfg.Logger.Info("freebuff orchestrator bundle",
+			"bundle_dir", bundle.ResourcesDir, "version", version, "commit", commit,
+			"pinned", freebuffSetting(cfg, freebuffrt.EnvAppVersion) != "")
 	}
 	bun, err := freebuffBunPath(cfg)
 	if err != nil {

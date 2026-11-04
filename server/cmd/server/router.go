@@ -2439,6 +2439,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Delete("/freebuff/accounts/{accountId}", h.RemoveFreebuffAccount)
 					r.Post("/freebuff/accounts/{accountId}/default", h.SetFreebuffDefaultAccount)
 					r.Post("/freebuff/accounts/{accountId}/login", h.RetryFreebuffAccountLogin)
+					r.Post("/freebuff/engine-version", h.SetFreebuffEngineVersion)
 					r.Delete("/", h.DeleteAgentRuntime)
 					// Confirmed variant of DELETE: unbind every agent bound to
 					// this runtime (they keep their configuration and chats and

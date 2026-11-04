@@ -60,6 +60,20 @@ var freebuffLoginPollInterval = 2 * time.Second
 // same account. The value is the cancel function of the login.
 var freebuffLogins sync.Map // "runtimeID/accountID" -> context.CancelFunc
 
+// freebuffPins remembers each runtime's engine version pin (the orchestrator
+// bundle version tasks run on), keyed by runtime id. The pending poll refresh
+// it; every orchestrator launch for that runtime — account flow and task
+// backend alike — reads it.
+var freebuffPins sync.Map // runtimeID -> string ("" = no pin)
+
+// freebuffEngineVersion returns the pin the server last reported for a
+// runtime, or "" when there is none.
+func freebuffEngineVersion(runtimeID string) string {
+	v, _ := freebuffPins.Load(runtimeID)
+	pin, _ := v.(string)
+	return pin
+}
+
 func freebuffLoginKey(runtimeID, accountID string) string { return runtimeID + "/" + accountID }
 
 // freebuffAccount is the slice of the orchestrator the account flow uses. It
@@ -79,6 +93,9 @@ type freebuffAccount interface {
 // the account flow without a real orchestrator.
 var startFreebuffAccount = func(ctx context.Context, runtimeID, accountID string) (freebuffAccount, func(), error) {
 	cfg := agent.Config{RuntimeID: runtimeID}
+	if pin := freebuffEngineVersion(runtimeID); pin != "" {
+		cfg.Env = map[string]string{agent.FreebuffEnvAppVersion: pin}
+	}
 	dir, err := agent.EnsureFreebuffAccountDir(cfg, accountID)
 	if err != nil {
 		return nil, nil, err
@@ -141,6 +158,7 @@ func (d *Daemon) syncFreebuffRuntime(ctx context.Context, rt Runtime) {
 		d.logger.Debug("freebuff pending poll failed", "runtime_id", rt.ID, "error", err)
 		return
 	}
+	freebuffPins.Store(rt.ID, strings.TrimSpace(pending.EngineVersion))
 	cfg := agent.Config{RuntimeID: rt.ID}
 
 	removed := false
@@ -384,9 +402,18 @@ func (d *Daemon) freebuffAccountEntry(ctx context.Context, rt Runtime, accountID
 
 // reportFreebuffEntries delivers a report to the server. complete says the
 // entries are every account on this machine, so any other the server lists is
-// gone from it.
+// gone from it. Each report carries the version store's current contents so
+// the runtime page lists what is installed; the server replaces its mirror
+// with what it receives.
 func (d *Daemon) reportFreebuffEntries(ctx context.Context, rt Runtime, entries []freebuffAccountReport, complete bool) {
 	payload := map[string]any{"accounts": entries, "complete": complete}
+	if installed := freebuffrt.InstalledVersions(agent.FreebuffBundleDir(agent.Config{RuntimeID: rt.ID})); installed != nil {
+		versions := make([]map[string]string, 0, len(installed))
+		for _, in := range installed {
+			versions = append(versions, map[string]string{"version": in.Version, "commit": in.Commit})
+		}
+		payload["versions"] = versions
+	}
 	d.reportRuntimeResultWithRetry(ctx, "freebuff_account", rt.ID, "", func(ctx context.Context) error {
 		return d.client.ReportFreebuffAccount(ctx, rt.ID, payload)
 	})

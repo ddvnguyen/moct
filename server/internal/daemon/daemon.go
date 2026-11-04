@@ -8978,6 +8978,18 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				agentCustomEnv[agent.FreebuffEnvAccount] = v
 			}
 		}
+		// Engine version pin (M-223): the version picked on the runtime page
+		// rides the same pending poll as the account requests, so the pin map
+		// is current even without a pending action. Layered UNDER custom_env
+		// so a runtime profile's own FREEBUFF_APP_VERSION wins.
+		if v := freebuffEngineVersion(task.RuntimeID); v != "" {
+			if _, ok := agentCustomEnv[agent.FreebuffEnvAppVersion]; !ok {
+				if agentCustomEnv == nil {
+					agentCustomEnv = map[string]string{}
+				}
+				agentCustomEnv[agent.FreebuffEnvAppVersion] = v
+			}
+		}
 	}
 	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
 	if managedFreebuffLaunchID != "" {

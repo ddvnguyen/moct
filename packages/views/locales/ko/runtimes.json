@@ -554,7 +554,12 @@
     "credit_title": "크레딧",
     "credit_daily": "오늘 {{limit}} 중 {{remaining}} Freebucks 남음",
     "credit_total": "총 {{total}} Freebucks",
-    "prices_title": "모델별 가격"
+    "prices_title": "모델별 가격",
+    "engine_title": "엔진 버전",
+    "engine_default": "기본값",
+    "engine_none": "설치된 엔진 버전이 없습니다. 런타임 머신에서 `multica runtime freebuff install-version`을 실행해 설치하세요.",
+    "engine_pinned_note": "다음 실행에 적용됩니다.",
+    "engine_select_failed": "엔진 버전을 설정할 수 없습니다"
   },
   "accounts": {
     "title": "계정",

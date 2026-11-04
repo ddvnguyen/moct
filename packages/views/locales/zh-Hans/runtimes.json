@@ -554,7 +554,12 @@
     "credit_title": "额度",
     "credit_daily": "今日剩余 {{remaining}} / {{limit}} Freebucks",
     "credit_total": "共 {{total}} Freebucks",
-    "prices_title": "各模型价格"
+    "prices_title": "各模型价格",
+    "engine_title": "引擎版本",
+    "engine_default": "默认",
+    "engine_none": "尚未安装引擎版本。请在运行时机器上执行 `multica runtime freebuff install-version` 进行安装。",
+    "engine_pinned_note": "将在下次运行时生效。",
+    "engine_select_failed": "无法设置引擎版本"
   },
   "accounts": {
     "title": "账户",

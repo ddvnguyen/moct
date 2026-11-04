@@ -687,7 +687,12 @@
     "link_copied": "連結已複制",
     "link_copy_failed": "無法複制連結",
     "toast_add_failed": "無法添加帳號",
-    "toast_action_failed": "操作失敗，請重試。"
+    "toast_action_failed": "操作失敗，請重試。",
+    "engine_title": "引擎版本",
+    "engine_default": "預設",
+    "engine_none": "尚未安裝引擎版本。請在執行環境機器上執行 `multica runtime freebuff install-version` 進行安裝。",
+    "engine_pinned_note": "將於下次執行時生效。",
+    "engine_select_failed": "無法設定引擎版本"
   },
   "accounts": {
     "title": "帳號",
