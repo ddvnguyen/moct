@@ -7948,6 +7948,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Repos are passed as metadata only — the agent checks them out on demand
 	// via `multica repo checkout <url>`.
 	taskCtx := execenv.TaskContextForEnv{
+		IsFreebuffDesktop:   isFreebuffDesktopRuntime(entry.Path, task),
 		IssueID:             task.IssueID,
 		TriggerCommentID:    task.TriggerCommentID,
 		TriggerThreadID:     task.TriggerThreadID,
@@ -8588,7 +8589,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				return // Preserve files that an unconfirmed process may still use.
 			}
 			var cleanupErr error
-			if cerr := execenv.CleanupRuntimeConfig(env.WorkDir, provider); cerr != nil {
+			if cerr := execenv.CleanupRuntimeConfigForTask(env.WorkDir, provider, taskCtx); cerr != nil {
 				cleanupErr = cerr
 				d.logger.Warn("execenv: cleanup runtime config failed", "error", cerr)
 			}
@@ -8795,6 +8796,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// is the one thing it cannot work out from its own context — tell it.
 	// Worktree mode is excluded: there the tree is this task's private checkout.
 	var promptOptions []PromptOption
+	if taskCtx.IsFreebuffDesktop {
+		promptOptions = append(promptOptions, WithFreebuffDesktop())
+	}
 	// MOCT pre-run memory inject (M-101, docs/moct-seam.md out-path 1). Fetched
 	// once per claim and carried on promptOptions, so the fresh-session retry's
 	// own BuildPrompt reuses the same block instead of fetching a second time.
@@ -8992,6 +8996,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
+	if isFreebuffDesktopRuntime(entry.Path, task) {
+		// Set after custom environment layering so callers cannot select a
+		// different task's conversation scope.
+		agentEnv["FREEBUFF_DESKTOP_SCOPE"] = freebuffDesktopScope(task)
+	}
 	if managedFreebuffLaunchID != "" {
 		applyManagedFreebuffDesktopEnv(agentEnv, task.Agent.AccountEndpoint, task.Agent.AccountCredentialRef, managedFreebuffLaunchID)
 	}

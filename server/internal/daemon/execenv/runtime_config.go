@@ -215,7 +215,7 @@ func InjectRuntimeConfig(workDir, provider string, ctx TaskContextForEnv) (Runti
 			},
 		},
 	}
-	path := runtimeConfigPath(workDir, provider)
+	path := runtimeConfigPathForTask(workDir, provider, ctx)
 	if path == "" {
 		// Unknown provider — skip config injection, prompt-only mode. The hash
 		// then fingerprints the text the backend receives inline, which is the
@@ -224,6 +224,13 @@ func InjectRuntimeConfig(workDir, provider string, ctx TaskContextForEnv) (Runti
 		return brief, nil
 	}
 	return brief, writeRuntimeConfigFile(path, content)
+}
+
+func runtimeConfigPathForTask(workDir, provider string, ctx TaskContextForEnv) string {
+	if ctx.IsFreebuffDesktop && provider == "codebuddy" {
+		return filepath.Join(workDir, "AGENTS.md")
+	}
+	return runtimeConfigPath(workDir, provider)
 }
 
 // RuntimeBrief is the rendered runtime config plus the accounting the daemon
@@ -526,7 +533,13 @@ func locateMarkerBlock(content string) (start, end int, found bool) {
 // Missing files, unknown providers, and files without a marker block are
 // no-ops — Cleanup is safe to call defensively.
 func CleanupRuntimeConfig(workDir, provider string) error {
-	path := runtimeConfigPath(workDir, provider)
+	return CleanupRuntimeConfigForTask(workDir, provider, TaskContextForEnv{})
+}
+
+// CleanupRuntimeConfigForTask removes only this task's managed block and
+// preserves any pre-existing project guidance in the file.
+func CleanupRuntimeConfigForTask(workDir, provider string, ctx TaskContextForEnv) error {
+	path := runtimeConfigPathForTask(workDir, provider, ctx)
 	if path == "" {
 		return nil
 	}

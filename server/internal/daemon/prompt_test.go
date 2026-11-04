@@ -3,12 +3,136 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/internal/service"
 )
+
+func TestFreebuffDesktopScopeIsolation(t *testing.T) {
+	base := Task{ID: "run-1", WorkspaceID: "ws", AgentID: "a", RuntimeID: "r", InitiatorType: "member", InitiatorID: "u", ChatSessionID: "chat"}
+	original := freebuffDesktopScope(base)
+	next := base
+	next.ID = "run-2"
+	if got := freebuffDesktopScope(next); got != original {
+		t.Fatal("same chat did not retain scope")
+	}
+	variants := []Task{}
+	change := func(f func(*Task)) { v := base; f(&v); variants = append(variants, v) }
+	change(func(t *Task) { t.ChatSessionID = ""; t.IssueID = "chat" })
+	change(func(t *Task) { t.InitiatorID = "other" })
+	change(func(t *Task) { t.WorkspaceID = "other" })
+	change(func(t *Task) { t.AgentID = "other" })
+	change(func(t *Task) { t.RuntimeID = "other" })
+	change(func(t *Task) { t.Agent = &AgentData{AccountID: "other"} })
+	for _, v := range variants {
+		if freebuffDesktopScope(v) == original {
+			t.Fatal("distinct context shared scope")
+		}
+	}
+	base.InitiatorID = ""
+	next = base
+	next.ID = "run-2"
+	if freebuffDesktopScope(base) == freebuffDesktopScope(next) {
+		t.Fatal("unknown initiator reused scope")
+	}
+	base.ID = ""
+	if freebuffDesktopScope(base) != "" {
+		t.Fatal("missing task ID should fail closed")
+	}
+}
+
+func TestDesktopGeneratedQuickCreateAndCommentCopy(t *testing.T) {
+	const userText = "The agent and worker must keep this exact text."
+	cases := map[string]Task{
+		"quick-default":  {QuickCreatePrompt: userText},
+		"quick-id":       {QuickCreatePrompt: userText, Agent: &AgentData{ID: "agent-id"}},
+		"quick-name":     {QuickCreatePrompt: userText, Agent: &AgentData{Name: "Participant"}},
+		"quick-squad":    {QuickCreatePrompt: userText, SquadID: "squad-id", SquadName: "Team"},
+		"comment":        {IssueID: "i", TriggerCommentID: "c", TriggerCommentContent: userText, TriggerAuthorType: "agent", TriggerAuthorName: "Person"},
+		"comment-folded": {IssueID: "i", TriggerCommentID: "c", TriggerCommentContent: userText, TriggerAuthorType: "agent", CoalescedComments: []CoalescedCommentData{{ID: "c2", AuthorType: "agent", Content: "Earlier comment"}}},
+	}
+	for name, task := range cases {
+		t.Run(name, func(t *testing.T) {
+			out := BuildPrompt(task, "codebuddy", WithFreebuffDesktop())
+			if !strings.Contains(out, userText) {
+				t.Fatal("user text changed")
+			}
+			prose := strings.ReplaceAll(out, userText, "")
+			prose = strings.ReplaceAll(prose, "agent-id", "identity")
+			prose = regexp.MustCompile("`[^`]*`").ReplaceAllString(prose, "")
+			if line := regexp.MustCompile(`(?im)^.*\b(agent|worker)s?\b.*$`).FindString(prose); line != "" {
+				t.Fatalf("unexpected wording: %.300s", line)
+			}
+			if name == "quick-id" && !strings.Contains(out, "agent-id") {
+				t.Fatal("identity changed")
+			}
+		})
+	}
+}
+
+func TestFreebuffDesktopPromptIntroduction(t *testing.T) {
+	const original = "You are running as a local coding agent for a Multica workspace."
+	cases := []struct {
+		name string
+		task Task
+	}{
+		{"assignment", Task{IssueID: "issue-1"}},
+		{"comment", Task{IssueID: "issue-1", TriggerCommentID: "comment-1", TriggerCommentContent: original}},
+		{"wakeup", Task{IssueID: "issue-1", WakeupID: "wake-1", HandoffNote: original}},
+		{"resume", Task{IssueID: "issue-1", TriggerEvidenceKind: "question_answer", HandoffNote: original}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ordinary := BuildPrompt(tc.task, "codebuddy")
+			desktop := BuildPrompt(tc.task, "codebuddy", WithFreebuffDesktop())
+			if !strings.HasPrefix(ordinary, original+"\n\n") {
+				t.Fatal("ordinary runtime introduction changed")
+			}
+			want := "We are working with Multica workspace\n\n" + strings.TrimPrefix(ordinary, original+"\n\n")
+			if desktop != want {
+				t.Fatalf("desktop prompt changed content beyond the introduction:\n%s", desktop)
+			}
+		})
+	}
+}
+
+func TestFreebuffDesktopRuntimeDetection(t *testing.T) {
+	cases := []struct {
+		path string
+		task Task
+		want bool
+	}{
+		{"/opt/FREEBUFF-DESKTOP-custom", Task{}, true},
+		{"/opt/custom-wrapper", Task{Agent: &AgentData{CustomEnv: map[string]string{"FREEBUFF_DESKTOP_URL": "http://localhost"}}}, true},
+		{"/opt/codebuddy", Task{}, false},
+		{"/opt/codebuddy", Task{Agent: &AgentData{CustomEnv: map[string]string{"OTHER": "value"}}}, false},
+	}
+	for _, tc := range cases {
+		if got := isFreebuffDesktopRuntime(tc.path, tc.task); got != tc.want {
+			t.Errorf("isFreebuffDesktopRuntime(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestFreebuffDesktopPromptRequesterIdentity(t *testing.T) {
+	for _, task := range []Task{
+		{IssueID: "issue-1", InitiatorName: "Owner", InitiatorEmail: "owner@example.test"},
+		{IssueID: "issue-1", WakeupID: "wake-1", InitiatorName: "Owner", InitiatorEmail: "owner@example.test"},
+	} {
+		desktop := BuildPrompt(task, "codebuddy", WithFreebuffDesktop())
+		for _, want := range []string{"We are working on behalf of **Owner** (owner@example.test)", "person-specific privacy or access rules", "do not assume this person can access everything you can"} {
+			if !strings.Contains(desktop, want) {
+				t.Errorf("desktop prompt missing %q: %s", want, desktop)
+			}
+		}
+	}
+	if got := BuildPrompt(Task{IssueID: "issue-1"}, "codebuddy", WithFreebuffDesktop()); strings.Contains(got, "## On Behalf Of") {
+		t.Fatal("empty requester should not create an identity block")
+	}
+}
 
 // TestBuildQuickCreatePromptRules locks in the rules that govern how the
 // quick-create agent is allowed to translate raw user input into the issue
@@ -112,7 +236,7 @@ func TestBuildQuickCreatePromptLargestAcceptedSourceContextFitsBudget(t *testing
 
 func TestIssuePromptsKeepSourceContextRuleOutOfPerTurnMessage(t *testing.T) {
 	const rule = "If the issue JSON contains `source_context`"
-	assignment := buildPromptBody(Task{IssueID: "issue-1"}, "claude")
+	assignment := buildPromptBody(Task{IssueID: "issue-1"}, "claude", false)
 	comment := buildCommentPrompt(Task{IssueID: "issue-1", TriggerCommentID: "comment-1"}, "claude")
 	if strings.Contains(assignment, rule) || strings.Contains(comment, rule) {
 		t.Fatal("source-context precedence rule must live in the cache-stable runtime brief, not per-turn prompts")

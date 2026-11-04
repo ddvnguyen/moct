@@ -1,11 +1,48 @@
 package daemon
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
+
+// freebuffDesktopScope is an opaque reuse key; incomplete identity fails
+// closed to one task. Account and model separation is also enforced by the
+// bridge's account state directory and selected model.
+func freebuffDesktopScope(task Task) string {
+	surface, id := "task", task.ID
+	if task.InitiatorID != "" && task.WorkspaceID != "" && task.AgentID != "" {
+		if task.ChatSessionID != "" {
+			surface, id = "chat", task.ChatSessionID
+		} else if task.IssueID != "" {
+			surface, id = "issue", task.IssueID
+		}
+	}
+	if id == "" {
+		return ""
+	}
+	account := ""
+	if task.Agent != nil {
+		account = task.Agent.AccountID
+	}
+	raw, _ := json.Marshal([]string{task.WorkspaceID, task.AgentID, task.RuntimeID, account, task.InitiatorType, task.InitiatorID, surface, id})
+	return fmt.Sprintf("%x", sha256.Sum256(raw))
+}
+
+func isFreebuffDesktopRuntime(path string, task Task) bool {
+	if strings.HasPrefix(strings.ToLower(filepath.Base(path)), "freebuff-desktop") {
+		return true
+	}
+	if task.Agent != nil {
+		_, ok := task.Agent.CustomEnv["FREEBUFF_DESKTOP_URL"]
+		return ok
+	}
+	return false
+}
 
 // sessionContinuityNoticeFor picks the notice matching what this surface
 // actually lost. See the constants in execenv for the full reasoning; the
@@ -68,7 +105,11 @@ func perTurnContextBlocks(task Task, opts promptOpts) string {
 	if task.PriorSessionResumeUnavailable {
 		b.WriteString(sessionContinuityNoticeFor(task))
 	}
-	b.WriteString(execenv.BuildOnBehalfOfBlock(task.InitiatorName, task.InitiatorEmail))
+	identity := execenv.BuildOnBehalfOfBlock(task.InitiatorName, task.InitiatorEmail)
+	if opts.freebuffDesktop {
+		identity = strings.Replace(identity, "You are acting on behalf of", "We are working on behalf of", 1)
+	}
+	b.WriteString(identity)
 	b.WriteString(execenv.BuildConnectedAppsBlock(task.ConnectedApps))
 	b.WriteString(buildJoinedWakeupsBlock(task.WakeupJoined))
 	b.WriteString(buildProjectWorkflowBlock(task))
@@ -107,11 +148,18 @@ func buildJoinedWakeupsBlock(notes string) string {
 // daemon's own execution context can answer. Kept behind PromptOption so the
 // common BuildPrompt(task, provider) call sites stay unchanged.
 type promptOpts struct {
+	freebuffDesktop         bool
 	sharedLocalDirectory    bool
 	worktreeReplayConflicts []string
 	moctInject              string
 	worktreeBranch          string
 	worktreeBase            string
+}
+
+// WithFreebuffDesktop selects the Desktop-specific introduction without
+// changing task content, identifiers, or prompts for other runtimes.
+func WithFreebuffDesktop() PromptOption {
+	return func(opts *promptOpts) { opts.freebuffDesktop = true }
 }
 
 // PromptOption tunes per-turn prompt copy with run-scoped context.
@@ -283,7 +331,13 @@ func BuildPrompt(task Task, provider string, options ...PromptOption) string {
 	for _, apply := range options {
 		apply(&opts)
 	}
-	body := buildPromptBody(task, provider)
+	body := buildPromptBody(task, provider, opts.freebuffDesktop)
+	if opts.freebuffDesktop {
+		const oldIntro = "You are running as a local coding agent for a Multica workspace.\n\n"
+		if rest, ok := strings.CutPrefix(body, oldIntro); ok {
+			body = "We are working with Multica workspace\n\n" + rest
+		}
+	}
 	// The MOCT memory block is the one run-scoped block that goes in FRONT of
 	// the task instruction, per the seam contract (docs/moct-seam.md). The
 	// rule below still holds for everything else — and for the block itself
@@ -303,10 +357,15 @@ func BuildPrompt(task Task, provider string, options ...PromptOption) string {
 	return body
 }
 
-func buildPromptBody(task Task, provider string) string {
+func buildPromptBody(task Task, provider string, isDesktop bool) string {
 	if task.WakeupID != "" {
 		var b strings.Builder
-		fmt.Fprintf(&b, "You are running as a local coding agent for a Multica workspace.\n\nYour assigned issue ID is: %s\n\n[WAKEUP]\n%s\n\n", task.IssueID, task.HandoffNote)
+		if isDesktop {
+			b.WriteString("We are working with Multica workspace\n\n")
+		} else {
+			b.WriteString("You are running as a local coding agent for a Multica workspace.\n\n")
+		}
+		fmt.Fprintf(&b, "Your assigned issue ID is: %s\n\n[WAKEUP]\n%s\n\n", task.IssueID, task.HandoffNote)
 		fmt.Fprintf(&b, "Start by running `multica issue get %s --output json`, then read current run/comment state. Decide whether the instruction's goal is met; the trigger reports a fact, not business completion. This is an ordinary run with normal result delivery, except where the [WAKEUP] block offers a check-in.\n", task.IssueID)
 		fmt.Fprintf(&b, "Scan comment threads with `multica issue comment list %s --roots-only --summary --compact --output json`, then expand relevant threads with `--thread <id> --tail 30`.\n", task.IssueID)
 		if task.WakeupSystemRule != "" {
@@ -324,13 +383,13 @@ func buildPromptBody(task Task, provider string) string {
 		return buildChatPrompt(task)
 	}
 	if task.TriggerCommentID != "" {
-		return buildCommentPrompt(task, provider)
+		return buildCommentPrompt(task, provider, isDesktop)
 	}
 	if task.AutopilotRunID != "" {
 		return buildAutopilotPrompt(task)
 	}
 	if task.QuickCreatePrompt != "" {
-		return buildQuickCreatePrompt(task)
+		return buildQuickCreatePrompt(task, isDesktop)
 	}
 	// S1-A1 (M-118): a run resumed from a parked ask/plan carries the human's
 	// answer or verdict in the handoff note. Render it as the answer/verdict
@@ -388,9 +447,14 @@ func buildAskPlanResumePrompt(task Task) string {
 // would produce a better issue. No issue exists yet, so the agent must NOT
 // call `multica issue get` or attempt to comment — there's nothing to read
 // or reply to.
-func buildQuickCreatePrompt(task Task) string {
+func buildQuickCreatePrompt(task Task, desktop ...bool) string {
+	isDesktop := len(desktop) > 0 && desktop[0]
 	var b strings.Builder
-	b.WriteString("You are running as a quick-create assistant for a Multica workspace.\n\n")
+	if isDesktop {
+		b.WriteString("We are working with Multica workspace\n\n")
+	} else {
+		b.WriteString("You are running as a quick-create assistant for a Multica workspace.\n\n")
+	}
 	b.WriteString("A user captured the following input via the quick-create modal. There is NO existing issue. Your job is to create a well-formed issue from this input with a single `multica issue create` command.\n\n")
 	if len(task.QuickCreateSourceContext) > 0 {
 		b.WriteString("New sub-issue instruction:\n\n")
@@ -410,7 +474,11 @@ func buildQuickCreatePrompt(task Task) string {
 	b.WriteString("- **title**: required. A concise but semantically rich summary. If the input references external resources (PRs, issues, URLs), use your judgment on whether fetching the resource would produce a meaningfully better title — e.g. \"review PR #123\" → \"Review PR #123: Refactor auth module to OAuth2\". Strip filler words but preserve key semantic information.\n\n")
 
 	// description — the core optimization
-	b.WriteString("- **description**: The description is the executing agent's primary context. Aim for high fidelity — they should grasp the user's intent as if they had read the raw input themselves. Use a two-section structure:\n\n")
+	if isDesktop {
+		b.WriteString("- **description**: Give the person carrying out the issue enough context to understand the user's intent as if they had read the original input. Use a two-section structure:\n\n")
+	} else {
+		b.WriteString("- **description**: The description is the executing agent's primary context. Aim for high fidelity — they should grasp the user's intent as if they had read the raw input themselves. Use a two-section structure:\n\n")
+	}
 	b.WriteString("  1. **User request** — Faithfully restate what the user wants in their own words. Preserve specific names, identifiers, file paths, code snippets, and technical terms verbatim. Strip non-spec material before writing it (this is removal, not paraphrasing): verbal routing wrappers about creating the issue or routing it (e.g. \"create an issue\", \"分配给 X\", \"让 @X 处理\") and pure conversational fillers (e.g. \"对吧？\"). When in doubt, keep it.\n\n")
 	b.WriteString("     CC exception: `multica issue create` has no `--subscriber` flag, and the platform auto-subscribes members whose `[@Name](mention://member/<uuid>)` link appears in the description. When the user wrote \"cc @Y\", strip the verbal \"cc\" wrapper from the User request body and append a final `CC: <mention link(s)>` line to the description so the cc routing still fires.\n\n")
 	b.WriteString("  2. **Context** — include ONLY when the input cited external resources AND you successfully fetched them AND they produced verifiable facts worth recording. Summarize facts only (e.g. \"PR #45 changes auth to JWT\"), not interpretation or unsolicited reference implementations. If you have nothing factual to add, omit the section entirely — never use it as an apology log for resources you could not fetch.\n\n")
@@ -425,31 +493,49 @@ func buildQuickCreatePrompt(task Task) string {
 
 	// assignee
 	b.WriteString("- **assignee**:\n")
-	b.WriteString("    - When the user names someone (\"assign to X\" / \"@X\"), call `multica workspace member list --output json`, `multica agent list --output json`, and `multica squad list --output json` and find the matching entity by display name. Squads are first-class assignees too — a squad name (e.g. \"Super Human\") routes work to the squad leader, who then delegates. On a clean unambiguous match, prefer `--assignee-id <uuid>` using the `user_id` (member) or `id` (agent or squad) from that JSON — UUID matching is exact and robust to name collisions in workspaces with overlapping names. `--assignee <name>` (fuzzy) is acceptable as a fallback when names are unambiguous. On no match or ambiguous match, do NOT pass either flag — instead append a final line to the description: `Unrecognized assignee: X`.\n")
-	b.WriteString("    - Treat bare @-routing as an assignee directive even when the user did not write the English word \"assign\". This includes Chinese imperatives like `让 @独立团 review 这个 PR`, `给 @X 处理`, or `交给 @X`; strip the leading `@`/`＠` before matching display names. Do not keep that routing wrapper or `@Name` in the description unless it is a true CC-style notification rather than ownership. If the matched entity is a squad, pass the squad's `id` as `--assignee-id`, not the leader agent's id.\n")
+	if isDesktop {
+		b.WriteString("    - When the user names someone, use `multica workspace member list --output json`, `multica agent list --output json`, and `multica squad list --output json` to match their display name. Squads are valid assignees and route work to their leader. For an unambiguous match, pass `--assignee-id <uuid>` using `user_id` for a member or `id` for another participant or squad. `--assignee <name>` is a fallback for unambiguous names. If no match or multiple matches exist, omit both flags and append `Unrecognized assignee: X` to the description.\n")
+		b.WriteString("    - Treat bare @-routing as an assignment, including `让 @独立团 review 这个 PR`, `给 @X 处理`, and `交给 @X`. Strip the leading `@`/`＠` before matching. Omit routing wrappers and @Name from the description unless used for CC. For a squad, pass its own `id` as `--assignee-id`.\n")
+	} else {
+		b.WriteString("    - When the user names someone (\"assign to X\" / \"@X\"), call `multica workspace member list --output json`, `multica agent list --output json`, and `multica squad list --output json` and find the matching entity by display name. Squads are first-class assignees too — a squad name (e.g. \"Super Human\") routes work to the squad leader, who then delegates. On a clean unambiguous match, prefer `--assignee-id <uuid>` using the `user_id` (member) or `id` (agent or squad) from that JSON — UUID matching is exact and robust to name collisions in workspaces with overlapping names. `--assignee <name>` (fuzzy) is acceptable as a fallback when names are unambiguous. On no match or ambiguous match, do NOT pass either flag — instead append a final line to the description: `Unrecognized assignee: X`.\n")
+		b.WriteString("    - Treat bare @-routing as an assignee directive even when the user did not write the English word \"assign\". This includes Chinese imperatives like `让 @独立团 review 这个 PR`, `给 @X 处理`, or `交给 @X`; strip the leading `@`/`＠` before matching display names. Do not keep that routing wrapper or `@Name` in the description unless it is a true CC-style notification rather than ownership. If the matched entity is a squad, pass the squad's `id` as `--assignee-id`, not the leader agent's id.\n")
+	}
 	agentID := ""
 	agentName := ""
 	if task.Agent != nil {
 		agentID = task.Agent.ID
 		agentName = task.Agent.Name
 	}
-	switch {
-	case task.SquadID != "":
-		// The user opened quick-create with a SQUAD selected. The task
-		// runs on the squad's leader agent, but the squad is the expected
-		// owner — assigning to the leader would mask the squad's
-		// delegation flow. Always point the default at the squad UUID.
-		if task.SquadName != "" {
-			fmt.Fprintf(&b, "    - When the user did NOT name an assignee, default to the picker SQUAD %q: pass `--assignee-id %q` (the squad's UUID). The user opened quick-create with the squad selected; you (the leader agent) are running on the squad's behalf, so the squad — not you — is the expected owner. Never leave the issue unassigned, and do not assign it to your own agent UUID.\n\n", task.SquadName, task.SquadID)
-		} else {
-			fmt.Fprintf(&b, "    - When the user did NOT name an assignee, default to the picker SQUAD: pass `--assignee-id %q` (the squad's UUID). The user opened quick-create with the squad selected; you (the leader agent) are running on the squad's behalf, so the squad — not you — is the expected owner. Never leave the issue unassigned, and do not assign it to your own agent UUID.\n\n", task.SquadID)
+	if isDesktop {
+		switch {
+		case task.SquadID != "":
+			fmt.Fprintf(&b, "    - If no assignee was named, use the selected squad %q: pass `--assignee-id %q`. The squad, not its leader, is the expected owner. Never leave the issue unassigned.\n\n", task.SquadName, task.SquadID)
+		case agentID != "":
+			fmt.Fprintf(&b, "    - If no assignee was named, use your selected identity: pass `--assignee-id %q`. Never leave the issue unassigned. Use the UUID for an unambiguous assignment.\n\n", agentID)
+		case agentName != "":
+			fmt.Fprintf(&b, "    - If no assignee was named, use your selected identity: pass `--assignee %q`. Never leave the issue unassigned.\n\n", agentName)
+		default:
+			b.WriteString("    - If no assignee was named, assign the issue to your selected identity with `--assignee-id <your UUID>` (preferred) or `--assignee <your name>`. Never leave the issue unassigned.\n\n")
 		}
-	case agentID != "":
-		fmt.Fprintf(&b, "    - When the user did NOT name an assignee, default to YOURSELF: pass `--assignee-id %q` (your agent UUID). The picker agent is the expected owner because the user opened quick-create with you selected — never leave the issue unassigned. Use the UUID flag, not `--assignee <name>`, so the assignment is unambiguous even when other agents share part of your name.\n\n", agentID)
-	case agentName != "":
-		fmt.Fprintf(&b, "    - When the user did NOT name an assignee, default to YOURSELF: pass `--assignee %q`. The picker agent is the expected owner because the user opened quick-create with you selected — never leave the issue unassigned.\n\n", agentName)
-	default:
-		b.WriteString("    - When the user did NOT name an assignee, default to YOURSELF (the picker agent): pass `--assignee-id <your agent UUID>` (preferred) or `--assignee <your agent name>`. Never leave the issue unassigned.\n\n")
+	} else {
+		switch {
+		case task.SquadID != "":
+			// The user opened quick-create with a SQUAD selected. The task
+			// runs on the squad's leader agent, but the squad is the expected
+			// owner — assigning to the leader would mask the squad's
+			// delegation flow. Always point the default at the squad UUID.
+			if task.SquadName != "" {
+				fmt.Fprintf(&b, "    - When the user did NOT name an assignee, default to the picker SQUAD %q: pass `--assignee-id %q` (the squad's UUID). The user opened quick-create with the squad selected; you (the leader agent) are running on the squad's behalf, so the squad — not you — is the expected owner. Never leave the issue unassigned, and do not assign it to your own agent UUID.\n\n", task.SquadName, task.SquadID)
+			} else {
+				fmt.Fprintf(&b, "    - When the user did NOT name an assignee, default to the picker SQUAD: pass `--assignee-id %q` (the squad's UUID). The user opened quick-create with the squad selected; you (the leader agent) are running on the squad's behalf, so the squad — not you — is the expected owner. Never leave the issue unassigned, and do not assign it to your own agent UUID.\n\n", task.SquadID)
+			}
+		case agentID != "":
+			fmt.Fprintf(&b, "    - When the user did NOT name an assignee, default to YOURSELF: pass `--assignee-id %q` (your agent UUID). The picker agent is the expected owner because the user opened quick-create with you selected — never leave the issue unassigned. Use the UUID flag, not `--assignee <name>`, so the assignment is unambiguous even when other agents share part of your name.\n\n", agentID)
+		case agentName != "":
+			fmt.Fprintf(&b, "    - When the user did NOT name an assignee, default to YOURSELF: pass `--assignee %q`. The picker agent is the expected owner because the user opened quick-create with you selected — never leave the issue unassigned.\n\n", agentName)
+		default:
+			b.WriteString("    - When the user did NOT name an assignee, default to YOURSELF (the picker agent): pass `--assignee-id <your agent UUID>` (preferred) or `--assignee <your agent name>`. Never leave the issue unassigned.\n\n")
+		}
 	}
 
 	if task.QuickCreateDueDate != "" {
@@ -498,7 +584,8 @@ func buildQuickCreatePrompt(task Task) string {
 // The reply instructions (including the current TriggerCommentID as --parent)
 // are re-emitted on every turn so resumed sessions cannot carry forward a
 // previous turn's --parent UUID.
-func buildCommentPrompt(task Task, provider string) string {
+func buildCommentPrompt(task Task, provider string, desktop ...bool) string {
+	isDesktop := len(desktop) > 0 && desktop[0]
 	var b strings.Builder
 	b.WriteString("You are running as a local coding agent for a Multica workspace.\n\n")
 	fmt.Fprintf(&b, "Your assigned issue ID is: %s\n\n", task.IssueID)
@@ -511,10 +598,17 @@ func buildCommentPrompt(task Task, provider string) string {
 			authorLabel = "The platform"
 		} else if task.TriggerAuthorType == "agent" {
 			name := task.TriggerAuthorName
-			if name == "" {
-				name = "another agent"
+			if isDesktop {
+				authorLabel = "Another participant"
+				if name != "" {
+					authorLabel = fmt.Sprintf("Another participant (%s)", name)
+				}
+			} else {
+				if name == "" {
+					name = "another agent"
+				}
+				authorLabel = fmt.Sprintf("Another agent (%s)", name)
 			}
-			authorLabel = fmt.Sprintf("Another agent (%s)", name)
 		}
 		// MUL-8218: an edited trigger on a resumed session. The edit cancelled
 		// the run that read the old text and retriggered from the new one, but
@@ -547,10 +641,17 @@ func buildCommentPrompt(task Task, provider string) string {
 					authorLabel = "The platform"
 				} else if cc.AuthorType == "agent" {
 					name := cc.AuthorName
-					if name == "" {
-						name = "another agent"
+					if isDesktop {
+						authorLabel = "Another participant"
+						if name != "" {
+							authorLabel = fmt.Sprintf("Another participant (%s)", name)
+						}
+					} else {
+						if name == "" {
+							name = "another agent"
+						}
+						authorLabel = fmt.Sprintf("Another agent (%s)", name)
 					}
-					authorLabel = fmt.Sprintf("Another agent (%s)", name)
 				} else if cc.AuthorName != "" {
 					authorLabel = cc.AuthorName
 				}
