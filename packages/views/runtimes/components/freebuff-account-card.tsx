@@ -94,13 +94,14 @@ export function FreebuffAccountCard({ runtime }: { runtime: AgentRuntime }) {
     return () => clearInterval(id);
   }, [isFreebuff]);
 
+  const setEngine = useSetFreebuffEngineVersion();
+
   if (!isFreebuff) return null;
 
   const accounts = data?.accounts ?? [];
   const defaultId = data?.default_account_id ?? null;
   const versions = data?.installed_versions ?? [];
   const engineVersion = data?.engine_version ?? "";
-  const setEngine = useSetFreebuffEngineVersion();
 
   const handleAdd = async () => {
     try {
