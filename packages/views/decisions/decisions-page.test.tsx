@@ -576,6 +576,90 @@ describe("DecisionsPage", () => {
     expect(screen.queryByRole("button", { name: "Request changes" })).toBeNull();
   });
 
+  it("shows the recorded verdict of an answered workflow handoff", async () => {
+    apiMock.listDecisions.mockImplementation(
+      async (_ws: string, params: { state?: string }) => ({
+        items:
+          params.state === "answered"
+            ? [
+                {
+                  ...DECISIONS[1],
+                  // The answered projection keys a handoff by issue and receipt.
+                  source_id: "issue-2:receipt-1",
+                  status: "answered",
+                  response_id: "receipt-1",
+                  actor_id: "member-1",
+                },
+              ]
+            : DECISIONS,
+        pending_count: 2,
+        next_cursor: null,
+      }),
+    );
+    apiMock.getDecisionDetail.mockResolvedValue({
+      id: "issue-2",
+      title: "Migrate the store",
+      description: "Waiting on the plan in the thread.",
+      revision: 12,
+      status: "in_progress",
+      response: {
+        id: "receipt-1",
+        issue_id: "issue-2",
+        actor_id: "member-1",
+        decision: "Approve",
+        rationale: "Reviewed the plan",
+        next_status: "in_progress",
+        created_at: "2026-11-03T12:00:00Z",
+      },
+    });
+    const view = renderPage();
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(3));
+    fireEvent.click(screen.getByRole("tab", { name: /Answered/ }));
+    await waitFor(() => expect(within(view.detail()).getByText("Verdict")).toBeTruthy());
+    // The verdict line carries the decision, who recorded it and when; the
+    // waiting copy belongs to a handoff nobody answered, so it cannot appear.
+    const verdict = within(view.detail()).getByText(/Approve/);
+    expect(verdict.textContent).toContain("Ada Lovelace");
+    expect(verdict.textContent).toContain("Answered 2 hours ago");
+    expect(within(view.detail()).getByText("Rationale")).toBeTruthy();
+    expect(
+      view.detail().querySelector('[data-readonly-content="Reviewed the plan"]'),
+    ).not.toBeNull();
+    expect(within(view.detail()).queryByText("Waiting on a workflow decision")).toBeNull();
+    expect(
+      within(view.detail())
+        .getAllByRole("link", { name: "Open issue" })
+        .some((link) => link.getAttribute("href") === "/acme/issues/issue-2"),
+    ).toBe(true);
+  });
+
+  it("keeps the waiting copy for a pending read that fails", async () => {
+    apiMock.getDecisionDetail.mockRejectedValue(new Error("boom"));
+    const view = renderPage();
+    await waitFor(() =>
+      expect(within(view.detail()).getByText("This request could not be loaded")).toBeTruthy(),
+    );
+    expect(
+      within(view.detail()).getByText("It is still waiting — nothing was answered."),
+    ).toBeTruthy();
+  });
+
+  it("does not tell the reader nothing was answered when an answered read fails", async () => {
+    apiMock.getDecisionDetail.mockRejectedValue(new Error("boom"));
+    const view = renderPage();
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(3));
+    fireEvent.click(screen.getByRole("tab", { name: /Answered/ }));
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(1));
+    await waitFor(() =>
+      expect(
+        within(view.detail()).getByText("Could not read this request. Try again."),
+      ).toBeTruthy(),
+    );
+    expect(
+      within(view.detail()).queryByText("It is still waiting — nothing was answered."),
+    ).toBeNull();
+  });
+
   it("renders a failed read as an error with a retry, never as an empty queue", async () => {
     apiMock.listDecisions.mockRejectedValue(new Error("boom"));
     renderPage();

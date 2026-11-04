@@ -133,8 +133,41 @@ describe("decision detail readers", () => {
       description: "Plan is attached to the thread.",
       revision: 12,
       status: "wait_for_decision",
+      response: null,
     });
     expect(parseDecisionStatus({ id: "" })).toBeNull();
+  });
+
+  it("reads the verdict recorded on an answered handoff", () => {
+    const detail = parseDecisionStatus({
+      id: "issue-1",
+      title: "Migrate the store",
+      description: "Plan is attached to the thread.",
+      revision: 13,
+      status: "in_progress",
+      response: {
+        id: "receipt-1",
+        issue_id: "issue-1",
+        actor_id: "member-1",
+        decision: "Approve",
+        rationale: "Reviewed the plan",
+        next_status: "in_progress",
+        requested_at: "2026-11-03T09:00:00Z",
+        created_at: "2026-11-03T10:00:00Z",
+      },
+    });
+    expect(detail?.response).toEqual({
+      decision: "Approve",
+      rationale: "Reviewed the plan",
+      actorId: "member-1",
+      recordedAt: "2026-11-03T10:00:00Z",
+    });
+    // A join that found no receipt is a handoff still waiting, not a verdict
+    // with every field missing.
+    expect(
+      parseDecisionStatus({ id: "issue-1", status: "wait_for_decision", response: null })
+        ?.response,
+    ).toBeNull();
   });
 
   it("answers the three shipped sources and leaves the handoff read-only", () => {

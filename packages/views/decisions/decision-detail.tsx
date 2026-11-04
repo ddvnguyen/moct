@@ -133,7 +133,9 @@ export function DecisionDetail({
               {t(($) => $.detail.error_title)}
             </p>
             <p className="mt-1 text-caption text-muted-foreground">
-              {t(($) => $.detail.error_hint)}
+              {state === "answered"
+                ? t(($) => $.detail.error_hint_answered)
+                : t(($) => $.detail.error_hint)}
             </p>
             <Button
               type="button"
@@ -312,6 +314,44 @@ function SourceBody({
     case "status": {
       const parsed = parseDecisionStatus(detail);
       if (parsed === null) return <UnreadableSource />;
+      // An answered handoff reads back as the recorded verdict: the decision,
+      // who recorded it and when, its rationale. The waiting copy below is for
+      // a handoff that has not been answered yet, never for one that has.
+      if (parsed.response !== null) {
+        const recordedBy = actorLabel(parsed.response.actorId);
+        return (
+          <div className="space-y-3">
+            <p className="text-caption font-medium text-foreground">
+              {t(($) => $.detail.review_title)}
+            </p>
+            <p className="text-caption text-muted-foreground">
+              {parsed.response.decision}
+              {recordedBy !== null
+                ? ` · ${t(($) => $.detail.by, { actor: recordedBy })}`
+                : ""}
+              {parsed.response.recordedAt !== null
+                ? ` · ${t(($) => $.detail.answered, {
+                    age: timeAgo(parsed.response.recordedAt),
+                  })}`
+                : ""}
+            </p>
+            {parsed.response.rationale.trim() !== "" && (
+              <>
+                <p className="text-caption font-medium text-foreground">
+                  {t(($) => $.detail.rationale_title)}
+                </p>
+                <div className="rounded-md border px-3 py-2.5">
+                  <ReadonlyContent content={parsed.response.rationale} />
+                </div>
+              </>
+            )}
+            <p className="text-caption text-muted-foreground">
+              {t(($) => $.detail.answered_hint)}
+            </p>
+            {issueLink}
+          </div>
+        );
+      }
       return (
         <div className="space-y-3">
           <p className="flex items-center gap-1.5 text-caption font-medium text-foreground">

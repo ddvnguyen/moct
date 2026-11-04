@@ -266,12 +266,22 @@ export function parseDecisionNative(
   };
 }
 
+export interface DecisionStatusResponse {
+  /** The workflow decision recorded on the issue, e.g. `Approve`. */
+  decision: string;
+  rationale: string;
+  actorId: string | null;
+  recordedAt: string | null;
+}
+
 export interface DecisionStatusDetail {
   issueId: string;
   title: string;
   description: string;
   revision: number;
   status: string;
+  /** The recorded handoff verdict, or null while the issue is still waiting. */
+  response: DecisionStatusResponse | null;
 }
 
 /** The issue behind a status-only handoff, or null. */
@@ -280,11 +290,27 @@ export function parseDecisionStatus(
 ): DecisionStatusDetail | null {
   const issueId = asText(detail.id);
   if (issueId === "") return null;
+  // An answered handoff reads back through the `issue_decision_response` row
+  // the detail query already joins; a body without one is a request that is
+  // still waiting, which is a different state, not a missing verdict.
+  const response = asRecord(detail.response);
+  const decision = asText(response?.decision);
   return {
     issueId,
     title: asText(detail.title),
     description: asText(detail.description),
     revision: asNumber(detail.revision) ?? 0,
     status: asText(detail.status),
+    response:
+      response === null || decision === ""
+        ? null
+        : {
+            decision,
+            rationale: asText(response.rationale),
+            actorId: asNullableText(response.actor_id),
+            recordedAt:
+              asNullableText(response.created_at) ??
+              asNullableText(response.requested_at),
+          },
   };
 }

@@ -2,7 +2,10 @@ package handler
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -242,6 +245,100 @@ func TestDecisionHandlers(t *testing.T) {
 	testutil.Call(t, testHandler.ListDecisions, req).Want(200).JSON(&page)
 	if page.PendingCount != 2 {
 		t.Fatalf("authorized source missing: %+v", page)
+	}
+}
+
+// TestDecisionDetailDecodesCompositeSourceID pins the wire contract of the
+// detail route: a composite source id (`<plan>:<review>`, `<issue>:<response>`,
+// `<task>:<seq>`) reaches the handler still percent-encoded, because the client
+// encodes the id and chi routes on the escaped path (M-234). Splitting before
+// decoding saw one part instead of two and answered 400 "invalid source id" for
+// every answered plan and handoff.
+//
+// The test drives the real route: the chi context a direct call would fake is
+// exactly the thing that carries the encoding, so a handler-level test cannot
+// catch this. Both spellings of the separator are exercised — a client that
+// sends a literal `:` keeps working — and a plain question id still resolves.
+func TestDecisionDetailDecodesCompositeSourceID(t *testing.T) {
+	issue := dbfx.Issue(t, "composite decision detail")
+	agent := dbfx.Agent(t, "composite decision agent", "")
+	plan := dbfx.Insert(t, "agent_plan", testutil.Cols{
+		"workspace_id": testWorkspaceID, "issue_id": issue, "agent_id": agent,
+		"task_id": testutil.Raw("gen_random_uuid()"), "title": "Encoded plan", "status": "approved",
+	})
+	review := dbfx.Insert(t, "agent_plan_review", testutil.Cols{
+		"plan_id": plan, "plan_revision": 1, "verdict": "approve",
+		"comments": testutil.Raw(`'["Ship it"]'::jsonb`), "reviewed_by": testUserID,
+	})
+	receipt := dbfx.Insert(t, "issue_decision_response", testutil.Cols{
+		"id": testutil.Raw("gen_random_uuid()"),
+		"workspace_id": testWorkspaceID, "issue_id": issue, "actor_id": testUserID,
+		"client_request_id": testutil.Raw("gen_random_uuid()"), "source_revision": 1,
+		"decision": "Approve", "rationale": "Reviewed", "next_status": "in_progress",
+		"comment_id": testutil.Raw("gen_random_uuid()"),
+	})
+	task := dbfx.Task(t, agent, testutil.Cols{"issue_id": issue, "status": "running", "runtime_id": testRuntimeID})
+	dbfx.Insert(t, "task_message", testutil.Cols{
+		"task_id": task, "seq": 7, "type": "text",
+		"input": testutil.Raw(`'{"questions":[{"question":"Which runtime?"}]}'::jsonb`),
+	})
+	card := dbfx.Insert(t, "agent_question_card", testutil.Cols{
+		"workspace_id": testWorkspaceID, "issue_id": issue, "agent_id": agent,
+		"task_id": testutil.Raw("gen_random_uuid()"), "questions": testutil.Raw(`'[{"prompt":"Pick"}]'::jsonb`),
+	})
+
+	router := chi.NewRouter()
+	router.Get("/api/workspaces/{id}/decisions/{kind}/{sourceId}", testHandler.GetDecisionDetail)
+	call := func(kind, sourceID string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		path := "/api/workspaces/" + testWorkspaceID + "/decisions/" + kind + "/" + sourceID
+		router.ServeHTTP(w, newRequest("GET", path, nil))
+		return w
+	}
+
+	for _, tc := range []struct {
+		kind, sourceID, want string
+	}{
+		{"plan", plan + "%3A" + review, `"verdict":"approve"`},
+		{"plan", plan + ":" + review, `"verdict":"approve"`},
+		{"status", issue + "%3A" + receipt, `"decision":"Approve"`},
+		{"status", issue + ":" + receipt, `"decision":"Approve"`},
+		{"native", task + "%3A7", `"seq":7`},
+		{"native", task + ":7", `"seq":7`},
+		{"question", card, `"id":"` + card + `"`},
+	} {
+		w := call(tc.kind, tc.sourceID)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s %s: status = %d, body = %s", tc.kind, tc.sourceID, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), tc.want) {
+			t.Fatalf("%s %s: body = %s, want %s", tc.kind, tc.sourceID, w.Body.String(), tc.want)
+		}
+	}
+
+	// A composite id whose halves are unusable stays a bad request: never a 500,
+	// and never a read of another issue's record.
+	for _, bad := range []struct{ kind, sourceID string }{
+		{"status", "not-a-uuid"},
+		{"status", issue + "%3Anot-a-uuid"},
+		{"question", card + "%3A" + receipt},
+		{"native", task + "%3Ax"},
+	} {
+		if w := call(bad.kind, bad.sourceID); w.Code != http.StatusBadRequest {
+			t.Fatalf("%s %s: status = %d, want 400 (body %s)", bad.kind, bad.sourceID, w.Code, w.Body.String())
+		}
+	}
+
+	// net/http rejects a malformed escape before it ever routes, so the guard for
+	// one is pinned on the handler itself.
+	w := httptest.NewRecorder()
+	testHandler.GetDecisionDetail(w, testutil.WithURLParams(
+		newRequest("GET", "/decisions/status/x", nil),
+		"id", testWorkspaceID, "kind", "status", "sourceId", issue+"%zz",
+	))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("malformed escape: status = %d, want 400 (body %s)", w.Code, w.Body.String())
 	}
 }
 

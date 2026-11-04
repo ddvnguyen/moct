@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -160,7 +161,17 @@ func (h *Handler) GetDecisionDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid decision kind")
 		return
 	}
-	parts := strings.Split(chi.URLParam(r, "sourceId"), ":")
+	// The client percent-encodes the composite source id (`<issue>:<response>`,
+	// `<task>:<seq>`), and chi routes on the escaped path, so the param arrives
+	// still encoded (M-234). Decode once here, before splitting: a decoded id is
+	// identical for a client that sent a literal `:`, and a malformed escape is
+	// a bad request rather than a 404 on a mangled id.
+	sourceID, err := url.PathUnescape(chi.URLParam(r, "sourceId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid source id")
+		return
+	}
+	parts := strings.Split(sourceID, ":")
 	if len(parts) < 1 || len(parts) > 2 || (kind == "native" && len(parts) != 2) || (kind == "question" && len(parts) != 1) {
 		writeError(w, http.StatusBadRequest, "invalid source id")
 		return
