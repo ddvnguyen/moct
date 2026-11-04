@@ -244,3 +244,64 @@ func TestDecisionHandlers(t *testing.T) {
 		t.Fatalf("authorized source missing: %+v", page)
 	}
 }
+
+func TestStatusDecisionReceiptHistory(t *testing.T) {
+	issue := dbfx.Issue(t, "answered decision")
+	requestedAt := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	receipt := dbfx.Insert(t, "issue_decision_response", testutil.Cols{
+		"id":           testutil.Raw("gen_random_uuid()"),
+		"workspace_id": testWorkspaceID, "issue_id": issue, "actor_id": testUserID,
+		"client_request_id": testutil.Raw("gen_random_uuid()"), "source_revision": 1,
+		"decision": "Approve", "rationale": "Reviewed", "next_status": "in_progress",
+		"comment_id":   testutil.Raw("gen_random_uuid()"),
+		"requested_at": requestedAt,
+	})
+	req := withURLParam(newRequest("GET", "/decisions?state=answered", nil), "id", testWorkspaceID)
+	var page decisionsResult
+	testutil.Call(t, testHandler.ListDecisions, req).Want(200).JSON(&page)
+	if len(page.Items) != 1 || page.Items[0].SourceID != issue+":"+receipt || page.Items[0].ResponseID == nil || *page.Items[0].ResponseID != receipt {
+		t.Fatalf("receipt history: %+v", page)
+	}
+	if !page.Items[0].RequestedAt.Equal(requestedAt) {
+		t.Fatalf("requested_at = %v, want %v", page.Items[0].RequestedAt, requestedAt)
+	}
+	req = withURLParam(newRequest("GET", "/decisions/status/"+issue+":"+receipt, nil), "id", testWorkspaceID)
+	chi.RouteContext(req.Context()).URLParams.Add("kind", "status")
+	chi.RouteContext(req.Context()).URLParams.Add("sourceId", issue+":"+receipt)
+	var detail struct {
+		Response struct {
+			Decision  string `json:"decision"`
+			Rationale string `json:"rationale"`
+		} `json:"response"`
+	}
+	testutil.Call(t, testHandler.GetDecisionDetail, req).Want(200).JSON(&detail)
+	if detail.Response.Decision != "Approve" || detail.Response.Rationale != "Reviewed" {
+		t.Fatalf("receipt detail: %+v", detail)
+	}
+}
+
+func TestDeleteIssueRemovesOnlyItsDecisionReceipts(t *testing.T) {
+	issue := dbfx.Issue(t, "decision receipt deletion")
+	other := dbfx.Issue(t, "another decision")
+	insert := func(issueID string) string {
+		return dbfx.Insert(t, "issue_decision_response", testutil.Cols{
+			"id": testutil.Raw("gen_random_uuid()"), "workspace_id": testWorkspaceID,
+			"issue_id": issueID, "actor_id": testUserID, "client_request_id": testutil.Raw("gen_random_uuid()"),
+			"source_revision": 1, "decision": "Approve", "rationale": "", "next_status": "in_progress",
+			"comment_id": testutil.Raw("gen_random_uuid()"),
+		})
+	}
+	receipt, otherReceipt := insert(issue), insert(other)
+	if err := testHandler.Queries.DeleteIssue(t.Context(), db.DeleteIssueParams{ID: parseUUID(issue), WorkspaceID: parseUUID(other)}); err != nil {
+		t.Fatal(err)
+	}
+	if !rowExists(t, "issue_decision_response", receipt) {
+		t.Fatal("foreign workspace deletion removed the receipt")
+	}
+	if err := testHandler.Queries.DeleteIssue(t.Context(), db.DeleteIssueParams{ID: parseUUID(issue), WorkspaceID: parseUUID(testWorkspaceID)}); err != nil {
+		t.Fatal(err)
+	}
+	if rowExists(t, "issue_decision_response", receipt) || !rowExists(t, "issue_decision_response", otherReceipt) {
+		t.Fatal("issue deletion did not remove only the target's receipt")
+	}
+}

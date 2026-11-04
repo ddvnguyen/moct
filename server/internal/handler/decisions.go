@@ -161,7 +161,7 @@ func (h *Handler) GetDecisionDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parts := strings.Split(chi.URLParam(r, "sourceId"), ":")
-	if len(parts) < 1 || len(parts) > 2 || (kind == "native" && len(parts) != 2) || ((kind == "question" || kind == "status") && len(parts) != 1) {
+	if len(parts) < 1 || len(parts) > 2 || (kind == "native" && len(parts) != 2) || (kind == "question" && len(parts) != 1) {
 		writeError(w, http.StatusBadRequest, "invalid source id")
 		return
 	}
@@ -172,7 +172,7 @@ func (h *Handler) GetDecisionDetail(w http.ResponseWriter, r *http.Request) {
 	var response pgtype.UUID
 	var seq int32
 	if len(parts) == 2 {
-		if kind == "plan" {
+		if kind == "plan" || kind == "status" {
 			response, ok = parseUUIDOrBadRequest(w, parts[1], "response_id")
 			if !ok {
 				return

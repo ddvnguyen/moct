@@ -19,3 +19,10 @@ export interface DecisionsParams { state?: "pending" | "answered"; project_id?: 
 
 export const DecisionDetailSchema = z.record(z.string(), z.unknown());
 export type DecisionDetail = z.infer<typeof DecisionDetailSchema>;
+
+export const DecisionResponseReceiptSchema = z.object({
+  id: z.string(), workspace_id: z.string(), issue_id: z.string(), client_request_id: z.string(),
+  actor_id: z.string(), source_revision: z.number(), decision: z.string(), rationale: z.string(),
+  next_status: z.string(), comment_id: z.string(), task_id: z.string().nullable(), created_at: z.string(),
+});
+export type DecisionResponseReceipt = z.infer<typeof DecisionResponseReceiptSchema>;

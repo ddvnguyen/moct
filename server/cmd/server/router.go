@@ -1772,6 +1772,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.With(handler.RequireHumanActor).Post("/question-cards/{cardId}/answer", h.AnswerQuestionCard)
 					r.With(handler.RequireHumanActor).Post("/plans/{planId}/verdict", h.ReviewPlan)
 					r.Get("/issues/{issueId}/ask-plan", h.GetIssueAskPlan)
+					r.With(handler.RequireHumanActor).Post("/issues/{issueId}/decision-response", h.DecisionResponse)
 					r.Get("/decisions", h.ListDecisions)
 					r.Get("/decisions/{kind}/{sourceId}", h.GetDecisionDetail)
 					// S2-C (M-123) settings the dsh panel's MOCT group reads: the

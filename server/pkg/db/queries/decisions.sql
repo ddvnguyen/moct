@@ -56,6 +56,12 @@ WITH scoped_issues AS MATERIALIZED (
 ), visible_pending AS MATERIALIZED (
     SELECT * FROM pending WHERE agent_id IS NULL OR agent_id = ANY(sqlc.arg(visible_agents)::uuid[])
 ), history AS (
+    SELECT 'status'::text AS kind, d.issue_id::text || ':' || d.id::text AS source_id, d.issue_id, NULL::uuid AS agent_id,
+           d.created_at AS sort_at, d.task_id, NULL::integer AS question_seq, 'answered'::text AS status,
+           d.id AS response_id, d.actor_id, d.requested_at, NULL::text AS receipt_reason
+    FROM issue_decision_response d JOIN scoped_issues i ON i.id = d.issue_id
+    WHERE d.workspace_id = i.workspace_id
+    UNION ALL
     SELECT 'question'::text AS kind, c.id::text AS source_id, c.issue_id, c.agent_id,
            COALESCE(c.answered_at, c.withdrawn_at) AS sort_at, c.task_id, NULL::integer AS question_seq, c.status, c.id AS response_id, c.answered_by AS actor_id, c.created_at AS requested_at, NULL::text AS receipt_reason
     FROM agent_question_card c JOIN scoped_issues i ON i.id = c.issue_id
@@ -116,6 +122,8 @@ SELECT payload FROM (
   WHERE sqlc.arg(kind)::text = 'native' AND i.workspace_id=sqlc.arg(workspace_id)::uuid
     AND t.id=sqlc.arg(source_id)::uuid AND t.agent_id = ANY(sqlc.arg(visible_agents)::uuid[])
   UNION ALL
-  SELECT jsonb_build_object('id', i.id, 'title', i.title, 'description', i.description, 'revision', i.revision, 'status', i.status)
-  FROM issue i WHERE sqlc.arg(kind)::text = 'status' AND i.workspace_id=sqlc.arg(workspace_id)::uuid AND i.id=sqlc.arg(source_id)::uuid
+  SELECT jsonb_build_object('id', i.id, 'title', i.title, 'description', i.description, 'revision', i.revision, 'status', i.status, 'response', to_jsonb(d))
+  FROM issue i LEFT JOIN issue_decision_response d ON d.issue_id = i.id AND d.workspace_id = i.workspace_id AND d.id = sqlc.narg(response_id)::uuid
+  WHERE sqlc.arg(kind)::text = 'status' AND i.workspace_id=sqlc.arg(workspace_id)::uuid AND i.id=sqlc.arg(source_id)::uuid
+    AND (sqlc.narg(response_id)::uuid IS NULL OR d.id IS NOT NULL)
 ) details LIMIT 1;

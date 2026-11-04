@@ -35,8 +35,10 @@ SELECT payload FROM (
   WHERE $1::text = 'native' AND i.workspace_id=$2::uuid
     AND t.id=$3::uuid AND t.agent_id = ANY($4::uuid[])
   UNION ALL
-  SELECT jsonb_build_object('id', i.id, 'title', i.title, 'description', i.description, 'revision', i.revision, 'status', i.status)
-  FROM issue i WHERE $1::text = 'status' AND i.workspace_id=$2::uuid AND i.id=$3::uuid
+  SELECT jsonb_build_object('id', i.id, 'title', i.title, 'description', i.description, 'revision', i.revision, 'status', i.status, 'response', to_jsonb(d))
+  FROM issue i LEFT JOIN issue_decision_response d ON d.issue_id = i.id AND d.workspace_id = i.workspace_id AND d.id = $5::uuid
+  WHERE $1::text = 'status' AND i.workspace_id=$2::uuid AND i.id=$3::uuid
+    AND ($5::uuid IS NULL OR d.id IS NOT NULL)
 ) details LIMIT 1
 `
 
@@ -121,6 +123,12 @@ WITH scoped_issues AS MATERIALIZED (
 ), visible_pending AS MATERIALIZED (
     SELECT kind, source_id, issue_id, agent_id, sort_at, task_id, question_seq, status, response_id, actor_id, requested_at, receipt_reason FROM pending WHERE agent_id IS NULL OR agent_id = ANY($4::uuid[])
 ), history AS (
+    SELECT 'status'::text AS kind, d.issue_id::text || ':' || d.id::text AS source_id, d.issue_id, NULL::uuid AS agent_id,
+           d.created_at AS sort_at, d.task_id, NULL::integer AS question_seq, 'answered'::text AS status,
+           d.id AS response_id, d.actor_id, d.requested_at, NULL::text AS receipt_reason
+    FROM issue_decision_response d JOIN scoped_issues i ON i.id = d.issue_id
+    WHERE d.workspace_id = i.workspace_id
+    UNION ALL
     SELECT 'question'::text AS kind, c.id::text AS source_id, c.issue_id, c.agent_id,
            COALESCE(c.answered_at, c.withdrawn_at) AS sort_at, c.task_id, NULL::integer AS question_seq, c.status, c.id AS response_id, c.answered_by AS actor_id, c.created_at AS requested_at, NULL::text AS receipt_reason
     FROM agent_question_card c JOIN scoped_issues i ON i.id = c.issue_id

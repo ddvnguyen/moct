@@ -47,7 +47,11 @@ import (
 // agent/system principals, but member/team targets fail closed without a
 // matching human.
 func (h *Handler) canInvokeAgent(ctx context.Context, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) bool {
-	allowed := h.invokeAgentDecision(ctx, agent, actorType, actorID, originatorUserID, workspaceID)
+	return h.canInvokeAgentWithQueries(ctx, h.Queries, agent, actorType, actorID, originatorUserID, workspaceID)
+}
+
+func (h *Handler) canInvokeAgentWithQueries(ctx context.Context, q *db.Queries, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) bool {
+	allowed := h.invokeAgentDecision(ctx, q, agent, actorType, actorID, originatorUserID, workspaceID)
 	if !allowed && actorType != "member" && originatorUserID == "" {
 		// MUL-6490: the wire reason stays the deliberately generic
 		// invocation_not_allowed (dispatch/reason.go — it must not reveal whether a
@@ -70,7 +74,7 @@ func (h *Handler) canInvokeAgent(ctx context.Context, agent db.Agent, actorType,
 
 // invokeAgentDecision is canInvokeAgent's pure verdict, split out so the gate has
 // exactly one place to observe a denial from.
-func (h *Handler) invokeAgentDecision(ctx context.Context, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) bool {
+func (h *Handler) invokeAgentDecision(ctx context.Context, q *db.Queries, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) bool {
 	effectiveUser := actorID
 	if actorType != "member" {
 		// agent / system: never trust the immediate principal, only the
@@ -89,7 +93,7 @@ func (h *Handler) invokeAgentDecision(ctx context.Context, agent db.Agent, actor
 		return false
 	}
 
-	targets, err := h.Queries.ListAgentInvocationTargets(ctx, agent.ID)
+	targets, err := q.ListAgentInvocationTargets(ctx, agent.ID)
 	if err != nil {
 		return false
 	}
@@ -107,8 +111,11 @@ func (h *Handler) invokeAgentDecision(ctx context.Context, agent db.Agent, actor
 	workspaceBroad := actorType == "agent" || actorType == "system"
 	isWorkspaceMember := false
 	if effectiveUser != "" {
-		if _, err := h.getWorkspaceMember(ctx, effectiveUser, workspaceID); err == nil {
-			isWorkspaceMember = true
+		userUUID, userErr := util.ParseUUID(effectiveUser)
+		workspaceUUID, workspaceErr := util.ParseUUID(workspaceID)
+		if userErr == nil && workspaceErr == nil {
+			_, err := q.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{UserID: userUUID, WorkspaceID: workspaceUUID})
+			isWorkspaceMember = err == nil
 		}
 	}
 

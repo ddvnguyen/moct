@@ -1,4 +1,4 @@
-import { DecisionDetailSchema, DecisionsPageSchema, type DecisionDetail, type DecisionsPage, type DecisionsParams } from "../decisions/schema";
+import { DecisionDetailSchema, DecisionResponseReceiptSchema, DecisionsPageSchema, type DecisionDetail, type DecisionResponseReceipt, type DecisionsPage, type DecisionsParams } from "../decisions/schema";
 import type { ZodType } from "zod";
 import { AgentRuntimeSchema, EMPTY_RUNTIME } from "../runtimes/schema";
 import type { IssueWakeup, IssueWakeupInput, IssueWakeupSummaryRow, PausedWakeup, SystemWakeup, WakeupRun, WorkspaceSystemWakeup } from "../types/issue-wakeup";
@@ -1032,6 +1032,16 @@ export class ApiClient {
     const raw = await this.fetch<unknown>(`/api/workspaces/${encodeURIComponent(workspaceId)}/decisions/${encodeURIComponent(kind)}/${encodeURIComponent(sourceId)}`);
     const parsed = parseWithFallback<DecisionDetail | null>(raw, DecisionDetailSchema, null, { endpoint: "GET /api/workspaces/:id/decisions/:kind/:sourceId" });
     if (!parsed) throw new Error("Invalid Decision detail response");
+    return parsed;
+  }
+
+  async respondDecision(issueId: string, body: { client_request_id: string; expected_issue_revision: number; decision: string; rationale?: string; next_status: string }): Promise<DecisionResponseReceipt> {
+    const raw = await this.fetch<unknown>(`/api/issues/${encodeURIComponent(issueId)}/decision-response`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const parsed = parseWithFallback<DecisionResponseReceipt | null>(raw, DecisionResponseReceiptSchema, null, { endpoint: "POST /api/issues/:id/decision-response" });
+    if (!parsed) throw new Error("Invalid Decision response receipt");
     return parsed;
   }
 

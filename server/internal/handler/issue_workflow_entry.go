@@ -45,15 +45,15 @@ type workflowHandoff struct {
 // run is the calling agent's run on this issue (nil for members): it may only
 // move the issue from the step it works on. It returns the handoff that write
 // triggers, or nil.
-func (h *Handler) applyIssueWorkflow(ctx context.Context, prev db.Issue, params *db.UpdateIssueParams, statusExplicit, assigneeTouched, enterOnMove bool, run *db.AgentTaskQueue) (*workflowHandoff, error) {
-	def, project, err := issueworkflow.ForProject(ctx, h.Queries, prev.WorkspaceID, params.ProjectID)
+func (h *Handler) applyIssueWorkflow(ctx context.Context, q *db.Queries, prev db.Issue, params *db.UpdateIssueParams, statusExplicit, assigneeTouched, enterOnMove bool, run *db.AgentTaskQueue) (*workflowHandoff, error) {
+	def, project, err := issueworkflow.ForProject(ctx, q, prev.WorkspaceID, params.ProjectID)
 	if err != nil || def == nil {
 		return nil, err
 	}
 	projectMoving := params.ProjectID != prev.ProjectID
 	if projectMoving && !statusExplicit && !def.IsDefault && !def.Has(prev.Status) {
 		target := issueworkflow.MoveTarget(*def, prev.Status, func(key string) string {
-			return issuestatus.Category(ctx, h.Queries, prev.WorkspaceID, key)
+			return issuestatus.Category(ctx, q, prev.WorkspaceID, key)
 		})
 		params.Status = pgtype.Text{String: target, Valid: true}
 	}
@@ -69,7 +69,7 @@ func (h *Handler) applyIssueWorkflow(ctx context.Context, prev db.Issue, params 
 	if run != nil && run.WorkflowStep.Valid && run.WorkflowStep.String != prev.Status &&
 		(!def.IsDefault || def.HandsOffAnywhere()) &&
 		statusExplicit && params.Status.Valid && params.Status.String != prev.Status {
-		return nil, h.stepMovedError(ctx, prev, run.WorkflowStep.String)
+		return nil, h.stepMovedError(ctx, q, prev, run.WorkflowStep.String)
 	}
 	if assigneeTouched || prev.TriageState.Valid {
 		return nil, nil
@@ -200,16 +200,16 @@ func (h *Handler) advanceRunStep(ctx context.Context, run *db.AgentTaskQueue, pr
 
 // stepMovedError explains a refused status change: where the run's step was,
 // where the issue is now, and who moved it.
-func (h *Handler) stepMovedError(ctx context.Context, issue db.Issue, step string) error {
+func (h *Handler) stepMovedError(ctx context.Context, q *db.Queries, issue db.Issue, step string) error {
 	resolver := issuestatus.NewResolver(issue.WorkspaceID)
 	out := &issueworkflow.StepMovedError{
 		IssueIdentifier: h.getIssuePrefix(ctx, issue.WorkspaceID) + "-" + strconv.Itoa(int(issue.Number)),
 		Step:            step,
-		StepName:        resolver.Name(ctx, h.Queries, step),
+		StepName:        resolver.Name(ctx, q, step),
 		Current:         issue.Status,
-		CurrentName:     resolver.Name(ctx, h.Queries, issue.Status),
+		CurrentName:     resolver.Name(ctx, q, issue.Status),
 	}
-	if last, err := h.Queries.GetLastIssueStatusChange(ctx, issue.ID); err == nil && last.ActorID.Valid {
+	if last, err := q.GetLastIssueStatusChange(ctx, issue.ID); err == nil && last.ActorID.Valid {
 		out.MovedBy = h.actorDisplayName(ctx, issue.WorkspaceID, last.ActorType.String, last.ActorID)
 	}
 	return out

@@ -927,6 +927,22 @@ type IssueChildEvent struct {
 	ProcessedAt  pgtype.Timestamptz `json:"processed_at"`
 }
 
+type IssueDecisionResponse struct {
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	IssueID         pgtype.UUID        `json:"issue_id"`
+	ClientRequestID pgtype.UUID        `json:"client_request_id"`
+	ActorID         pgtype.UUID        `json:"actor_id"`
+	SourceRevision  int64              `json:"source_revision"`
+	Decision        string             `json:"decision"`
+	Rationale       string             `json:"rationale"`
+	NextStatus      string             `json:"next_status"`
+	CommentID       pgtype.UUID        `json:"comment_id"`
+	TaskID          pgtype.UUID        `json:"task_id"`
+	RequestedAt     pgtype.Timestamptz `json:"requested_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
 type IssueDependency struct {
 	ID               pgtype.UUID `json:"id"`
 	IssueID          pgtype.UUID `json:"issue_id"`

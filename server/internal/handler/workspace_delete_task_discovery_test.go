@@ -240,6 +240,22 @@ func TestDeleteWorkspace_CollectsTasksThroughEveryOwnershipPath(t *testing.T) {
 		t.Skip("database not available")
 	}
 	f := newWorkspaceDeletePathFixture(t, "endtoend")
+	insertReceipt := func(workspaceID, issueID string) string {
+		t.Helper()
+		var id string
+		err := testPool.QueryRow(t.Context(), `INSERT INTO issue_decision_response
+			(id, workspace_id, issue_id, client_request_id, actor_id, source_revision, decision, rationale, next_status, comment_id)
+			VALUES (gen_random_uuid(), $1, $2, gen_random_uuid(), $3, 1, 'approve', '', 'in_progress', gen_random_uuid()) RETURNING id`, workspaceID, issueID, testUserID).Scan(&id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = testPool.Exec(context.Background(), `DELETE FROM issue_decision_response WHERE id=$1`, id)
+		})
+		return id
+	}
+	victimReceipt := insertReceipt(f.victimID, f.victimIssue)
+	neighbourReceipt := insertReceipt(f.neighbourID, f.neighbourIssue)
 
 	w := httptest.NewRecorder()
 	req := newRequest("DELETE", "/api/workspaces/"+f.victimID, nil)
@@ -247,6 +263,9 @@ func TestDeleteWorkspace_CollectsTasksThroughEveryOwnershipPath(t *testing.T) {
 	testHandler.DeleteWorkspace(w, req)
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("DeleteWorkspace = %d, want 204: %s", w.Code, w.Body.String())
+	}
+	if rowExists(t, "issue_decision_response", victimReceipt) || !rowExists(t, "issue_decision_response", neighbourReceipt) {
+		t.Fatal("workspace deletion did not remove only the victim's decision receipt")
 	}
 
 	for name, id := range map[string]string{

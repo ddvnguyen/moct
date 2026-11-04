@@ -4019,7 +4019,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	// An agent's run may only move the issue from the step it works on.
 	callerType, _ := h.resolveActor(r, userID, workspaceID)
 	callerRun := h.agentRunOnIssue(r, callerType, prevIssue)
-	handoff, err := h.applyIssueWorkflow(r.Context(), prevIssue, &params, req.Status != nil, touchedType || touchedID, req.EnterWorkflowStep, callerRun)
+	handoff, err := h.applyIssueWorkflow(r.Context(), h.Queries, prevIssue, &params, req.Status != nil, touchedType || touchedID, req.EnterWorkflowStep, callerRun)
 	if err != nil {
 		if writeIssueWorkflowError(w, err) {
 			return
@@ -4857,7 +4857,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		// entering a handoff step reassigns this issue to the step's handler.
 		callerType, _ := h.resolveActor(r, userID, workspaceID)
 		callerRun := h.agentRunOnIssue(r, callerType, prevIssue)
-		handoff, err := h.applyIssueWorkflow(r.Context(), prevIssue, &params, req.Updates.Status != nil, batchTouchedType || batchTouchedID, false, callerRun)
+		handoff, err := h.applyIssueWorkflow(r.Context(), h.Queries, prevIssue, &params, req.Updates.Status != nil, batchTouchedType || batchTouchedID, false, callerRun)
 		if err != nil {
 			continue
 		}

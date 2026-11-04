@@ -320,6 +320,9 @@ deleted_task_tokens AS (
 deleted_orphan_task_supplements AS (
     DELETE FROM task_supplement WHERE workspace_id = $1
 ),
+deleted_issue_decision_responses AS (
+    DELETE FROM issue_decision_response WHERE workspace_id = $1
+),
 deleted_orphan_task_supplement_capabilities AS (
     DELETE FROM task_supplement_capability WHERE workspace_id = $1
 ),

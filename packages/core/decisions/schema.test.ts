@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { DecisionsPageSchema } from "./schema";
+import { DecisionResponseReceiptSchema, DecisionsPageSchema } from "./schema";
 
 describe("DecisionsPageSchema", () => {
   it("accepts an unknown source kind for read-only display", () => {
@@ -14,5 +14,16 @@ describe("DecisionsPageSchema", () => {
   });
   it("rejects a malformed queue instead of displaying it as empty", () => {
     expect(DecisionsPageSchema.safeParse({ items: "broken", pending_count: 0, next_cursor: null }).success).toBe(false);
+  });
+});
+
+
+describe("DecisionResponseReceiptSchema", () => {
+  it("rejects a malformed receipt", () => {
+    expect(DecisionResponseReceiptSchema.safeParse({ id: "x" }).success).toBe(false);
+  });
+  it("accepts a valid receipt", () => {
+    const receipt = { id: "1", workspace_id: "2", issue_id: "3", client_request_id: "4", actor_id: "5", source_revision: 1, decision: "Approve", rationale: "r", next_status: "in_progress", comment_id: "6", task_id: null, created_at: "2026-01-01T00:00:00Z" };
+    expect(DecisionResponseReceiptSchema.safeParse(receipt).success).toBe(true);
   });
 });
