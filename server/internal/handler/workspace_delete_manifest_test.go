@@ -30,6 +30,7 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"agent_plan":                         workspaceDelete,
 	"agent_plan_review":                  workspaceDelete,
 	"agent_question_card":                workspaceDelete,
+	"native_question_answer":             workspaceDelete,
 	"agent_to_label":                     workspaceDelete,
 	"attachment":                         workspaceDelete,
 	"autopilot":                          workspaceDelete,

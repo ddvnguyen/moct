@@ -422,6 +422,128 @@ func (h *Handler) CreateTaskSupplement(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, resp)
 }
 
+type createNativeQuestionAnswerRequest struct {
+	QuestionSeq     int32  `json:"question_seq"`
+	Content         string `json:"content"`
+	ClientRequestID string `json:"client_request_id"`
+}
+
+// CreateNativeQuestionAnswer answers one native ask by its exact sequence.
+//
+// The ordinary supplement endpoint cannot serve this: it accepts any message
+// into the run, so two windows can each queue an answer to the same question
+// and a stale tab can answer one the run already left. Here the sequence is
+// part of the write, the SQL re-checks the shipped pending predicate while
+// holding the task, and one unique binding per (task, sequence) turns the
+// second attempt into a conflict that writes nothing. Delivery, failure and
+// retry stay on the ordinary supplement receipt (RetryTaskSupplement).
+func (h *Handler) CreateNativeQuestionAnswer(w http.ResponseWriter, r *http.Request) {
+	issue, task, authorID, ok := h.loadTaskSupplementTarget(w, r)
+	if !ok {
+		return
+	}
+	var req createNativeQuestionAnswerRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*maxCommentContentBytes)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Content = sanitizeNullBytes(req.Content)
+	if len(req.Content) > maxCommentContentBytes {
+		writeError(w, http.StatusBadRequest, "content is too long")
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		writeError(w, http.StatusBadRequest, "content is required")
+		return
+	}
+	if req.QuestionSeq < 0 {
+		writeError(w, http.StatusBadRequest, "question_seq must be a non-negative integer")
+		return
+	}
+	requestID, ok := parseUUIDOrBadRequest(w, req.ClientRequestID, "client_request_id")
+	if !ok {
+		return
+	}
+	lookup := db.GetNativeQuestionAnswerByRequestParams{
+		TaskID: task.ID, WorkspaceID: issue.WorkspaceID, AuthorID: authorID, ClientRequestID: requestID,
+	}
+	if existing, err := h.Queries.GetNativeQuestionAnswerByRequest(r.Context(), lookup); err == nil {
+		h.notifyTaskSupplementAvailable(task)
+		h.writeCommentReceipt(w, r, issue.WorkspaceID, existing.CommentID)
+		return
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusInternalServerError, "failed to check the answer")
+		return
+	}
+	if task.Status != "running" {
+		writeErrorCode(w, http.StatusConflict, "task_supplement_turn_ended", "this run has ended")
+		return
+	}
+	capability, err := h.Queries.GetTaskSupplementCapability(r.Context(), task.ID)
+	if errors.Is(err, pgx.ErrNoRows) || capability.Capability != protocol.DaemonCapabilityTaskSupplementV1 {
+		writeErrorCode(w, http.StatusPreconditionFailed, "task_supplement_unsupported", "this run does not support additional messages")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check additional-message support")
+		return
+	}
+
+	created, err := h.Queries.CreateNativeQuestionAnswer(r.Context(), db.CreateNativeQuestionAnswerParams{
+		TaskID: task.ID, IssueID: issue.ID, WorkspaceID: issue.WorkspaceID,
+		QuestionSeq: req.QuestionSeq, AuthorID: authorID, Content: req.Content, ClientRequestID: requestID,
+	})
+	if isUniqueViolation(err) {
+		// Two writers raced: this request id committed first and is being
+		// retried, or another request already answered this question.
+		if existing, loadErr := h.Queries.GetNativeQuestionAnswerByRequest(r.Context(), lookup); loadErr == nil {
+			h.notifyTaskSupplementAvailable(task)
+			h.writeCommentReceipt(w, r, issue.WorkspaceID, existing.CommentID)
+			return
+		}
+		if _, loadErr := h.Queries.GetNativeQuestionAnswerBySeq(r.Context(), db.GetNativeQuestionAnswerBySeqParams{
+			TaskID: task.ID, QuestionSeq: req.QuestionSeq,
+		}); loadErr == nil {
+			writeErrorCode(w, http.StatusConflict, "question_already_answered", "this question already has an answer")
+			return
+		}
+		writeErrorCode(w, http.StatusConflict, "client_request_id is already in use", "this request id is already in use")
+		return
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeErrorCode(w, http.StatusConflict, "question_not_pending", "this question is no longer waiting for an answer")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to answer the question")
+		return
+	}
+	comment := db.Comment{
+		ID: created.ID, IssueID: created.IssueID, AuthorType: created.AuthorType,
+		AuthorID: created.AuthorID, Content: created.Content, Type: created.Type,
+		CreatedAt: created.CreatedAt, UpdatedAt: created.UpdatedAt, ParentID: created.ParentID,
+		WorkspaceID: created.WorkspaceID, ResolvedAt: created.ResolvedAt,
+		ResolvedByType: created.ResolvedByType, ResolvedByID: created.ResolvedByID,
+		SourceTaskID: created.SourceTaskID, QuickActionID: created.QuickActionID,
+		ViaPluginID: created.ViaPluginID, Revision: created.Revision,
+		RecoverySettledAt: created.RecoverySettledAt, DeletedAt: created.DeletedAt,
+	}
+	resp := commentToResponse(comment, nil, nil)
+	resp.IssueRevision = created.IssueRevision
+	applyCommentSupplements(&resp, []CommentSupplementResponse{{
+		TaskID:        uuidToString(task.ID),
+		AgentID:       uuidToString(task.AgentID),
+		Status:        created.SupplementStatus,
+		FailureReason: textToPtr(created.SupplementFailureReason),
+		DeliveredAt:   timestampToPtr(created.SupplementDeliveredAt),
+	}})
+	h.publish(protocol.EventCommentCreated, uuidToString(issue.WorkspaceID), "member", uuidToString(authorID), map[string]any{
+		"comment": resp, "issue_title": issue.Title, "issue_revision": created.IssueRevision,
+	})
+	h.notifyTaskSupplementAvailable(task)
+	writeJSON(w, http.StatusCreated, resp)
+}
+
 func (h *Handler) notifyTaskSupplementAvailable(task db.AgentTaskQueue) {
 	if h.DaemonTaskSupplement == nil || task.Status != "running" || !task.RuntimeID.Valid {
 		return
@@ -430,15 +552,22 @@ func (h *Handler) notifyTaskSupplementAvailable(task db.AgentTaskQueue) {
 }
 
 func (h *Handler) writeExistingTaskSupplement(w http.ResponseWriter, r *http.Request, existing db.TaskSupplement) {
+	h.writeCommentReceipt(w, r, existing.WorkspaceID, existing.CommentID)
+}
+
+// writeCommentReceipt answers with the comment an earlier request already
+// created, receipts included: a retry of a landed write must return the same
+// body instead of writing a second one.
+func (h *Handler) writeCommentReceipt(w http.ResponseWriter, r *http.Request, workspaceID, commentID pgtype.UUID) {
 	comment, err := h.Queries.GetCommentInWorkspace(r.Context(), db.GetCommentInWorkspaceParams{
-		ID: existing.CommentID, WorkspaceID: existing.WorkspaceID,
+		ID: commentID, WorkspaceID: workspaceID,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load additional message")
 		return
 	}
 	resp := commentToResponse(comment, nil, nil)
-	applyCommentSupplements(&resp, h.listCommentSupplements(r.Context(), existing.WorkspaceID, []pgtype.UUID{existing.CommentID})[uuidToString(existing.CommentID)])
+	applyCommentSupplements(&resp, h.listCommentSupplements(r.Context(), workspaceID, []pgtype.UUID{commentID})[uuidToString(commentID)])
 	writeJSON(w, http.StatusOK, resp)
 }
 

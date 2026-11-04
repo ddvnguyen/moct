@@ -6,7 +6,7 @@ import type { AgentAnswerDraft, AgentQuestion } from "@multica/core/issues/agent
 import { renderWithI18n } from "../../test/i18n";
 import { AgentQuestionCard } from "./agent-question-card";
 
-vi.mock("@multica/core/api", () => ({ api: { createTaskSupplement: vi.fn() } }));
+vi.mock("@multica/core/api", () => ({ api: { createTaskSupplement: vi.fn(), answerNativeQuestion: vi.fn() } }));
 vi.mock("@multica/core/hooks", () => ({ useWorkspaceId: () => "workspace" }));
 vi.mock("../../editor", () => ({
   ReadonlyContent: ({ content }: { content: string }) => <div data-testid="plan-detail">{content}</div>,
@@ -44,11 +44,18 @@ const plan: AgentQuestion = {
 function render(
   questions: AgentQuestion[],
   submit?: (drafts: readonly AgentAnswerDraft[]) => Promise<void>,
+  questionSeq?: number,
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   renderWithI18n(
     <QueryClientProvider client={client}>
-      <AgentQuestionCard issueId="issue" taskId={TASK} questions={questions} submit={submit} />
+      <AgentQuestionCard
+        issueId="issue"
+        taskId={TASK}
+        questions={questions}
+        submit={submit}
+        questionSeq={questionSeq}
+      />
     </QueryClientProvider>,
   );
   return client;
@@ -117,6 +124,43 @@ describe("AgentQuestionCard", () => {
     await waitFor(() => expect(api.createTaskSupplement).toHaveBeenCalledWith(
       "issue", TASK, "Split step 2", expect.any(String),
     ));
+  });
+
+  it("fences the answer to the ask's own sequence when the card knows it", async () => {
+    vi.mocked(api.answerNativeQuestion).mockResolvedValue(comment("Web") as never);
+    render([question()], undefined, 7);
+    fireEvent.click(screen.getByRole("radio", { name: /Web/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Answer" }));
+    await waitFor(() => expect(api.answerNativeQuestion).toHaveBeenCalledWith(
+      "issue", TASK, 7, "Web", expect.any(String),
+    ));
+    expect(api.createTaskSupplement).not.toHaveBeenCalled();
+  });
+
+  it("fences a plan approval to the ask's sequence with exactly the approve label", async () => {
+    vi.mocked(api.answerNativeQuestion).mockResolvedValue(comment("Approve") as never);
+    render([plan], undefined, 3);
+    fireEvent.click(screen.getByRole("button", { name: "Approve plan" }));
+    await waitFor(() => expect(api.answerNativeQuestion).toHaveBeenCalledWith(
+      "issue", TASK, 3, "Approve", expect.any(String),
+    ));
+    expect(api.createTaskSupplement).not.toHaveBeenCalled();
+  });
+
+  it("reuses the draft's request id after a transport failure", async () => {
+    vi.mocked(api.answerNativeQuestion)
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValue(comment("Web") as never);
+    render([question()], undefined, 7);
+    fireEvent.click(screen.getByRole("radio", { name: /Web/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Answer" }));
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "Answer" }));
+
+    await waitFor(() => expect(api.answerNativeQuestion).toHaveBeenCalledTimes(2));
+    const [first, second] = vi.mocked(api.answerNativeQuestion).mock.calls;
+    expect(second?.[4]).toBe(first?.[4]);
+    expect(await screen.findByText("Answer sent")).toBeInTheDocument();
   });
 
   it("reports a send that failed instead of claiming it went through", async () => {

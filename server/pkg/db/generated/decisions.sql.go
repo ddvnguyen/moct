@@ -23,9 +23,15 @@ SELECT payload FROM (
     AND p.id = $3::uuid AND p.agent_id = ANY($4::uuid[])
     AND ($5::uuid IS NULL OR r.id IS NOT NULL)
   UNION ALL
-  SELECT jsonb_build_object('task_id', t.id, 'message', to_jsonb(m))
+  SELECT jsonb_build_object('task_id', t.id, 'message', to_jsonb(m),
+         'answer', CASE WHEN a.task_id IS NULL THEN NULL ELSE jsonb_build_object(
+             'comment_id', a.comment_id, 'question_seq', a.question_seq,
+             'status', COALESCE(answered.status, ''), 'failure_reason', answered.failure_reason,
+             'delivered_at', answered.delivered_at) END)
   FROM agent_task_queue t JOIN issue i ON i.id=t.issue_id
   JOIN task_message m ON m.task_id=t.id AND m.seq=$6::integer
+  LEFT JOIN native_question_answer a ON a.task_id=t.id AND a.question_seq=m.seq
+  LEFT JOIN task_supplement answered ON answered.task_id=a.task_id AND answered.comment_id=a.comment_id
   WHERE $1::text = 'native' AND i.workspace_id=$2::uuid
     AND t.id=$3::uuid AND t.agent_id = ANY($4::uuid[])
   UNION ALL
@@ -63,7 +69,16 @@ WITH scoped_issues AS MATERIALIZED (
     WHERE workspace_id = $2::uuid
       AND ($3::uuid IS NULL OR project_id = $3::uuid)
 ), native AS MATERIALIZED (
-    SELECT t.issue_id, t.id AS task_id, t.agent_id, m.seq, m.created_at
+    SELECT t.issue_id, t.id AS task_id, t.agent_id, m.seq, m.created_at,
+           -- The answer receipt, if a human already answered this exact ask:
+           -- queued while its steer is still on its way, failed with a reason
+           -- after the daemon rejected it. Neither releases the queue yet, so
+           -- the row stays pending until delivery or the run's end.
+           CASE WHEN answered.status IN ('pending', 'delivering') THEN 'queued'
+                WHEN answered.status = 'failed' THEN 'failed'
+                ELSE 'open' END AS answer_state,
+           answered.failure_reason AS answer_failure_reason,
+           a.comment_id AS answer_comment_id
     FROM agent_task_queue t
     JOIN scoped_issues i ON i.id = t.issue_id
     JOIN task_supplement_capability c ON c.task_id = t.id AND c.workspace_id = i.workspace_id
@@ -80,52 +95,54 @@ WITH scoped_issues AS MATERIALIZED (
             AND length(btrim(q->>'question', U&' \0009\000A\000B\000C\000D\00A0\1680\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200A\2028\2029\202F\205F\3000\FEFF')) > 0)
         ORDER BY tm.seq DESC LIMIT 1
     ) m ON true
+    LEFT JOIN native_question_answer a ON a.task_id = t.id AND a.question_seq = m.seq
+    LEFT JOIN task_supplement answered ON answered.task_id = a.task_id AND answered.comment_id = a.comment_id
     WHERE t.status = 'running' AND m.created_at IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM task_supplement s WHERE s.task_id = t.id
           AND s.workspace_id = i.workspace_id AND s.status = 'delivered' AND date_trunc('milliseconds', s.delivered_at) >= date_trunc('milliseconds', m.created_at))
 ), pending AS MATERIALIZED (
     SELECT 'question'::text AS kind, c.id::text AS source_id, c.issue_id, c.agent_id,
-           c.created_at AS sort_at, c.task_id, NULL::integer AS question_seq, c.status, NULL::uuid AS response_id, NULL::uuid AS actor_id, c.created_at AS requested_at
+           c.created_at AS sort_at, c.task_id, NULL::integer AS question_seq, c.status, NULL::uuid AS response_id, NULL::uuid AS actor_id, c.created_at AS requested_at, NULL::text AS receipt_reason
     FROM agent_question_card c JOIN scoped_issues i ON i.id = c.issue_id
     WHERE c.workspace_id = i.workspace_id AND c.status = 'open'
     UNION ALL
-    SELECT 'plan', p.id::text, p.issue_id, p.agent_id, p.updated_at, p.task_id, NULL::integer, p.status, NULL::uuid, NULL::uuid, p.updated_at
+    SELECT 'plan', p.id::text, p.issue_id, p.agent_id, p.updated_at, p.task_id, NULL::integer, p.status, NULL::uuid, NULL::uuid, p.updated_at, NULL::text
     FROM agent_plan p JOIN scoped_issues i ON i.id = p.issue_id
     WHERE p.workspace_id = i.workspace_id AND p.status = 'in_review'
     UNION ALL
-    SELECT 'native', n.task_id::text || ':' || n.seq::text, n.issue_id, n.agent_id, n.created_at, n.task_id, n.seq, 'open', NULL::uuid, NULL::uuid, n.created_at
+    SELECT 'native', n.task_id::text || ':' || n.seq::text, n.issue_id, n.agent_id, n.created_at, n.task_id, n.seq, n.answer_state, n.answer_comment_id, NULL::uuid, n.created_at, n.answer_failure_reason
     FROM native n
     UNION ALL
-    SELECT 'status', i.id::text, i.id, NULL::uuid, i.updated_at, NULL::uuid, NULL::integer, i.status, NULL::uuid, NULL::uuid, i.updated_at
+    SELECT 'status', i.id::text, i.id, NULL::uuid, i.updated_at, NULL::uuid, NULL::integer, i.status, NULL::uuid, NULL::uuid, i.updated_at, NULL::text
     FROM scoped_issues i WHERE i.status = 'wait_for_decision'
       AND NOT EXISTS (SELECT 1 FROM agent_question_card c WHERE c.issue_id = i.id AND c.workspace_id = i.workspace_id AND c.status = 'open')
       AND NOT EXISTS (SELECT 1 FROM agent_plan p WHERE p.issue_id = i.id AND p.workspace_id = i.workspace_id AND p.status = 'in_review')
       AND NOT EXISTS (SELECT 1 FROM native n WHERE n.issue_id = i.id)
 ), visible_pending AS MATERIALIZED (
-    SELECT kind, source_id, issue_id, agent_id, sort_at, task_id, question_seq, status, response_id, actor_id, requested_at FROM pending WHERE agent_id IS NULL OR agent_id = ANY($4::uuid[])
+    SELECT kind, source_id, issue_id, agent_id, sort_at, task_id, question_seq, status, response_id, actor_id, requested_at, receipt_reason FROM pending WHERE agent_id IS NULL OR agent_id = ANY($4::uuid[])
 ), history AS (
     SELECT 'question'::text AS kind, c.id::text AS source_id, c.issue_id, c.agent_id,
-           COALESCE(c.answered_at, c.withdrawn_at) AS sort_at, c.task_id, NULL::integer AS question_seq, c.status, c.id AS response_id, c.answered_by AS actor_id, c.created_at AS requested_at
+           COALESCE(c.answered_at, c.withdrawn_at) AS sort_at, c.task_id, NULL::integer AS question_seq, c.status, c.id AS response_id, c.answered_by AS actor_id, c.created_at AS requested_at, NULL::text AS receipt_reason
     FROM agent_question_card c JOIN scoped_issues i ON i.id = c.issue_id
     WHERE c.workspace_id = i.workspace_id AND c.status IN ('answered', 'withdrawn') AND COALESCE(c.answered_at, c.withdrawn_at) IS NOT NULL
       AND c.agent_id = ANY($4::uuid[])
     UNION ALL
-    SELECT 'plan', p.id::text || ':' || r.id::text, p.issue_id, p.agent_id, r.created_at, p.task_id, NULL::integer, r.verdict, r.id, r.reviewed_by, p.created_at
+    SELECT 'plan', p.id::text || ':' || r.id::text, p.issue_id, p.agent_id, r.created_at, p.task_id, NULL::integer, r.verdict, r.id, r.reviewed_by, p.created_at, NULL::text
     FROM agent_plan_review r JOIN agent_plan p ON p.id = r.plan_id
     JOIN scoped_issues i ON i.id = p.issue_id
     WHERE p.workspace_id = i.workspace_id AND p.agent_id = ANY($4::uuid[])
     UNION ALL
-    SELECT 'plan', p.id::text, p.issue_id, p.agent_id, p.cancelled_at, p.task_id, NULL::integer, p.status, NULL::uuid, NULL::uuid, p.created_at
+    SELECT 'plan', p.id::text, p.issue_id, p.agent_id, p.cancelled_at, p.task_id, NULL::integer, p.status, NULL::uuid, NULL::uuid, p.created_at, NULL::text
     FROM agent_plan p JOIN scoped_issues i ON i.id = p.issue_id
     WHERE p.workspace_id = i.workspace_id AND p.agent_id = ANY($4::uuid[])
       AND p.status = 'cancelled' AND p.cancelled_at IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM agent_plan_review r WHERE r.plan_id = p.id AND r.verdict = 'cancel')
 ), selected AS (
-    SELECT kind, source_id, issue_id, agent_id, sort_at, task_id, question_seq, status, response_id, actor_id, requested_at FROM visible_pending WHERE $1::text = 'pending'
+    SELECT kind, source_id, issue_id, agent_id, sort_at, task_id, question_seq, status, response_id, actor_id, requested_at, receipt_reason FROM visible_pending WHERE $1::text = 'pending'
     UNION ALL
-    SELECT kind, source_id, issue_id, agent_id, sort_at, task_id, question_seq, status, response_id, actor_id, requested_at FROM history WHERE $1::text = 'answered'
+    SELECT kind, source_id, issue_id, agent_id, sort_at, task_id, question_seq, status, response_id, actor_id, requested_at, receipt_reason FROM history WHERE $1::text = 'answered'
 ), page AS (
-    SELECT s.kind, s.source_id, s.issue_id, s.agent_id, s.sort_at, s.task_id, s.question_seq, s.status, s.response_id, s.actor_id, s.requested_at, i.title AS issue_title, i.project_id, i.revision AS issue_revision
+    SELECT s.kind, s.source_id, s.issue_id, s.agent_id, s.sort_at, s.task_id, s.question_seq, s.status, s.response_id, s.actor_id, s.requested_at, s.receipt_reason, i.title AS issue_title, i.project_id, i.revision AS issue_revision
     FROM selected s JOIN scoped_issues i ON i.id = s.issue_id
     WHERE $5::timestamptz IS NULL
       OR ($1::text = 'pending' AND (s.sort_at, s.kind, s.source_id) > ($5::timestamptz, $6::text, $7::text))

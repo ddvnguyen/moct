@@ -288,6 +288,166 @@ func (q *Queries) CommentHasTaskSupplement(ctx context.Context, arg CommentHasTa
 	return bound, err
 }
 
+const createNativeQuestionAnswer = `-- name: CreateNativeQuestionAnswer :one
+WITH locked_task AS MATERIALIZED (
+    SELECT t.id, t.issue_id, t.agent_id, t.trigger_comment_id
+    FROM agent_task_queue t
+    JOIN agent_runtime r ON r.id = t.runtime_id
+    JOIN task_supplement_capability cap ON cap.task_id = t.id
+    WHERE t.id = $1
+      AND t.issue_id = $2
+      AND r.workspace_id = $3
+      AND t.status = 'running'
+      AND cap.capability = 'task-supplement-v1'
+      AND r.provider IN ('codex', 'claude', 'grok', 'cursor', 'kiro', 'dsh')
+    FOR UPDATE OF t
+), pending_ask AS MATERIALIZED (
+    SELECT m.seq
+    FROM task_message m
+    WHERE m.task_id = $1
+      AND m.seq = $4
+      AND EXISTS (SELECT 1 FROM jsonb_array_elements(
+            CASE WHEN jsonb_typeof(m.input->'questions') = 'array' THEN m.input->'questions' ELSE '[]'::jsonb END
+          ) q WHERE jsonb_typeof(q->'question') = 'string'
+            AND length(btrim(q->>'question', U&' \0009\000A\000B\000C\000D\00A0\1680\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200A\2028\2029\202F\205F\3000\FEFF')) > 0)
+      AND NOT EXISTS (SELECT 1 FROM task_message later WHERE later.task_id = m.task_id AND later.seq > m.seq)
+      AND NOT EXISTS (SELECT 1 FROM task_supplement s WHERE s.task_id = m.task_id
+          AND s.workspace_id = $3 AND s.status = 'delivered'
+          AND date_trunc('milliseconds', s.delivered_at) >= date_trunc('milliseconds', m.created_at))
+), touched_issue AS (
+    UPDATE issue i SET
+        updated_at = now(),
+        revision = revision + 1,
+        last_activity_at = GREATEST(COALESCE(last_activity_at, updated_at), now())
+    FROM locked_task t, pending_ask a
+    WHERE i.id = t.issue_id AND i.workspace_id = $3
+    RETURNING i.id, i.workspace_id, i.revision
+), inserted_comment AS (
+    INSERT INTO comment (
+        issue_id, workspace_id, author_type, author_id, content, type, parent_id
+    )
+    SELECT i.id, i.workspace_id, 'member', $5, $6, 'comment', t.trigger_comment_id
+    FROM touched_issue i
+    JOIN locked_task t ON t.issue_id = i.id
+    RETURNING id, issue_id, author_type, author_id, content, type, created_at, updated_at, parent_id, workspace_id, resolved_at, resolved_by_type, resolved_by_id, source_task_id, quick_action_id, via_plugin_id, revision, recovery_settled_at, deleted_at, suppressed_agent_ids
+), inserted_supplement AS (
+    INSERT INTO task_supplement (
+        task_id, workspace_id, issue_id, comment_id, author_id,
+        client_request_id, status, mode
+    )
+    SELECT t.id, i.workspace_id, i.id, c.id, $5,
+           $7, 'pending', 'steer'
+    FROM locked_task t
+    JOIN touched_issue i ON i.id = t.issue_id
+    JOIN inserted_comment c ON c.issue_id = i.id
+    RETURNING task_id, workspace_id, issue_id, comment_id, author_id, client_request_id, status, failure_reason, attempt_count, created_at, updated_at, delivered_at, mode
+), inserted_binding AS (
+    INSERT INTO native_question_answer (
+        task_id, workspace_id, issue_id, question_seq, comment_id, author_id, client_request_id
+    )
+    SELECT t.id, i.workspace_id, i.id, a.seq, c.id, $5, $7
+    FROM locked_task t
+    JOIN pending_ask a ON true
+    JOIN touched_issue i ON i.id = t.issue_id
+    JOIN inserted_comment c ON c.issue_id = i.id
+    RETURNING task_id, workspace_id, issue_id, question_seq, comment_id, author_id, client_request_id, created_at
+)
+SELECT c.id, c.issue_id, c.author_type, c.author_id, c.content, c.type, c.created_at, c.updated_at, c.parent_id, c.workspace_id, c.resolved_at, c.resolved_by_type, c.resolved_by_id, c.source_task_id, c.quick_action_id, c.via_plugin_id, c.revision, c.recovery_settled_at, c.deleted_at, c.suppressed_agent_ids, i.revision AS issue_revision, b.question_seq,
+       s.status AS supplement_status, s.failure_reason AS supplement_failure_reason,
+       s.delivered_at AS supplement_delivered_at
+FROM inserted_binding b
+JOIN inserted_comment c ON c.id = b.comment_id
+JOIN touched_issue i ON i.id = b.issue_id
+JOIN inserted_supplement s ON s.comment_id = b.comment_id
+`
+
+type CreateNativeQuestionAnswerParams struct {
+	TaskID          pgtype.UUID `json:"task_id"`
+	IssueID         pgtype.UUID `json:"issue_id"`
+	WorkspaceID     pgtype.UUID `json:"workspace_id"`
+	QuestionSeq     int32       `json:"question_seq"`
+	AuthorID        pgtype.UUID `json:"author_id"`
+	Content         string      `json:"content"`
+	ClientRequestID pgtype.UUID `json:"client_request_id"`
+}
+
+type CreateNativeQuestionAnswerRow struct {
+	ID                      pgtype.UUID        `json:"id"`
+	IssueID                 pgtype.UUID        `json:"issue_id"`
+	AuthorType              string             `json:"author_type"`
+	AuthorID                pgtype.UUID        `json:"author_id"`
+	Content                 string             `json:"content"`
+	Type                    string             `json:"type"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
+	ParentID                pgtype.UUID        `json:"parent_id"`
+	WorkspaceID             pgtype.UUID        `json:"workspace_id"`
+	ResolvedAt              pgtype.Timestamptz `json:"resolved_at"`
+	ResolvedByType          pgtype.Text        `json:"resolved_by_type"`
+	ResolvedByID            pgtype.UUID        `json:"resolved_by_id"`
+	SourceTaskID            pgtype.UUID        `json:"source_task_id"`
+	QuickActionID           pgtype.UUID        `json:"quick_action_id"`
+	ViaPluginID             pgtype.UUID        `json:"via_plugin_id"`
+	Revision                int64              `json:"revision"`
+	RecoverySettledAt       pgtype.Timestamptz `json:"recovery_settled_at"`
+	DeletedAt               pgtype.Timestamptz `json:"deleted_at"`
+	SuppressedAgentIds      []pgtype.UUID      `json:"suppressed_agent_ids"`
+	IssueRevision           int64              `json:"issue_revision"`
+	QuestionSeq             int32              `json:"question_seq"`
+	SupplementStatus        string             `json:"supplement_status"`
+	SupplementFailureReason pgtype.Text        `json:"supplement_failure_reason"`
+	SupplementDeliveredAt   pgtype.Timestamptz `json:"supplement_delivered_at"`
+}
+
+// One statement answers a native question: the comment, its steer binding, the
+// answer binding and the issue revision land together or not at all. The
+// guards restate the shipped UI predicate (isAgentQuestionPending): the answer
+// names the newest transcript row, that row still carries a question, and no
+// delivered steer has reached the turn since the ask. The pending-ask gate sits
+// on touched_issue so an ask the run already left writes nothing at all. The
+// unique (task_id, question_seq) index is the last word: a second window's
+// answer aborts this whole statement.
+func (q *Queries) CreateNativeQuestionAnswer(ctx context.Context, arg CreateNativeQuestionAnswerParams) (CreateNativeQuestionAnswerRow, error) {
+	row := q.db.QueryRow(ctx, createNativeQuestionAnswer,
+		arg.TaskID,
+		arg.IssueID,
+		arg.WorkspaceID,
+		arg.QuestionSeq,
+		arg.AuthorID,
+		arg.Content,
+		arg.ClientRequestID,
+	)
+	var i CreateNativeQuestionAnswerRow
+	err := row.Scan(
+		&i.ID,
+		&i.IssueID,
+		&i.AuthorType,
+		&i.AuthorID,
+		&i.Content,
+		&i.Type,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ParentID,
+		&i.WorkspaceID,
+		&i.ResolvedAt,
+		&i.ResolvedByType,
+		&i.ResolvedByID,
+		&i.SourceTaskID,
+		&i.QuickActionID,
+		&i.ViaPluginID,
+		&i.Revision,
+		&i.RecoverySettledAt,
+		&i.DeletedAt,
+		&i.SuppressedAgentIds,
+		&i.IssueRevision,
+		&i.QuestionSeq,
+		&i.SupplementStatus,
+		&i.SupplementFailureReason,
+		&i.SupplementDeliveredAt,
+	)
+	return i, err
+}
+
 const createTaskSupplement = `-- name: CreateTaskSupplement :one
 WITH locked_task AS MATERIALIZED (
     SELECT t.id, t.issue_id, t.agent_id, t.trigger_comment_id
@@ -456,6 +616,68 @@ func (q *Queries) DeleteUndeliveredTaskSupplementForRun(ctx context.Context, arg
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getNativeQuestionAnswerByRequest = `-- name: GetNativeQuestionAnswerByRequest :one
+SELECT task_id, workspace_id, issue_id, question_seq, comment_id, author_id, client_request_id, created_at FROM native_question_answer
+WHERE task_id = $1
+  AND workspace_id = $2
+  AND author_id = $3
+  AND client_request_id = $4
+`
+
+type GetNativeQuestionAnswerByRequestParams struct {
+	TaskID          pgtype.UUID `json:"task_id"`
+	WorkspaceID     pgtype.UUID `json:"workspace_id"`
+	AuthorID        pgtype.UUID `json:"author_id"`
+	ClientRequestID pgtype.UUID `json:"client_request_id"`
+}
+
+func (q *Queries) GetNativeQuestionAnswerByRequest(ctx context.Context, arg GetNativeQuestionAnswerByRequestParams) (NativeQuestionAnswer, error) {
+	row := q.db.QueryRow(ctx, getNativeQuestionAnswerByRequest,
+		arg.TaskID,
+		arg.WorkspaceID,
+		arg.AuthorID,
+		arg.ClientRequestID,
+	)
+	var i NativeQuestionAnswer
+	err := row.Scan(
+		&i.TaskID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.QuestionSeq,
+		&i.CommentID,
+		&i.AuthorID,
+		&i.ClientRequestID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getNativeQuestionAnswerBySeq = `-- name: GetNativeQuestionAnswerBySeq :one
+SELECT task_id, workspace_id, issue_id, question_seq, comment_id, author_id, client_request_id, created_at FROM native_question_answer
+WHERE task_id = $1 AND question_seq = $2
+`
+
+type GetNativeQuestionAnswerBySeqParams struct {
+	TaskID      pgtype.UUID `json:"task_id"`
+	QuestionSeq int32       `json:"question_seq"`
+}
+
+func (q *Queries) GetNativeQuestionAnswerBySeq(ctx context.Context, arg GetNativeQuestionAnswerBySeqParams) (NativeQuestionAnswer, error) {
+	row := q.db.QueryRow(ctx, getNativeQuestionAnswerBySeq, arg.TaskID, arg.QuestionSeq)
+	var i NativeQuestionAnswer
+	err := row.Scan(
+		&i.TaskID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.QuestionSeq,
+		&i.CommentID,
+		&i.AuthorID,
+		&i.ClientRequestID,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const getRunningTaskForAgentOnIssue = `-- name: GetRunningTaskForAgentOnIssue :one

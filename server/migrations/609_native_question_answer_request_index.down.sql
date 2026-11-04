@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_native_question_answer_request;

@@ -37,6 +37,9 @@ type decisionItem struct {
 	ResponseID    *string   `json:"response_id"`
 	ActorID       *string   `json:"actor_id"`
 	RequestedAt   time.Time `json:"requested_at"`
+	// A native row's answer receipt: queued or failed carry the answer
+	// comment in ResponseID (the retry handle), and failed explains itself.
+	ReceiptReason *string `json:"receipt_reason,omitempty"`
 }
 
 type decisionsResult struct {

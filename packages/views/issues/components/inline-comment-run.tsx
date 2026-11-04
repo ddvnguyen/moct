@@ -247,7 +247,12 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
       <div className={cn(showIdentity && "pl-8")}>
         {replyTo}
         {askPending && ask !== null && (
-          <AgentQuestionCard issueId={task.issue_id} taskId={task.id} questions={ask.questions} />
+          <AgentQuestionCard
+            issueId={task.issue_id}
+            taskId={task.id}
+            questionSeq={ask.seq}
+            questions={ask.questions}
+          />
         )}
         {output && <div className="mt-2 text-body"><ReadonlyContent content={redactSecrets(output)} /></div>}
         {needsAction && rawError && <TruncatedTooltip content={rawError}>

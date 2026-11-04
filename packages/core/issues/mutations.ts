@@ -1,4 +1,5 @@
 import { normalizeStatusPatch } from "./status-category";
+import { useRef } from "react";
 import {
   hashKey,
   useMutation,
@@ -7,6 +8,7 @@ import {
   type QueryKey,
 } from "@tanstack/react-query";
 import { api } from "../api";
+import { decisionKeys } from "../decisions/queries";
 import { issueKeys } from "./queries";
 import type { AgentAnswerDraft } from "./agent-question";
 import type { PlanVerdictBody } from "./ask-plan";
@@ -929,6 +931,58 @@ export function useCreateTaskSupplement(issueId: string) {
       api.createTaskSupplement(issueId, taskId, content, createSafeId()),
     onSuccess: (comment) => {
       applyCreatedComment(qc, wsId, issueId, comment);
+    },
+  });
+}
+
+/**
+ * Answer one native ask by its exact transcript sequence.
+ *
+ * The supplement mutation above names only the turn, so two windows can each
+ * queue an answer to the same question and a stale tab can answer one the run
+ * already left. This one names the question too: the server re-checks the
+ * pending predicate and binds one answer per `(task, sequence)` in the same
+ * statement, so a second attempt is a conflict that writes nothing.
+ *
+ * `client_request_id` outlives a failed attempt on purpose. A dropped
+ * transport retries the same intent, and the server answers with the receipt
+ * it already created instead of steering a second answer. A 409 settles the
+ * intent — the question is gone — so the form's next attempt is a new one.
+ */
+export function useAnswerNativeQuestion(issueId: string) {
+  const qc = useQueryClient();
+  const wsId = useWorkspaceId();
+  const requests = useRef(new Map<string, string>());
+  const keyOf = (taskId: string, questionSeq: number) => `${taskId}:${questionSeq}`;
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      questionSeq,
+      content,
+    }: {
+      taskId: string;
+      questionSeq: number;
+      content: string;
+    }) => {
+      const key = keyOf(taskId, questionSeq);
+      const requestId = requests.current.get(key) ?? createSafeId();
+      requests.current.set(key, requestId);
+      return api.answerNativeQuestion(issueId, taskId, questionSeq, content, requestId);
+    },
+    onSuccess: (comment, { taskId, questionSeq }) => {
+      requests.current.delete(keyOf(taskId, questionSeq));
+      applyCreatedComment(qc, wsId, issueId, comment);
+      void qc.invalidateQueries({ queryKey: decisionKeys.all(wsId) });
+    },
+    onError: (error, { taskId, questionSeq }) => {
+      // Only a settled question discards the id; anything else may still have
+      // landed, so its retry has to reuse it. Every 409 here means the ask is
+      // gone — answered, moved on, or the run ended — so none of them is worth
+      // retrying under the same id.
+      if (typeof error === "object" && error !== null && (error as { status?: unknown }).status === 409) {
+        requests.current.delete(keyOf(taskId, questionSeq));
+      }
+      void qc.invalidateQueries({ queryKey: decisionKeys.all(wsId) });
     },
   });
 }

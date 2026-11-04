@@ -3031,6 +3031,27 @@ export class ApiClient {
     });
   }
 
+  /**
+   * Answer one native ask by the exact transcript sequence it asked at.
+   *
+   * The supplement endpoint above takes any message for a run; this one names
+   * the question, so the server can refuse a stale tab or a second window
+   * instead of steering a second answer into a turn that moved on. The reply
+   * is the answer comment, receipt included, exactly like a supplement's.
+   */
+  async answerNativeQuestion(
+    issueId: string,
+    taskId: string,
+    questionSeq: number,
+    content: string,
+    clientRequestId: string,
+  ): Promise<Comment> {
+    return this.fetch(`/api/issues/${issueId}/tasks/${taskId}/question-answers`, {
+      method: "POST",
+      body: JSON.stringify({ question_seq: questionSeq, content, client_request_id: clientRequestId }),
+    });
+  }
+
   async retryTaskSupplement(issueId: string, taskId: string, commentId: string): Promise<void> {
     await this.fetch(`/api/issues/${issueId}/tasks/${taskId}/supplements/${commentId}/retry`, {
       method: "POST",

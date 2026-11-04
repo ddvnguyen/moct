@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS uq_native_question_answer_task_seq;
