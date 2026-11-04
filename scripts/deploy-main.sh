@@ -285,3 +285,20 @@ done
 
 trap - EXIT
 log "deployment verified: commit=$EXPECTED_COMMIT version=$IMAGE_TAG; backup=$BACKUP_DIR"
+
+# Image retention (owner directive, 2026-11-04): keep only the two newest
+# localhost/multica-{web,backend} versions — the one just deployed and its
+# predecessor for rollback. podman rmi refuses images a container uses, so
+# the running stack is never touched; a refused removal is logged, never
+# fatal, since the deployment already succeeded.
+for repo in localhost/multica-web localhost/multica-backend; do
+  while read -r image; do
+    [ -n "$image" ] || continue
+    if ! podman rmi "$image" >/dev/null 2>&1; then
+      log "image retention kept $image (in use or already removed)"
+    fi
+  done < <(podman images --format '{{.Repository}} {{.Tag}} {{.CreatedAt}}' \
+    | awk -v repo="$repo" '$1 == repo && $2 != "<none>"' \
+    | sort -k3,3r -k4,4r \
+    | awk 'NR > 2 { print $1 ":" $2 }')
+done

@@ -38,6 +38,12 @@ case "$1 $2" in
   'compose up') printf 'compose up\n' >> "$STUB_LOG" ;;
   'exec db-id') printf 'database dump bytes\n' ;;
   'run --rm') printf 'new daemon binary\n' ;;
+  'images --format')
+    # Lines look like: <repo> <tag> <date> <time> <tz> UTC. Empty by default
+    # (nothing to prune); the retention test overrides this.
+    if [ -n "${PODMAN_IMAGES_LINES:-}" ]; then printf '%s\n' "$PODMAN_IMAGES_LINES"; fi
+    ;;
+  'rmi '*) printf 'rmi:%s\n' "$2" >> "$STUB_LOG" ;;
   *) printf 'unexpected podman call: %s\n' "$*" >&2; exit 90 ;;
 esac
 EOF
@@ -156,5 +162,21 @@ assert grep -q 'curl http://127.0.0.1:4802/healthz' "$STUB_LOG"
 assert grep -q 'curl http://127.0.0.1:4180/' "$STUB_LOG"
 after_stops="$(grep -c 'systemctl --user stop multica-daemon.service' "$STUB_LOG")"
 assert test "$after_stops" -gt "$before_stops"
+
+# Image retention: after a successful deploy, only the two newest
+# localhost/multica-{web,backend} versions stay; older tags are removed and
+# other repositories are untouched.
+before_rmis="$(grep -c '^rmi:' "$STUB_LOG" || true)"
+PODMAN_IMAGES_LINES="$(printf '%s\n' \
+  'localhost/multica-web keep-newest 2026-11-04 10:00:00 +0000 UTC' \
+  'localhost/multica-web keep-previous 2026-11-03 10:00:00 +0000 UTC' \
+  'localhost/multica-web drop-old 2026-11-02 10:00:00 +0000 UTC' \
+  'localhost/multica-backend keep-b-newest 2026-11-04 11:00:00 +0000 UTC' \
+  'localhost/multica-backend keep-b-previous 2026-11-03 11:00:00 +0000 UTC' \
+  'localhost/multica-backend drop-b-old 2026-11-02 11:00:00 +0000 UTC' \
+  'ghcr.io/multica-ai/multica-web latest 2026-10-01 10:00:00 +0000 UTC')" run >/dev/null 2>&1
+assert grep -q '^rmi:localhost/multica-web:drop-old$' "$STUB_LOG"
+assert grep -q '^rmi:localhost/multica-backend:drop-b-old$' "$STUB_LOG"
+assert test "$(grep -c '^rmi:' "$STUB_LOG")" -eq "$((before_rmis + 2))"
 
 printf 'deploy-main stub tests passed\n'
