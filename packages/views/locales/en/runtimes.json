@@ -593,7 +593,10 @@
     "advanced": "Advanced",
     "copy_login_url_aria": "Copy sign-in link",
     "open_login_url_aria": "Open sign-in link",
-    "toast_failed": "Could not update the account"
+    "toast_failed": "Could not update the account",
+    "engine_version_aria": "Engine version for {{label}}",
+    "engine_default": "Default",
+    "engine_version_note": "Applies after this account's running tasks finish and its engine restarts."
   },
   "qoder": {
     "title": "Qoder Cloud Agents runtime",

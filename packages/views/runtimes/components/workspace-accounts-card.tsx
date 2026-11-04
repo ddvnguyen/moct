@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Trash2, ExternalLink, Copy, Check } from "@multica/ui/icons";
-import type { AgentRuntime } from "@multica/core/types";
+import type { AgentRuntime, WorkspaceAccount } from "@multica/core/types";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { runtimeProfileListOptions } from "@multica/core/runtimes";
 import {
@@ -23,6 +23,11 @@ import { copyText } from "@multica/ui/lib/clipboard";
 const FREEBUFF_DESKTOP_COMMAND_PREFIX = "freebuff-desktop";
 
 const MOVING_STATES = new Set(["requested", "awaiting_login", "removing"]);
+
+function hasEngineVersionOptions(account: WorkspaceAccount): boolean {
+  return Boolean(account.runtimeId && account.daemonAccountId) &&
+    (account.installedVersions?.length ?? 0) > 0;
+}
 
 export function WorkspaceAccountsCard({
   runtime,
@@ -133,18 +138,42 @@ export function WorkspaceAccountsCard({
                   {account.error ? (
                     <div className="text-caption text-destructive">{account.error}</div>
                   ) : null}
-              {canManage && (account.state === "failed" || account.state === "signed_out") ? (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="self-start"
-                  disabled={update.isPending}
-                  onClick={() => update.mutate({ accountId: account.id, patch: { retry: true } }, { onError: fail })}
-                >
-                  {t(($) => $.accounts.retry)}
-                </Button>
-              ) : null}
+                  {canManage && (account.state === "failed" || account.state === "signed_out") ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="self-start"
+                      disabled={update.isPending}
+                      onClick={() => update.mutate({ accountId: account.id, patch: { retry: true } }, { onError: fail })}
+                    >
+                      {t(($) => $.accounts.retry)}
+                    </Button>
+                  ) : null}
                 </div>
+                {hasEngineVersionOptions(account) ? (
+                  <select
+                    value={account.engineVersion ?? ""}
+                    disabled={!canManage || update.isPending}
+                    aria-label={t(($) => $.accounts.engine_version_aria, { label: account.label })}
+                    onChange={(event) =>
+                      update.mutate(
+                        {
+                          accountId: account.id,
+                          patch: { engine_version: event.target.value },
+                        },
+                        { onError: fail },
+                      )
+                    }
+                    className="max-w-36 rounded-md border bg-muted px-2 py-1 text-caption"
+                  >
+                    <option value="">{t(($) => $.accounts.engine_default)}</option>
+                    {account.installedVersions?.map((version) => (
+                      <option key={version.version} value={version.version}>
+                        {version.version}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
                 <Switch
                   checked={account.enabled}
                   disabled={!canManage || update.isPending}
@@ -165,6 +194,11 @@ export function WorkspaceAccountsCard({
                   </Button>
                 )}
               </div>
+              {hasEngineVersionOptions(account) ? (
+                <p className="text-caption text-muted-foreground">
+                  {t(($) => $.accounts.engine_version_note)}
+                </p>
+              ) : null}
               {account.state === "awaiting_login" && account.loginUrl ? (
                 <div className="flex items-stretch gap-1.5">
                   <input

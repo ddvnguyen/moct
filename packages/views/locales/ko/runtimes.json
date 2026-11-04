@@ -576,7 +576,10 @@
     "advanced": "고급",
     "copy_login_url_aria": "로그인 링크 복사",
     "open_login_url_aria": "로그인 링크 열기",
-    "toast_failed": "계정을 업데이트할 수 없습니다"
+    "toast_failed": "계정을 업데이트할 수 없습니다",
+    "engine_version_aria": "{{label}} 엔진 버전",
+    "engine_default": "기본값",
+    "engine_version_note": "이 계정의 실행 중인 작업이 끝나고 엔진이 다시 시작된 후 적용됩니다."
   },
   "qoder": {
     "title": "Qoder Cloud Agents runtime",

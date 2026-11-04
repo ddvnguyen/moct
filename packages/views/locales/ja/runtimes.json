@@ -576,7 +576,10 @@
     "advanced": "詳細設定",
     "copy_login_url_aria": "サインインリンクをコピー",
     "open_login_url_aria": "サインインリンクを開く",
-    "toast_failed": "アカウントを更新できませんでした"
+    "toast_failed": "アカウントを更新できませんでした",
+    "engine_version_aria": "{{label}}のエンジンバージョン",
+    "engine_default": "デフォルト",
+    "engine_version_note": "このアカウントの実行中タスクが完了し、エンジンが再起動した後に適用されます。"
   },
   "qoder": {
     "title": "Qoder Cloud Agents runtime",

@@ -91,6 +91,54 @@ describe("WorkspaceAccountsCard", () => {
     expect(screen.queryByText("Other runtime")).toBeNull();
   });
 
+  it("lets an admin choose an installed engine version or the default", async () => {
+    const user = userEvent.setup();
+    api.listWorkspaceAccounts.mockResolvedValue([
+      account({
+        runtimeId: "rt-1",
+        daemonAccountId: "daemon-1",
+        engineVersion: "1.0.0",
+        installedVersions: [{ version: "1.0.0" }, { version: "2.0.0", commit: "abcdef123456" }],
+      }),
+    ]);
+    renderCard(true);
+
+    const select = await screen.findByRole("combobox", { name: "Engine version for Team A" });
+    expect(select).toHaveDisplayValue("1.0.0");
+    expect(screen.getByRole("option", { name: "Default" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "2.0.0" })).toBeTruthy();
+    expect(screen.getByText(/Applies after this account's running tasks finish/)).toBeTruthy();
+
+    await user.selectOptions(select, "2.0.0");
+    await waitFor(() =>
+      expect(api.updateWorkspaceAccount).toHaveBeenCalledWith("ws-1", "acc-1", {
+        engine_version: "2.0.0",
+      }),
+    );
+
+    await user.selectOptions(select, "");
+    await waitFor(() =>
+      expect(api.updateWorkspaceAccount).toHaveBeenCalledWith("ws-1", "acc-1", {
+        engine_version: "",
+      }),
+    );
+  });
+
+  it("hides engine selection for unmanaged accounts and when no versions are reported", async () => {
+    api.listWorkspaceAccounts.mockResolvedValue([
+      account(),
+      account({
+        id: "acc-2",
+        label: "No versions",
+        runtimeId: "rt-1",
+        daemonAccountId: "daemon-2",
+      }),
+    ]);
+    renderCard(true);
+    await screen.findByText("No versions");
+    expect(screen.queryByRole("combobox", { name: /Engine version/ })).toBeNull();
+  });
+
   it("lets an admin add an account (manual, advanced)", async () => {
     const user = userEvent.setup();
     renderCard(true);

@@ -576,7 +576,10 @@
     "advanced": "高级",
     "copy_login_url_aria": "复制登录链接",
     "open_login_url_aria": "打开登录链接",
-    "toast_failed": "无法更新账户"
+    "toast_failed": "无法更新账户",
+    "engine_version_aria": "{{label}}的引擎版本",
+    "engine_default": "默认",
+    "engine_version_note": "此账户正在运行的任务结束且引擎重启后生效。"
   },
   "qoder": {
     "title": "Qoder Cloud Agents 运行时",

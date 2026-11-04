@@ -1473,6 +1473,8 @@ export interface WorkspaceAccount {
   status?: unknown;
   daemonAccountId?: string;
   runtimeId?: string;
+  engineVersion?: string | null;
+  installedVersions?: FreebuffVersion[] | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -1484,6 +1486,7 @@ export interface CreateWorkspaceAccountRequest {
   enabled?: boolean;
   managed?: boolean;
   runtime_id?: string;
+  engine_version?: string;
 }
 
 export type UpdateWorkspaceAccountRequest = Partial<CreateWorkspaceAccountRequest> & { retry?: boolean };

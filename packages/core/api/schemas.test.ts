@@ -88,8 +88,14 @@ describe("WorkspaceAccountSchema", () => {
       enabled: true,
       runtime_id: "runtime-1",
       state: "connected",
+      daemon_account_id: "daemon-account-1",
+      engine_version: "v1.2.3",
+      installed_versions: [{ version: "v1.2.3", commit: "abcdef123456" }],
     });
     expect(account.runtimeId).toBe("runtime-1");
+    expect(account.daemonAccountId).toBe("daemon-account-1");
+    expect(account.engineVersion).toBe("v1.2.3");
+    expect(account.installedVersions).toEqual([{ version: "v1.2.3", commit: "abcdef123456" }]);
     expect(account.createdAt).toBe("");
     expect(account).not.toHaveProperty("runtime_id");
   });

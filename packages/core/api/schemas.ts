@@ -3986,6 +3986,11 @@ export const WorkspaceAccountSchema = z.object({
   status: z.unknown().optional(),
   daemon_account_id: z.string().optional(),
   runtime_id: z.string().optional(),
+  engine_version: z.string().nullish().catch(null),
+  installed_versions: z.array(z.object({
+    version: z.string(),
+    commit: z.string().nullish().catch(null),
+  }).passthrough()).nullish().catch(null),
   created_at: z.string().catch(""),
   updated_at: z.string().catch(""),
 }).passthrough().transform((account) => {
@@ -3996,6 +4001,8 @@ export const WorkspaceAccountSchema = z.object({
     expires_at,
     daemon_account_id,
     runtime_id,
+    engine_version,
+    installed_versions,
     created_at,
     updated_at,
     ...rest
@@ -4008,6 +4015,8 @@ export const WorkspaceAccountSchema = z.object({
     expiresAt: expires_at,
     daemonAccountId: daemon_account_id,
     runtimeId: runtime_id,
+    engineVersion: engine_version,
+    installedVersions: installed_versions,
     createdAt: created_at,
     updatedAt: updated_at,
   };

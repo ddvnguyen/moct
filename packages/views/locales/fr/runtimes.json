@@ -593,7 +593,10 @@
     "advanced": "Avancé",
     "copy_login_url_aria": "Copier le lien de connexion",
     "open_login_url_aria": "Ouvrir le lien de connexion",
-    "toast_failed": "Impossible de mettre à jour le compte"
+    "toast_failed": "Impossible de mettre à jour le compte",
+    "engine_version_aria": "Version du moteur pour {{label}}",
+    "engine_default": "Par défaut",
+    "engine_version_note": "S’applique après la fin des tâches en cours de ce compte et le redémarrage de son moteur."
   },
   "qoder": {
     "title": "Environnement Qoder Cloud Agents",

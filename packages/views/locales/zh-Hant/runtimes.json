@@ -709,6 +709,9 @@
     "advanced": "進階",
     "copy_login_url_aria": "複製登入連結",
     "open_login_url_aria": "開啟登入連結",
-    "toast_failed": "無法更新帳號"
+    "toast_failed": "無法更新帳號",
+    "engine_version_aria": "{{label}}的引擎版本",
+    "engine_default": "預設",
+    "engine_version_note": "此帳戶正在執行的任務結束且引擎重新啟動後生效。"
   }
 }
