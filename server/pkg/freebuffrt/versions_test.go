@@ -152,6 +152,13 @@ func TestInstalledVersions(t *testing.T) {
 	if got[1].Dir != filepath.Join(root, "versions", "0.0.196") {
 		t.Errorf("dir = %q", got[1].Dir)
 	}
+	// A manifest whose version disagrees with its directory is still listed
+	// under the directory name — the version a pin resolves.
+	makeBundle(t, filepath.Join(root, "versions", "0.0.250"), BundleManifest{Version: "9.9.9", Commit: "abc250"})
+	got = InstalledVersions(root)
+	if len(got) != 3 || got[2].Version != "0.0.250" || got[2].Commit != "abc250" {
+		t.Fatalf("mismatched manifest: %+v", got)
+	}
 	// No store at all is an empty list, not an error.
 	if got := InstalledVersions(t.TempDir()); got != nil {
 		t.Errorf("no store: %+v", got)
@@ -206,6 +213,73 @@ func TestInstallBundle(t *testing.T) {
 	}
 	if _, err := InstallBundle(notBundle, dst, "0.0.191"); err == nil {
 		t.Fatal("install from a non-bundle must fail")
+	}
+}
+
+// Installing a bundle whose source manifest names another version lists and
+// resolves it under the store directory name; the source commit is kept.
+func TestInstallBundleAlignsManifestVersionWithDirectory(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "resources")
+	makeBundle(t, src, BundleManifest{Version: "9.9.9", Commit: "sourca"})
+
+	dst := t.TempDir()
+	if _, err := InstallBundle(src, dst, "0.0.196"); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := readBundleManifest(filepath.Join(dst, "versions", "0.0.196"))
+	if !ok || m.Version != "0.0.196" || m.Commit != "sourca" {
+		t.Fatalf("manifest = %+v ok=%v", m, ok)
+	}
+	got := InstalledVersions(dst)
+	if len(got) != 1 || got[0].Version != "0.0.196" || got[0].Commit != "sourca" {
+		t.Fatalf("installed versions = %+v", got)
+	}
+	b, err := PinnedBundle(dst, "0.0.196")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version, commit := b.Version(); version != "0.0.196" || commit != "sourca" {
+		t.Fatalf("version/commit = %q/%q", version, commit)
+	}
+}
+
+// A Desktop bundle's real build-info.json shape (commitSha) is read through
+// InstallBundle, InstalledVersions and Bundle.Version.
+func TestBuildCommitFromCommitSha(t *testing.T) {
+	const commit = "7807c228ed488496a7bc468aace868368fd605fa"
+
+	root := t.TempDir()
+	src := filepath.Join(root, "resources")
+	makeBundle(t, src, BundleManifest{})
+	if err := os.WriteFile(filepath.Join(src, "orchestrator", "build-info.json"), []byte(`{"commitSha":"`+commit+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readBuildCommit(src); got != commit {
+		t.Fatalf("readBuildCommit = %q", got)
+	}
+
+	dst := t.TempDir()
+	b, err := InstallBundle(src, dst, "0.0.196")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := InstalledVersions(dst)
+	if len(got) != 1 || got[0].Version != "0.0.196" || got[0].Commit != commit {
+		t.Fatalf("installed versions = %+v", got)
+	}
+	if version, build := b.Version(); version != "0.0.196" || build != commit {
+		t.Fatalf("version/commit = %q/%q", version, build)
+	}
+
+	// Without a manifest, Version still reads build-info.json directly.
+	bare := filepath.Join(dst, "versions", "0.0.197")
+	makeBundle(t, bare, BundleManifest{})
+	if err := os.WriteFile(filepath.Join(bare, "orchestrator", "build-info.json"), []byte(`{"commitSha":"`+commit+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if version, build := (Bundle{ResourcesDir: bare}).Version(); version != "0.0.197" || build != commit {
+		t.Fatalf("bare version/commit = %q/%q", version, build)
 	}
 }
 

@@ -20,11 +20,12 @@ import (
 //	<runtimeDir>/versions/<semver>/manifest.json
 //
 // Each entry is a Desktop resources directory, exactly what the legacy single
-// path pointed at. manifest.json names the version and the commit the bundle
-// was built from; a bundle without one is still listed, by its directory
-// name. Legacy layouts (orchestrator/ directly under the runtime dir) keep
-// working: a version pin is what selects the store, and no pin means the
-// resolution order in ResolveBundle is unchanged.
+// path pointed at. The store directory name is the bundle's version; its
+// manifest.json records that version and the commit the bundle was built
+// from. A bundle without one is still listed, by its directory name. Legacy
+// layouts (orchestrator/ directly under the runtime dir) keep working: a
+// version pin is what selects the store, and no pin means the resolution
+// order in ResolveBundle is unchanged.
 
 // EnvAppVersion pins which installed bundle version a runtime's orchestrator
 // runs. It is read through the same setting path as FREEBUFF_BUN_PATH
@@ -82,8 +83,9 @@ func readBundleManifest(resourcesDir string) (BundleManifest, bool) {
 }
 
 // InstalledVersions lists the bundles in a runtime's store, oldest first.
-// A directory without a manifest is listed under its own name; anything that
-// is not a directory (or holds no orchestrator) is skipped.
+// Each bundle is listed under its store directory name — the version a pin
+// resolves; anything that is not a directory (or holds no orchestrator) is
+// skipped. The commit comes from the bundle's manifest or build-info.json.
 func InstalledVersions(runtimeDir string) []InstalledBundle {
 	entries, err := os.ReadDir(VersionsDir(runtimeDir))
 	if err != nil {
@@ -102,7 +104,6 @@ func InstalledVersions(runtimeDir string) []InstalledBundle {
 		version := e.Name()
 		commit := ""
 		if m, ok := readBundleManifest(dir); ok {
-			version = m.Version
 			commit = m.Commit
 		}
 		out = append(out, InstalledBundle{Version: version, Commit: commit, Dir: dir})
@@ -178,7 +179,9 @@ func PinnedBundle(runtimeDir, version string) (Bundle, error) {
 // InstallBundle copies a Desktop resources directory (or an export of one)
 // into the version store as version. The copy lands atomically: it is built
 // under a temporary directory and renamed into place only when complete, so a
-// failed install never leaves a half bundle behind.
+// failed install never leaves a half bundle behind. The installed manifest's
+// version is the store directory name; the manifest's commit (or the source
+// build-info.json's) is kept.
 func InstallBundle(srcDir, runtimeDir, version string) (Bundle, error) {
 	if err := ValidateVersion(version); err != nil {
 		return Bundle{}, err
@@ -199,8 +202,12 @@ func InstallBundle(srcDir, runtimeDir, version string) (Bundle, error) {
 	if err := copyTree(srcDir, tmp); err != nil {
 		return Bundle{}, err
 	}
-	if _, ok := readBundleManifest(tmp); !ok {
-		m := BundleManifest{Version: version, Commit: readBuildCommit(srcDir)}
+	m, ok := readBundleManifest(tmp)
+	if !ok || m.Version != version {
+		if m.Commit == "" {
+			m.Commit = readBuildCommit(srcDir)
+		}
+		m.Version = version
 		raw, err := json.Marshal(m)
 		if err != nil {
 			return Bundle{}, err
@@ -220,23 +227,29 @@ func InstallBundle(srcDir, runtimeDir, version string) (Bundle, error) {
 }
 
 // readBuildCommit picks up the bundle's build commit from build-info.json,
-// the file the orchestrator build writes alongside itself.
+// the file the orchestrator build writes alongside itself. Desktop builds
+// write the commit as "commitSha"; older shapes used "commit" or "sha".
 func readBuildCommit(resourcesDir string) string {
 	raw, err := os.ReadFile(filepath.Join(resourcesDir, "orchestrator", "build-info.json"))
 	if err != nil {
 		return ""
 	}
 	var info struct {
-		Commit string `json:"commit"`
-		SHA    string `json:"sha"`
+		CommitSHA string `json:"commitSha"`
+		Commit    string `json:"commit"`
+		SHA       string `json:"sha"`
 	}
 	if json.Unmarshal(raw, &info) != nil {
 		return ""
 	}
-	if info.Commit != "" {
+	switch {
+	case info.CommitSHA != "":
+		return info.CommitSHA
+	case info.Commit != "":
 		return info.Commit
+	default:
+		return info.SHA
 	}
-	return info.SHA
 }
 
 // copyTree copies src into dst, preserving file modes. Symlinks are copied
