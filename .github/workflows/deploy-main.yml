@@ -48,7 +48,7 @@ permissions:
 jobs:
   validate:
     name: Validate dispatch inputs and refs
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, multica-main]
     timeout-minutes: 2
     steps:
       - name: Reject disallowed dispatch ref and invalid inputs
