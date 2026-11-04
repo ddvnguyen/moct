@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Check, Copy, ExternalLink, Plus, Timer, Wallet } from "@multica/ui/icons";
-import type { AgentRuntime, FreebuffAccount } from "@multica/core/types";
+import type { AgentRuntime, FreebuffAccount, FreebuffVersion } from "@multica/core/types";
 // Deep import on purpose: the freebuff helpers live behind their own
 // entry point so a test that stubs the runtimes barrel does not have to
 // know about them.
@@ -14,6 +14,7 @@ import {
   useRemoveFreebuffAccount,
   useRetryFreebuffAccountLogin,
   useSetFreebuffDefaultAccount,
+  useSetFreebuffEngineVersion,
 } from "@multica/core/runtimes/freebuff";
 import { Button } from "@multica/ui/components/ui/button";
 import { copyText } from "@multica/ui/lib/clipboard";
@@ -93,16 +94,28 @@ export function FreebuffAccountCard({ runtime }: { runtime: AgentRuntime }) {
     return () => clearInterval(id);
   }, [isFreebuff]);
 
+  const setEngine = useSetFreebuffEngineVersion();
+
   if (!isFreebuff) return null;
 
   const accounts = data?.accounts ?? [];
   const defaultId = data?.default_account_id ?? null;
+  const versions = data?.installed_versions ?? [];
+  const engineVersion = data?.engine_version ?? "";
 
   const handleAdd = async () => {
     try {
       await addAccount.mutateAsync(runtime.id);
     } catch (error) {
       toast.error(errorMessage(error, t(($) => $.freebuff.toast_add_failed)));
+    }
+  };
+
+  const handleEngine = async (version: string) => {
+    try {
+      await setEngine.mutateAsync({ runtimeId: runtime.id, version });
+    } catch (error) {
+      toast.error(errorMessage(error, t(($) => $.freebuff.engine_select_failed)));
     }
   };
 
@@ -123,6 +136,13 @@ export function FreebuffAccountCard({ runtime }: { runtime: AgentRuntime }) {
         </Button>
       </div>
 
+      <FreebuffEngineRow
+        versions={versions}
+        pinned={engineVersion}
+        pending={setEngine.isPending}
+        onChange={handleEngine}
+      />
+
       {accounts.length === 0 ? (
         <p className="px-4 py-3 text-caption text-muted-foreground">
           {t(($) => $.freebuff.empty)}
@@ -140,6 +160,53 @@ export function FreebuffAccountCard({ runtime }: { runtime: AgentRuntime }) {
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+// The engine version the runtime's tasks run on. The list is what the daemon
+// last reported installing; choosing one pins it, choosing the default
+// unpins. A change applies on the next run, not one in flight.
+function FreebuffEngineRow({
+  versions,
+  pinned,
+  pending,
+  onChange,
+}: {
+  versions: FreebuffVersion[];
+  pinned: string;
+  pending: boolean;
+  onChange: (version: string) => void | Promise<void>;
+}) {
+  const { t } = useT("runtimes");
+  if (versions.length === 0) return null;
+
+  return (
+    <div className="flex items-center justify-between gap-3 border-b px-4 py-2.5">
+      <span className="text-caption font-medium">
+        {t(($) => $.freebuff.engine_title)}
+      </span>
+      <div className="flex items-center gap-2">
+        {pinned ? (
+          <span className="text-caption text-muted-foreground">
+            {t(($) => $.freebuff.engine_pinned_note)}
+          </span>
+        ) : null}
+        <select
+          value={pinned}
+          disabled={pending}
+          aria-label={t(($) => $.freebuff.engine_title)}
+          onChange={(e) => onChange(e.target.value)}
+          className="rounded-md border bg-muted px-2 py-1 text-caption"
+        >
+          <option value="">{t(($) => $.freebuff.engine_default)}</option>
+          {versions.map((v) => (
+            <option key={v.version} value={v.version}>
+              {v.commit ? `${v.version} (${v.commit.slice(0, 7)})` : v.version}
+            </option>
+          ))}
+        </select>
+      </div>
     </div>
   );
 }

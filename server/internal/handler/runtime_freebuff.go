@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/freebuffrt"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -80,11 +81,27 @@ type FreebuffAccount struct {
 	UpdatedAt   *time.Time      `json:"updated_at,omitempty"`
 }
 
+// FreebuffVersion is one orchestrator bundle installed on the daemon's
+// machine, as the runtime page shows it.
+type FreebuffVersion struct {
+	Version string `json:"version"`
+	// Commit is the build the bundle was made from, when known.
+	Commit string `json:"commit,omitempty"`
+}
+
 // FreebuffBlock is the stored shape of the runtime's `metadata.freebuff` key.
 type FreebuffBlock struct {
 	Accounts []FreebuffAccount `json:"accounts"`
 	// DefaultAccountID is the account tasks run on.
 	DefaultAccountID string `json:"default_account_id,omitempty"`
+	// EngineVersion pins the orchestrator bundle version tasks run on. Empty
+	// means the daemon's default bundle. The daemon applies the pin when it
+	// next reads its pending state, so a change lands on the next run.
+	EngineVersion string `json:"engine_version,omitempty"`
+	// InstalledVersions is what the daemon last reported having under its
+	// version store, oldest first. The daemon owns the list; the server only
+	// mirrors it.
+	InstalledVersions []FreebuffVersion `json:"installed_versions,omitempty"`
 	// UpdatedAt is when the daemon last reported.
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
@@ -160,6 +177,9 @@ type freebuffReport struct {
 	// Complete says the report lists every account the daemon has, so an
 	// account missing from it is gone from the daemon's machine.
 	Complete bool `json:"complete"`
+	// Versions is the full list of orchestrator bundles in the daemon's
+	// version store. Always replaced wholesale: the daemon owns the list.
+	Versions []FreebuffVersion `json:"versions,omitempty"`
 }
 
 func validFreebuffReportedState(state string) bool {
@@ -231,6 +251,21 @@ func applyFreebuffReport(block *FreebuffBlock, report freebuffReport, now time.T
 	}
 	t := now
 	block.UpdatedAt = &t
+	block.InstalledVersions = report.Versions
+	if block.EngineVersion != "" {
+		// The pin must point at a bundle the daemon still has; a report that
+		// no longer lists it would otherwise leave tasks failing to resolve.
+		installed := false
+		for _, v := range report.Versions {
+			if v.Version == block.EngineVersion {
+				installed = true
+				break
+			}
+		}
+		if !installed {
+			block.EngineVersion = ""
+		}
+	}
 	block.fixDefault()
 }
 
@@ -495,6 +530,67 @@ func (h *Handler) ReportFreebuffAccount(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// SetFreebuffEngineVersion pins the orchestrator bundle version tasks run on.
+// An empty version clears the pin, returning the runtime to the daemon's
+// default bundle. The daemon picks the pin up through its pending poll, so a
+// change applies on the next run, not the one in flight.
+func (h *Handler) SetFreebuffEngineVersion(w http.ResponseWriter, r *http.Request) {
+	rt, _, ok := h.requireRuntimeReadAccess(w, r, obsmetrics.RuntimeLookupSourceRuntimeAPI, chi.URLParam(r, "runtimeId"))
+	if !ok {
+		return
+	}
+	if rt.Provider != FreebuffProvider {
+		writeError(w, http.StatusNotFound, "runtime is not a Freebuff runtime")
+		return
+	}
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.Version != "" {
+		if err := freebuffrt.ValidateVersion(body.Version); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid engine version")
+			return
+		}
+	}
+	notInstalled := false
+	block, err := h.updateFreebuffBlock(r, rt, func(b *FreebuffBlock) (bool, error) {
+		if body.Version != "" && len(b.InstalledVersions) > 0 {
+			installed := false
+			for _, v := range b.InstalledVersions {
+				if v.Version == body.Version {
+					installed = true
+					break
+				}
+			}
+			if !installed {
+				notInstalled = true
+				return false, nil
+			}
+		}
+		if b.EngineVersion == body.Version {
+			return false, nil
+		}
+		b.EngineVersion = body.Version
+		return true, nil
+	})
+	if err != nil {
+		slog.Warn("freebuff set engine version failed", "runtime_id", uuidToString(rt.ID), "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to set the engine version")
+		return
+	}
+	if notInstalled {
+		writeError(w, http.StatusConflict, "that engine version is not installed on the runtime")
+		return
+	}
+
+	h.requestDaemonPendingWork(uuidToString(rt.ID), protocol.PendingWorkKindFreebuff)
+	writeJSON(w, http.StatusOK, block)
+}
+
 // GetFreebuffPending answers the daemon's question "what did the user ask
 // for?". It is daemon-authenticated and read-only.
 //
@@ -519,5 +615,6 @@ func (h *Handler) GetFreebuffPending(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":           pending,
 		"default_account_id": block.DefaultAccountID,
+		"engine_version":     block.EngineVersion,
 	})
 }

@@ -2723,6 +2723,21 @@ export class ApiClient {
     });
   }
 
+  // Pins the orchestrator bundle version tasks run on. An empty version
+  // clears the pin. The daemon applies it on the next run, not one in flight.
+  async setFreebuffEngineVersion(runtimeId: string, version: string): Promise<FreebuffAccounts> {
+    const raw = await this.fetch<unknown>(
+      `/api/runtimes/${runtimeId}/freebuff/engine-version`,
+      {
+        method: "POST",
+        body: JSON.stringify({ version }),
+      },
+    );
+    return parseWithFallback<FreebuffAccounts>(raw, FreebuffAccountsSchema, { accounts: [] }, {
+      endpoint: "POST /api/runtimes/:id/freebuff/engine-version",
+    });
+  }
+
   // Workspace dashboard — three independent rollups for `/{slug}/dashboard`.
   // Each accepts an optional `project_id` to narrow the scope to one project.
   // Cost is computed client-side from the model pricing table (same contract

@@ -1045,11 +1045,22 @@ export interface FreebuffAccount {
   updated_at?: string | null;
 }
 
+// One orchestrator bundle installed on the daemon's machine. The daemon owns
+// the list; the runtime page only mirrors it.
+export interface FreebuffVersion {
+  version: string;
+  commit?: string | null;
+}
+
 // The accounts a Freebuff runtime holds. `default_account_id` is the account
-// tasks run on.
+// tasks run on. `engine_version` pins the orchestrator bundle tasks run on
+// (empty = the daemon's default); `installed_versions` is what the daemon
+// last reported having.
 export interface FreebuffAccounts {
   accounts: FreebuffAccount[];
   default_account_id?: string | null;
+  engine_version?: string | null;
+  installed_versions?: FreebuffVersion[] | null;
   updated_at?: string | null;
 }
 
