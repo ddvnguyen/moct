@@ -410,6 +410,34 @@ WHERE s.task_id = t.id
   AND s.status = 'failed'
 RETURNING s.*;
 
+-- name: PromoteTaskSupplement :one
+-- Flips one still-pending queued message to steer, so the running turn reads it
+-- at its next step instead of after the turn. Locking the task serializes
+-- against terminal transitions, and the status guard turns a message the
+-- daemon already claimed into a conflict instead of a second delivery.
+WITH locked_task AS MATERIALIZED (
+    SELECT t.id
+    FROM agent_task_queue t
+    JOIN agent_runtime r ON r.id = t.runtime_id
+    JOIN task_supplement_capability cap ON cap.task_id = t.id
+    WHERE t.id = @task_id
+      AND t.issue_id = @issue_id
+      AND r.workspace_id = @workspace_id
+      AND t.status = 'running'
+      AND cap.capability = 'task-supplement-v1'
+    FOR UPDATE OF t
+)
+UPDATE task_supplement s
+SET mode = 'steer',
+    updated_at = now()
+FROM locked_task t
+WHERE s.task_id = t.id
+  AND s.comment_id = @comment_id
+  AND s.workspace_id = @workspace_id
+  AND s.status = 'pending'
+  AND s.mode = 'queue'
+RETURNING s.*;
+
 -- name: LockTaskSupplementsByComment :many
 SELECT * FROM task_supplement
 WHERE comment_id = @comment_id AND workspace_id = @workspace_id

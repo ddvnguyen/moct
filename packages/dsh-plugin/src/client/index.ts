@@ -14,6 +14,7 @@ import {
   type RailGlyph,
 } from "./seat";
 import { startUnreadPoll } from "./unread-store";
+import { createSteerComposer, STEER_COMPOSER_ENTRY } from "./steer-composer";
 
 /**
  * Browser face of the Multica panel.
@@ -200,6 +201,20 @@ export function apply(ctx: DshClientContext): void {
   }
 
   const createElement = hostCreateElement ?? (bundledCreateElement as HostCreateElement);
+
+  // The dsh chat's composer for an MMX-owned session (M-136).
+  //
+  // The selector is the whole safety story: it declines unless exactly one
+  // *running* MMX turn pins this session and negotiated `task-supplement-v1`
+  // with permission for this viewer. A session with no owner, two owners, or a
+  // run that cannot take a message keeps the shell's composer and M-142's
+  // banner.
+  ctx.slots.inject("conversation.composer", () =>
+    ctx.slots.register(
+      { ...STEER_COMPOSER_ENTRY },
+      createSteerComposer(createElement),
+    ),
+  );
 
   MULTICA_ENTRIES.forEach((entry, index) => {
     const railIcon = createRailIcon(createElement, entry.glyph);

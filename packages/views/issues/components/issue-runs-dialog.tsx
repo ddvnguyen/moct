@@ -28,6 +28,7 @@ import {
   type CostBreakdown,
 } from "../../runtimes/utils";
 import { AttributionBadge } from "./attribution-badge";
+import { RunSteerControls } from "./run-steer-controls";
 import {
   buildRunTimeline,
   cacheHitRate,
@@ -924,6 +925,7 @@ function RunListRow({ run, issueId }: { run: TimelineRun; issueId: string }) {
           </>
         )}
         <span className={cn(COL.actions, "flex items-center justify-end gap-0.5 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/run-row:opacity-100 [@media(hover:hover)]:focus-within:opacity-100")}>
+          <RunSteerControls task={task} issueId={issueId} />
           <TranscriptButton
             task={task}
             agentName={agentName}
@@ -956,6 +958,35 @@ function RunListRow({ run, issueId }: { run: TimelineRun; issueId: string }) {
   );
 }
 
+// The daemon writes exactly one of three verdicts into result.session_start
+// (M-138). A value this build does not know is shown verbatim: a newer
+// daemon's verdict is still the truth, just not a string we can translate.
+const SEEDED_FROM_SUMMARY = "seeded from summary of ";
+
+type SessionStart =
+  | { kind: "fresh" }
+  | { kind: "resumed" }
+  | { kind: "seeded"; session: string }
+  | { kind: "other"; text: string };
+
+function readSessionStart(result: unknown): SessionStart | null {
+  if (!result || typeof result !== "object") return null;
+  const raw = (result as { session_start?: unknown }).session_start;
+  if (typeof raw !== "string" || !raw) return null;
+  if (raw === "fresh") return { kind: "fresh" };
+  if (raw === "resumed warm") return { kind: "resumed" };
+  if (raw.startsWith(SEEDED_FROM_SUMMARY)) {
+    return { kind: "seeded", session: raw.slice(SEEDED_FROM_SUMMARY.length) };
+  }
+  return { kind: "other", text: raw };
+}
+
+function readWorkDir(result: unknown): string | null {
+  if (!result || typeof result !== "object") return null;
+  const raw = (result as { work_dir?: unknown }).work_dir;
+  return typeof raw === "string" && raw ? raw : null;
+}
+
 function RunDetails({ id, run, reason }: { id: string; run: TimelineRun; reason: string | null }) {
   const { t } = useT("issues");
   const locale = useLocale();
@@ -965,6 +996,12 @@ function RunDetails({ id, run, reason }: { id: string; run: TimelineRun; reason:
   const usage = run.usage;
   const breakdown = run.breakdown;
   const hit = usage ? cacheHitRate(usage) : null;
+  // Session context (M-136): which provider session this run wrote to, how it
+  // opened it, and where it ran. All three are "not measured" when absent, so
+  // each row is omitted rather than shown as a dash.
+  const sessionId = run.task.session_id || null;
+  const start = readSessionStart(run.task.result);
+  const workDir = readWorkDir(run.task.result);
   const hm = new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", hour12: false });
   const tokenCount: Record<CostPartKey, number> = usage
     ? { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite }
@@ -1046,6 +1083,36 @@ function RunDetails({ id, run, reason }: { id: string; run: TimelineRun; reason:
               <dd className="min-w-0 truncate font-mono text-micro">
                 {run.task.branch_name}
               </dd>
+            </TruncatedTooltip>
+          </>
+        )}
+        {sessionId && (
+          <>
+            <dt className="text-muted-foreground">{t(($) => $.runs_timeline.detail_session)}</dt>
+            <TruncatedTooltip content={sessionId}>
+              <dd className="min-w-0 truncate font-mono text-micro">{sessionId}</dd>
+            </TruncatedTooltip>
+          </>
+        )}
+        {start && (
+          <>
+            <dt className="text-muted-foreground">{t(($) => $.runs_timeline.detail_session_start)}</dt>
+            <dd className="min-w-0 break-words">
+              {start.kind === "fresh"
+                ? t(($) => $.runs_timeline.session_start_fresh)
+                : start.kind === "resumed"
+                  ? t(($) => $.runs_timeline.session_start_resumed)
+                  : start.kind === "seeded"
+                    ? t(($) => $.runs_timeline.session_start_seeded, { session: start.session })
+                    : start.text}
+            </dd>
+          </>
+        )}
+        {workDir && (
+          <>
+            <dt className="text-muted-foreground">{t(($) => $.runs_timeline.detail_work_dir)}</dt>
+            <TruncatedTooltip content={workDir}>
+              <dd className="min-w-0 truncate font-mono text-micro">{workDir}</dd>
             </TruncatedTooltip>
           </>
         )}

@@ -32,6 +32,7 @@ import {
   summarizeTaskUsage,
   summarizeTaskUsageAcross,
 } from "../../runtimes/utils";
+import { RunSteerControls } from "./run-steer-controls";
 import { TerminateTaskConfirmDialog } from "./terminate-task-confirm-dialog";
 import { IssueRunsDialog } from "./issue-runs-dialog";
 import { RunTriggerLabel } from "./run-trigger-label";
@@ -537,6 +538,7 @@ export function ActiveTaskRow({
         )}
       </RowStatus>
       <RowActions>
+        <RunSteerControls task={task} issueId={issueId} />
         {showTranscript && (
           <TranscriptButton
             task={task}

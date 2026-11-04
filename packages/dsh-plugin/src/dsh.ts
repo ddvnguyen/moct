@@ -55,6 +55,12 @@ export interface DshSlotRegistration {
   order?: number;
   priority?: number;
   label?: string;
+  /**
+   * Chain-slot selector: return the value this entry is elected for, or `null`
+   * to decline. Entries are tried in ascending `priority`; the first non-null
+   * result wins and reaches the component as its `matched` prop.
+   */
+  select?: (owner: unknown) => unknown;
 }
 
 /**

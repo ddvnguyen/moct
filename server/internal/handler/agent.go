@@ -478,6 +478,12 @@ type AgentTaskResponse struct {
 	LinkedPriorSessionIssueID string `json:"linked_prior_session_issue_id,omitempty"`
 	LinkedPriorSessionEndedAt string `json:"linked_prior_session_ended_at,omitempty"`
 	LinkedPriorSessionWorkDir string `json:"linked_prior_session_work_dir,omitempty"`
+	// SessionID is the provider session this run writes to, pinned by the
+	// daemon as soon as the provider reports it (M-136). It is the only
+	// session key a live turn can be matched on: PriorSessionID names the
+	// session a run resumed *from*, and a seeded run may abandon that session
+	// and continue in a fresh one. Empty until the daemon reports a session.
+	SessionID string `json:"session_id,omitempty"`
 	// DshSessionURL is set only on dsh-runtime tasks whose transcript is owned
 	// by the dsh session store (M-102): it links to the dsh web app whose
 	// sidebar lists the run's session. Empty everywhere else — the run row's
@@ -912,6 +918,10 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 	if t.BranchName.Valid {
 		branchName = t.BranchName.String
 	}
+	sessionID := ""
+	if t.SessionID.Valid {
+		sessionID = t.SessionID.String
+	}
 	var wakeupContext struct {
 		ID         string `json:"wakeup_id"`
 		SystemRule string `json:"wakeup_system"`
@@ -959,6 +969,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		WakeupSystemRule:       wakeupContext.SystemRule,
 		WakeupJoined:           service.JoinedWakeupNotes(t.Context),
 		WorkDir:                workDir,
+		SessionID:              sessionID,
 		RelativeWorkDir:        relativeWorkDir(workDir, workspaceID, uuidToString(t.ID)),
 		DurableWorkDir:         durableWorkDir,
 		RelativeDurableWorkDir: relativeWorkDir(durableWorkDir, "", ""),
@@ -3426,6 +3437,11 @@ func (h *Handler) ListWorkspaceAgentTaskSnapshot(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusInternalServerError, "failed to list agent task snapshot")
 		return
 	}
+	// The dsh composer takeover reads ownership from THIS snapshot, so it needs
+	// the same supplement metadata the task lists carry: without the negotiated
+	// capability and the caller's permission the map stays empty and the chat
+	// keeps its read-only composer (M-136). Fail-closed like every other caller.
+	h.hydrateTaskSupplementMetadata(r.Context(), r, parseUUID(workspaceID), kept, resp)
 	h.hydrateTaskAttributions(r.Context(), attributionsOf(resp))
 
 	writeJSON(w, http.StatusOK, resp)

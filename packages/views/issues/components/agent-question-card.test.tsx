@@ -80,8 +80,9 @@ describe("AgentQuestionCard", () => {
     render([question()]);
     fireEvent.click(screen.getByRole("radio", { name: /Web/ }));
     fireEvent.click(screen.getByRole("button", { name: "Answer" }));
+    // No explicit mode: an answer wants the server's default (steer).
     await waitFor(() => expect(api.createTaskSupplement).toHaveBeenCalledWith(
-      "issue", TASK, "Web", expect.any(String),
+      "issue", TASK, "Web", expect.any(String), undefined,
     ));
   });
 
@@ -91,7 +92,7 @@ describe("AgentQuestionCard", () => {
     fireEvent.change(screen.getByPlaceholderText("Or write your own answer"), { target: { value: "Neither — use the CLI" } });
     fireEvent.click(screen.getByRole("button", { name: "Answer" }));
     await waitFor(() => expect(api.createTaskSupplement).toHaveBeenCalledWith(
-      "issue", TASK, "Neither — use the CLI", expect.any(String),
+      "issue", TASK, "Neither — use the CLI", expect.any(String), undefined,
     ));
   });
 
@@ -112,7 +113,7 @@ describe("AgentQuestionCard", () => {
     expect(screen.getByTestId("plan-detail")).toHaveTextContent("1. Read the fork");
     fireEvent.click(screen.getByRole("button", { name: "Approve plan" }));
     await waitFor(() => expect(api.createTaskSupplement).toHaveBeenCalledWith(
-      "issue", TASK, "Approve", expect.any(String),
+      "issue", TASK, "Approve", expect.any(String), undefined,
     ));
   });
 
@@ -122,7 +123,7 @@ describe("AgentQuestionCard", () => {
     fireEvent.change(screen.getByPlaceholderText("Your answer"), { target: { value: "Split step 2" } });
     fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
     await waitFor(() => expect(api.createTaskSupplement).toHaveBeenCalledWith(
-      "issue", TASK, "Split step 2", expect.any(String),
+      "issue", TASK, "Split step 2", expect.any(String), undefined,
     ));
   });
 

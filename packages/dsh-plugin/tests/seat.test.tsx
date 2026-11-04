@@ -105,16 +105,34 @@ describe("client apply", () => {
     // and `sessions` feed the Files/Terminal bridge (M-159); each is read
     // tolerantly in `apply`.
     expect(inject).toEqual(["slots", "layout", "sidebarRight", "workspaces", "sessions"]);
-    // Two contributions per entry, and each waits for its own slot.
-    expect(injected).toEqual(
-      MULTICA_ENTRIES.flatMap(() => ["sidebar.panellist", "main"]),
-    );
+    // Two contributions per entry, and each waits for its own slot. The
+    // composer takeover (M-136) is the one contribution that is not a rail
+    // row, so it registers first and once.
+    expect(injected).toEqual([
+      "conversation.composer",
+      ...MULTICA_ENTRIES.flatMap(() => ["sidebar.panellist", "main"]),
+    ]);
 
     const rows = byName(registrations, "sidebar.panellist");
     const seats = byName(registrations, "main");
     expect(rows).toHaveLength(7);
     expect(seats).toHaveLength(7);
     expect(MULTICA_ENTRIES).toHaveLength(7);
+  });
+
+  it("registers the composer takeover as a chain entry that can decline", () => {
+    const { ctx, registrations } = fakeSlots();
+    apply(ctx);
+
+    const composer = byName(registrations, "conversation.composer");
+    expect(composer).toHaveLength(1);
+    // Priority 0 sits above ui-subagent's read-only entry (-10) and below the
+    // pending-interaction entries (1), and it is a selector entry: declining is
+    // how the shell's own composer keeps the session.
+    expect(composer[0]?.options.priority).toBe(0);
+    expect(typeof composer[0]?.options.select).toBe("function");
+    const select = composer[0]?.options.select as (owner: unknown) => unknown;
+    expect(select({ sessionId: "sess-nobody-owns" })).toBeNull();
   });
 
   it("labels the seven entries and keeps the rail order", () => {

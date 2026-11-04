@@ -147,18 +147,24 @@ export interface BackendOptions {
   problem?: string | null;
   /** The folder the "All projects" default addresses (M-159); empty means none. */
   workspaceFolder?: string;
+  /** The rows `GET /api/agent-task-snapshot` answers (M-136's ownership map). */
+  agentTasks?: unknown[];
 }
 
 declare global {
   interface Window {
     /** Every `/multica` call the island makes, so a spec can inspect them. */
     __requests?: string[];
+    /** Every write a page made, so a spec asserts on the body, not on internals. */
+    __mutations?: Array<{ method: string; path: string; body: Record<string, unknown> }>;
   }
 }
 
 export function installBackend(options: BackendOptions = {}): void {
   const requests: string[] = [];
   window.__requests = requests;
+  const mutations: NonNullable<Window["__mutations"]> = [];
+  window.__mutations = mutations;
 
   const json = (body: unknown): Response =>
     new Response(JSON.stringify(body), {
@@ -180,6 +186,29 @@ export function installBackend(options: BackendOptions = {}): void {
       }
     };
     const path = url.split("?")[0] ?? "";
+    const method = (init?.method ?? "GET").toUpperCase();
+
+    // M-136's three writes. They answer like the server does — a supplement is
+    // a comment plus a receipt, a promote answers with the receipt's new mode,
+    // a cancel is a bare 200 — and record what the page sent.
+    if (method === "POST" && /^\/multica\/api\/issues\/[^/]+\/tasks\/[^/]+\/supplements$/.test(path)) {
+      mutations.push({ method, path, body: body() });
+      return json({
+        id: "comment-steer-1",
+        supplements: [{ task_id: "task-1", status: "pending", supplement_mode: body().mode }],
+      });
+    }
+    if (
+      method === "POST" &&
+      /^\/multica\/api\/issues\/[^/]+\/tasks\/[^/]+\/supplements\/[^/]+\/promote$/.test(path)
+    ) {
+      mutations.push({ method, path, body: body() });
+      return json({ supplement_task_id: "task-1", supplement_status: "pending", supplement_mode: "steer" });
+    }
+    if (method === "POST" && /^\/multica\/api\/issues\/[^/]+\/tasks\/[^/]+\/cancel$/.test(path)) {
+      mutations.push({ method, path, body: body() });
+      return json({ ok: true });
+    }
 
     if (url.startsWith("/multica/config")) {
       // M-173: the host's slug is the only source the WorkspaceGate reads;
@@ -283,7 +312,7 @@ export function installBackend(options: BackendOptions = {}): void {
       return json({ sessions: [], total: 0 });
     }
     if (url.startsWith("/multica/api/chat")) return json({ messages: [], total: 0 });
-    if (url.startsWith("/multica/api/agent-task-snapshot")) return json([]);
+    if (url.startsWith("/multica/api/agent-task-snapshot")) return json(options.agentTasks ?? []);
     if (url.startsWith("/multica/api/agent-tasks")) return json([]);
     // The board is the table surface: one cursor page per column, addressed by
     // the group key the descriptor named.

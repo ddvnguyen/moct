@@ -922,16 +922,44 @@ export function useCreateComment(issueId: string) {
  *
  * `client_request_id` is minted once per submitted answer: a double click
  * retries the same intent instead of posting the answer twice.
+ *
+ * `mode` picks what the message does to the turn (M-136): `queue` stores it for
+ * the agent's next turn, `steer` delivers it into the running one. Omitting it
+ * leaves the server default (`steer`), which is what every caller before this
+ * card meant.
  */
 export function useCreateTaskSupplement(issueId: string) {
   const qc = useQueryClient();
   const wsId = useWorkspaceId();
   return useMutation({
-    mutationFn: ({ taskId, content }: { taskId: string; content: string }) =>
-      api.createTaskSupplement(issueId, taskId, content, createSafeId()),
+    mutationFn: ({
+      taskId,
+      content,
+      mode,
+    }: {
+      taskId: string;
+      content: string;
+      mode?: "steer" | "queue";
+    }) =>
+      api.createTaskSupplement(issueId, taskId, content, createSafeId(), mode),
     onSuccess: (comment) => {
       applyCreatedComment(qc, wsId, issueId, comment);
     },
+  });
+}
+
+/**
+ * Move one still-pending queued message to steer (M-136).
+ *
+ * The receipt, not the comment, is the answer: it carries the new mode and the
+ * delivery state, which is what the queued row paints. The server broadcasts
+ * the comment's updated receipts, so the issue timeline needs no invalidate of
+ * its own.
+ */
+export function usePromoteTaskSupplement(issueId: string) {
+  return useMutation({
+    mutationFn: ({ taskId, commentId }: { taskId: string; commentId: string }) =>
+      api.promoteTaskSupplement(issueId, taskId, commentId),
   });
 }
 

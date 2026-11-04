@@ -133,6 +133,116 @@ func TestTaskSupplementSubmissionBoundsAndConflicts(t *testing.T) {
 	}
 }
 
+// TestTaskSupplementPromoteQueuedMessage covers the only write that changes a
+// message's delivery mode: a queued message flips to steer in place, a retry
+// returns the same receipt, and a message the promote no longer owns is a
+// conflict rather than a second delivery.
+func TestTaskSupplementPromoteQueuedMessage(t *testing.T) {
+	f := newSupplementFixture(t, "dsh", "running", true)
+	var queued CommentResponse
+	supplementRequestWithMode(t, f, "0199a4e8-22ce-7b01-bba5-444444444444", "read the migration first", "queue").
+		Want(http.StatusCreated).JSON(&queued)
+	if n := dbfx.Count(t, `SELECT count(*) FROM task_supplement WHERE comment_id=$1 AND mode='queue' AND status='pending'`, queued.ID); n != 1 {
+		t.Fatalf("queued message not persisted: %d rows", n)
+	}
+
+	var promoted taskSupplementReceiptResponse
+	promoteSupplementRequest(t, f, queued.ID).Want(http.StatusOK).JSON(&promoted)
+	if promoted.Status != "pending" || promoted.Mode != "steer" {
+		t.Fatalf("promoted receipt = %+v", promoted)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM task_supplement WHERE comment_id=$1 AND mode='steer'`, queued.ID); n != 1 {
+		t.Fatalf("promote left %d steer rows", n)
+	}
+	if n := dbfx.Count(t, `SELECT count(*) FROM comment WHERE issue_id=$1 AND content=$2`, f.issueID, "read the migration first"); n != 1 {
+		t.Fatal("promote created a second comment")
+	}
+
+	// A retry after the flip is the same success, not a second write.
+	var replayed taskSupplementReceiptResponse
+	promoteSupplementRequest(t, f, queued.ID).Want(http.StatusOK).JSON(&replayed)
+	if replayed.Status != promoted.Status || replayed.Mode != promoted.Mode || replayed.TaskID != promoted.TaskID {
+		t.Fatalf("replay = %+v, want %+v", replayed, promoted)
+	}
+
+	// A message that is already steer is the same success whether it was
+	// created that way or promoted here, so a client can promote blindly.
+	var steered CommentResponse
+	supplementRequest(t, f, "0199a4e8-22ce-7b01-bba5-555555555555", "steer me now").Want(http.StatusCreated).JSON(&steered)
+	var alreadySteer taskSupplementReceiptResponse
+	promoteSupplementRequest(t, f, steered.ID).Want(http.StatusOK).JSON(&alreadySteer)
+	if alreadySteer.Status != "pending" || alreadySteer.Mode != "steer" {
+		t.Fatalf("promote of a steer message = %+v", alreadySteer)
+	}
+	// Once the run has consumed the message it is no longer a queued item this
+	// client owns: the promote must not resurrect it as a second delivery.
+	dbfx.Exec(t, `UPDATE task_supplement SET status='delivered', delivered_at=now() WHERE comment_id=$1`, steered.ID)
+	if code := promoteSupplementRequest(t, f, steered.ID).Want(http.StatusConflict).Map()["code"]; code != "task_supplement_taken" {
+		t.Fatalf("promote of a delivered message = %v, want task_supplement_taken", code)
+	}
+	// An unknown comment never becomes a delivery.
+	if code := promoteSupplementRequest(t, f, "0199a4e8-22ce-7b01-bba5-666666666666").Want(http.StatusNotFound).Map()["code"]; code != "task_supplement_not_found" {
+		t.Fatalf("promote of an unknown comment = %v, want task_supplement_not_found", code)
+	}
+
+	// The queued message must not outlive the turn it was queued for.
+	if w := completeTaskViaHandler(t, f.taskID, "done"); w.Code != http.StatusOK {
+		t.Fatalf("complete task: status %d: %s", w.Code, w.Body.String())
+	}
+	if code := promoteSupplementRequest(t, f, queued.ID).Want(http.StatusConflict).Map()["code"]; code != "task_supplement_turn_ended" {
+		t.Fatalf("promote after the turn = %v, want task_supplement_turn_ended", code)
+	}
+}
+
+// TestAgentTaskSnapshotCarriesSupplementMetadata pins the contract the dsh
+// composer takeover reads. Ownership is decided off the workspace snapshot, not
+// off the issue's task list, so the snapshot has to answer all three questions
+// the takeover asks: did this run negotiate steering, may this caller use it,
+// and which session does the run write to. Without the hydration the map is
+// empty on a live server and the chat silently keeps its read-only composer,
+// which is exactly what the hand-built e2e fixture used to hide.
+func TestAgentTaskSnapshotCarriesSupplementMetadata(t *testing.T) {
+	f := newSupplementFixture(t, "dsh", "running", true)
+	const sessionID = "0199a4e8-22ce-7b01-bba5-888888888888"
+	dbfx.Exec(t, `UPDATE agent_task_queue SET session_id=$2 WHERE id=$1`, f.taskID, sessionID)
+
+	req := newRequest(http.MethodGet, "/api/agent-task-snapshot", nil)
+	var tasks []AgentTaskResponse
+	testutil.Call(t, testHandler.ListWorkspaceAgentTaskSnapshot, req).Want(http.StatusOK).JSON(&tasks)
+
+	var got *AgentTaskResponse
+	for i := range tasks {
+		if tasks[i].ID == f.taskID {
+			got = &tasks[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("snapshot omitted the running task %s", f.taskID)
+	}
+	if got.SupplementCapability != protocol.DaemonCapabilityTaskSupplementV1 {
+		t.Fatalf("supplement_capability = %q, want %q", got.SupplementCapability, protocol.DaemonCapabilityTaskSupplementV1)
+	}
+	if !got.CanSupplement {
+		t.Fatal("can_supplement = false for the agent's owner")
+	}
+	if got.SessionID != sessionID {
+		t.Fatalf("session_id = %q, want %q", got.SessionID, sessionID)
+	}
+}
+
+// TestTaskSupplementQueueModeIsDshOnly keeps the queue/steer distinction
+// meaningful: a runtime without a step boundary cannot hold a message back.
+func TestTaskSupplementQueueModeIsDshOnly(t *testing.T) {
+	f := newSupplementFixture(t, "claude", "running", true)
+	const requestID = "0199a4e8-22ce-7b01-bba5-777777777777"
+	supplementRequestWithMode(t, f, requestID, "wait for the turn", "queue").Want(http.StatusBadRequest)
+	if n := dbfx.Count(t, `SELECT count(*) FROM task_supplement WHERE task_id=$1`, f.taskID); n != 0 {
+		t.Fatal("refused queue mode was persisted")
+	}
+	supplementRequestWithMode(t, f, requestID, "not a mode", "broadcast").Want(http.StatusBadRequest)
+}
+
 func newSupplementFixture(t *testing.T, provider, status string, negotiated bool) supplementFixture {
 	t.Helper()
 	if testHandler == nil {
@@ -162,12 +272,29 @@ func newSupplementFixture(t *testing.T, provider, status string, negotiated bool
 
 func supplementRequest(t *testing.T, fixture supplementFixture, requestID, content string) *testutil.Response {
 	t.Helper()
-	req := newRequest(http.MethodPost, "/api/issues/"+fixture.issueID+"/tasks/"+fixture.taskID+"/supplements", map[string]any{
+	return supplementRequestWithMode(t, fixture, requestID, content, "")
+}
+
+func supplementRequestWithMode(t *testing.T, fixture supplementFixture, requestID, content, mode string) *testutil.Response {
+	t.Helper()
+	body := map[string]any{
 		"client_request_id": requestID,
 		"content":           content,
-	})
+	}
+	if mode != "" {
+		body["mode"] = mode
+	}
+	req := newRequest(http.MethodPost, "/api/issues/"+fixture.issueID+"/tasks/"+fixture.taskID+"/supplements", body)
 	return testutil.Call(t, testHandler.CreateTaskSupplement,
 		withURLParams(req, "id", fixture.issueID, "taskId", fixture.taskID),
+	)
+}
+
+func promoteSupplementRequest(t *testing.T, fixture supplementFixture, commentID string) *testutil.Response {
+	t.Helper()
+	req := newRequest(http.MethodPost, "/api/issues/"+fixture.issueID+"/tasks/"+fixture.taskID+"/supplements/"+commentID+"/promote", nil)
+	return testutil.Call(t, testHandler.PromoteTaskSupplement,
+		withURLParams(req, "id", fixture.issueID, "taskId", fixture.taskID, "commentId", commentID),
 	)
 }
 

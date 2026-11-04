@@ -427,6 +427,15 @@ export interface AgentTask {
    */
   relative_durable_work_dir?: string;
   /**
+   * Provider session this run writes to, pinned by the daemon as soon as the
+   * provider reports it (M-136). The only correct key for a live turn: a
+   * seeded run may abandon `prior_session_id` and continue in a fresh session,
+   * so matching a running turn on the prior id can miss or collide.
+   *
+   * Absent until the provider reports a session, and on older backends.
+   */
+  session_id?: string;
+  /**
    * Base URL of the dsh web app whose sidebar lists this run's session.
    * Set ONLY for dsh-runtime tasks whose transcript is owned by the dsh
    * session store; every other runtime (and older backends) omit the field

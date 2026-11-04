@@ -133,6 +133,13 @@ export type { LocaleAdapter } from "@multica/core/i18n";
 // and the portal seat that keeps overlays inside the island's shadow root.
 export { RESOURCES } from "@multica/views/locales";
 export { ErrorBoundary } from "@multica/ui/components/common/error-boundary";
+
+// Which running MMX turn owns a dsh session (M-136). The snapshot is the same
+// workspace-wide key the presence surfaces read, so the composer's takeover
+// store costs no request of its own and follows the realtime invalidation the
+// task events already trigger.
+export { agentTaskSnapshotOptions } from "@multica/core/agents/queries";
+export type { AgentTask } from "@multica/core/types";
 export { PortalContainerProvider } from "@multica/ui/components/ui/portal-container";
 
 // The runtimes surface (M-174): the same page the desktop and web apps render,

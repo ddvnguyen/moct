@@ -34,6 +34,7 @@ import { runtimesDeviceTab } from "./moct-runtimes";
 import { ShellButtons } from "./shell-buttons";
 import { createAgentMemorySections } from "./moct-agent-memory";
 import { UnreadReporter } from "./unread-reporter";
+import { SteerReporter } from "./steer-reporter";
 import { DecisionsBadgeReporter } from "./decisions-badge-reporter";
 import { IslandVersionBadge } from "./version-badge";
 import {
@@ -313,6 +314,10 @@ function WorkspaceGate({
           the reporter observes the summary key the inbox page reads and
           writes the rail dot's store. */}
       <UnreadReporter workspaceId={workspace.id} />
+      {/* Which running MMX turn owns each dsh session (M-136): the dsh chat's
+          composer takeover reads this store, and this observer is what keeps
+          it current from the same snapshot query presence already loads. */}
+      <SteerReporter workspaceId={workspace.id} />
       <IslandPages
         slug={workspace.slug}
         workspaceId={workspace.id}
