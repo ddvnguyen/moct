@@ -1,4 +1,4 @@
-name: Deploy main Multica
+name: Deploy Multica (main-multica stack)
 
 on:
   workflow_dispatch:
@@ -13,9 +13,9 @@ on:
         default: multica-moct
         type: string
       drain_timeout_seconds:
-        description: Maximum time to wait for active daemon tasks
+        description: Max seconds to wait for active daemon tasks before cancelling them; 0 = no wait, cancel and deploy immediately
         required: true
-        default: "600"
+        default: "0"
         type: string
       image_source:
         description: Build images on this host or use images already staged there
@@ -36,7 +36,7 @@ on:
         default: false
         type: boolean
 
-run-name: Deploy main ${{ inputs.image_tag }} from ${{ inputs.source_ref }} (force=${{ inputs.force }}, dry_run=${{ inputs.dry_run }})
+run-name: Deploy Multica ${{ inputs.image_tag }} from ${{ inputs.source_ref }} (drain=${{ inputs.drain_timeout_seconds }}s, force=${{ inputs.force }}, dry_run=${{ inputs.dry_run }})
 
 concurrency:
   group: multica-main-production-deploy
@@ -75,15 +75,15 @@ jobs:
           [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || {
             echo "::error::image_tag is invalid"; exit 1;
           }
-          [[ "$DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] && (( DRAIN_TIMEOUT > 0 )) || {
-            echo "::error::drain_timeout_seconds must be a positive integer"; exit 1;
+          [[ "$DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] || {
+            echo "::error::drain_timeout_seconds must be a non-negative integer (0 = cancel tasks and deploy immediately)"; exit 1;
           }
           if [[ "$DRY_RUN" == "true" && "$IMAGE_SOURCE" != "staged" ]]; then
             echo "::error::dry_run requires image_source=staged so it does not build or mutate host images"; exit 1
           fi
 
   deploy:
-    name: Deploy main (force=${{ inputs.force }})
+    name: Deploy Multica stack (drain=${{ inputs.drain_timeout_seconds }}s, force=${{ inputs.force }})
     needs: validate
     if: ${{ needs.validate.result == 'success' }}
     runs-on: [self-hosted, linux, x64, multica-main]

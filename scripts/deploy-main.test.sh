@@ -118,6 +118,18 @@ fi
 assert grep -q '^MULTICA_IMAGE_TAG=old-tag$' "$STACK_DIR/.env"
 assert grep -q 'old daemon binary' "$HOME/.local/bin/multica"
 
+# drain_timeout_seconds=0 (the CI/CD default) does not wait for active tasks:
+# it cancels them and deploys immediately (owner directive, 2026-11-04).
+drain0_log="$SANDBOX/drain0.log"
+ACTIVE_TASK_COUNT=1 bash "$SCRIPT" "$IMAGE_TAG" "$EXPECTED_COMMIT" 0 >"$drain0_log" 2>&1 || {
+  echo "expected drain=0 deploy to succeed with active tasks" >&2; cat "$drain0_log" >&2; exit 1; }
+assert grep -q 'deploy does not wait for task drain' "$drain0_log"
+assert grep -q "MULTICA_IMAGE_TAG=$IMAGE_TAG" "$STACK_DIR/.env"
+assert grep -q "new daemon binary" "$HOME/.local/bin/multica"
+# Restore fixtures the later rollback tests rely on.
+printf 'MULTICA_IMAGE_TAG=old-tag\nPOSTGRES_DB=multica\nBACKEND_PORT=4802\nFRONTEND_PORT=4180\n' > "$STACK_DIR/.env"
+printf 'old daemon binary\n' > "$HOME/.local/bin/multica"
+
 # A post-switch health failure restores .env and daemon binary and brings the
 # compose stack and daemon back up. All host commands above are stubbed.
 if FAIL_HEALTH=1 run >/dev/null 2>&1; then

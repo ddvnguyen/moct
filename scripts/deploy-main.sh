@@ -6,8 +6,11 @@ usage() {
   cat <<'EOF'
 Usage: deploy-main.sh <image-tag> <expected-commit-sha> <max-drain-seconds> [--force] [--dry-run]
 
-The script runs only from outside multica-daemon. --force stops the daemon
-after a drain timeout and cancels remaining tasks. --dry-run prints the plan.
+max-drain-seconds 0 (the CI/CD default) does not wait for active tasks: it
+cancels them by stopping the daemon and deploys immediately. A positive
+value waits that long for tasks to drain; --force stops the daemon and
+cancels remaining tasks at the timeout instead of failing.
+--dry-run prints the plan.
 EOF
 }
 
@@ -32,7 +35,7 @@ done
 
 [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "invalid image tag"
 [[ "$EXPECTED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] || die "expected commit must be a full 40-character SHA"
-[[ "$MAX_DRAIN_SECONDS" =~ ^[0-9]+$ ]] && [ "$MAX_DRAIN_SECONDS" -gt 0 ] || die "max drain wait must be a positive number of seconds"
+[[ "$MAX_DRAIN_SECONDS" =~ ^[0-9]+$ ]] || die "max drain wait must be a non-negative number of seconds (0 = cancel tasks and deploy immediately)"
 
 STACK_DIR="${MULTICA_MAIN_STACK_DIR:-$HOME/.local/share/multica}"
 ENV_FILE="$STACK_DIR/.env"
@@ -158,16 +161,21 @@ fi
 daemon_json="$(multica daemon status --output json)" || die "could not read daemon status"
 active_count="$(jq -r '.active_task_count // empty' <<<"$daemon_json")"
 [[ "$active_count" =~ ^[0-9]+$ ]] || die "daemon status has no numeric active_task_count"
-deadline=$((SECONDS + MAX_DRAIN_SECONDS))
-while [ "$active_count" -gt 0 ] && [ "$SECONDS" -lt "$deadline" ]; do
-  log "waiting for $active_count active task(s) to drain"
-  sleep 5
-  daemon_json="$(multica daemon status --output json)" || die "could not read daemon status while draining"
-  active_count="$(jq -r '.active_task_count // empty' <<<"$daemon_json")"
-  [[ "$active_count" =~ ^[0-9]+$ ]] || die "daemon status has no numeric active_task_count"
-done
-if [ "$active_count" -gt 0 ] && [ "$FORCE" != 1 ]; then
-  die "drain timed out with $active_count active task(s); no changes made (pass --force to cancel them)"
+# max-drain-seconds 0 (the CI/CD default, owner directive 2026-11-04) deploys
+# immediately: no wait for active tasks — stopping the daemon below cancels
+# them. A positive value waits for tasks to drain first.
+if [ "$MAX_DRAIN_SECONDS" -gt 0 ]; then
+  deadline=$((SECONDS + MAX_DRAIN_SECONDS))
+  while [ "$active_count" -gt 0 ] && [ "$SECONDS" -lt "$deadline" ]; do
+    log "waiting for $active_count active task(s) to drain"
+    sleep 5
+    daemon_json="$(multica daemon status --output json)" || die "could not read daemon status while draining"
+    active_count="$(jq -r '.active_task_count // empty' <<<"$daemon_json")"
+    [[ "$active_count" =~ ^[0-9]+$ ]] || die "daemon status has no numeric active_task_count"
+  done
+  if [ "$active_count" -gt 0 ] && [ "$FORCE" != 1 ]; then
+    die "drain timed out with $active_count active task(s); no changes made (pass --force to cancel them)"
+  fi
 fi
 
 mkdir -p "$TMPDIR" "$BACKUP_ROOT"
@@ -204,7 +212,7 @@ rollback() {
 trap rollback EXIT
 
 if [ "$active_count" -gt 0 ]; then
-  log "--force enabled; stopping daemon to cancel $active_count remaining task(s)"
+  log "stopping daemon to cancel $active_count remaining task(s); deploy does not wait for task drain"
 fi
 DAEMON_WAS_STOPPED=1
 systemctl --user stop multica-daemon.service
