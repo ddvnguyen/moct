@@ -1,0 +1,57 @@
+{
+  "page": {
+    "title": "Décisions",
+    "pending_tab": "En attente",
+    "answered_tab": "Répondues"
+  },
+  "list": {
+    "aria": "Décisions",
+    "loading": "Chargement des décisions…",
+    "error_title": "Impossible de charger les décisions",
+    "error_hint": "La file est dérivée de l'état des tickets et des tâches : un échec de lecture ne signifie pas qu'il n'y a rien.",
+    "retry": "Réessayer",
+    "empty_pending_title": "Rien en attente",
+    "empty_pending_hint": "Les questions, plans et passations apparaissent ici dès qu'un agent les demande.",
+    "empty_answered_title": "Aucune réponse",
+    "empty_answered_hint": "Toute réponse enregistrée depuis cette page est conservée ici.",
+    "load_more": "Charger plus",
+    "unknown_kind": "Source non reconnue",
+    "none_selected_title": "Sélectionnez une demande",
+    "none_selected_hint": "Choisissez-en une à gauche pour la lire et y répondre ici."
+  },
+  "kind": {
+    "question": "Question",
+    "plan": "Plan",
+    "native": "Question d'agent",
+    "status": "Passation de workflow"
+  },
+  "row": {
+    "by_agent": "{{agent}}",
+    "unknown_agent": "Un agent",
+    "waiting": "en attente {{age}}"
+  },
+  "detail": {
+    "issue_link": "Ouvrir le ticket",
+    "requested": "Demandé {{age}}",
+    "answered": "Répondu {{age}}",
+    "by": "{{actor}}",
+    "unknown_actor": "Un membre",
+    "loading": "Chargement de la demande…",
+    "error_title": "Impossible de charger cette demande",
+    "error_hint": "Elle attend toujours — aucune réponse n'a été enregistrée.",
+    "retry": "Réessayer",
+    "answers_title": "Réponse",
+    "answers_empty": "Aucun texte de réponse enregistré.",
+    "no_answer": "Sans réponse",
+    "review_title": "Verdict",
+    "review_comments": "Commentaires",
+    "review_no_comments": "Aucun commentaire",
+    "native_no_form_title": "Pas de formulaire structuré",
+    "native_no_form_hint": "Cette demande n'est arrivée qu'en texte : répondez-y depuis le ticket.",
+    "status_title": "En attente d'une décision de workflow",
+    "status_hint": "Cette passation se répond pour l'instant depuis le ticket ; cette liste lit l'état du ticket.",
+    "unknown_title": "Cette version ne peut pas y répondre",
+    "unknown_hint": "Elle attend toujours. Ouvrez le ticket pour en lire le contexte.",
+    "answered_hint": "Les réponses enregistrées sont en lecture seule. Une nouvelle demande arrive sur sa propre ligne."
+  }
+}

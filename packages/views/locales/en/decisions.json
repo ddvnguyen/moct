@@ -1,0 +1,57 @@
+{
+  "page": {
+    "title": "Decisions",
+    "pending_tab": "Pending",
+    "answered_tab": "Answered"
+  },
+  "list": {
+    "aria": "Decisions",
+    "loading": "Loading decisions…",
+    "error_title": "Decisions could not be loaded",
+    "error_hint": "The queue is derived from issue and task state, so a failed read is not an empty one.",
+    "retry": "Retry",
+    "empty_pending_title": "Nothing waiting",
+    "empty_pending_hint": "Questions, plans and handoffs appear here as soon as an agent asks.",
+    "empty_answered_title": "No answers yet",
+    "empty_answered_hint": "Every answer recorded from this page is kept here.",
+    "load_more": "Load more",
+    "unknown_kind": "Unrecognised source",
+    "none_selected_title": "Select a request",
+    "none_selected_hint": "Pick one on the left to read it and answer it here."
+  },
+  "kind": {
+    "question": "Question",
+    "plan": "Plan",
+    "native": "Agent question",
+    "status": "Workflow handoff"
+  },
+  "row": {
+    "by_agent": "{{agent}}",
+    "unknown_agent": "An agent",
+    "waiting": "waiting {{age}}"
+  },
+  "detail": {
+    "issue_link": "Open issue",
+    "requested": "Asked {{age}}",
+    "answered": "Answered {{age}}",
+    "by": "{{actor}}",
+    "unknown_actor": "A member",
+    "loading": "Loading the request…",
+    "error_title": "This request could not be loaded",
+    "error_hint": "It is still waiting — nothing was answered.",
+    "retry": "Retry",
+    "answers_title": "Answer",
+    "answers_empty": "No answer text was stored.",
+    "no_answer": "No answer",
+    "review_title": "Verdict",
+    "review_comments": "Comments",
+    "review_no_comments": "No comments",
+    "native_no_form_title": "No structured form",
+    "native_no_form_hint": "This ask reached the transcript as text only, so it is answered on the issue page.",
+    "status_title": "Waiting on a workflow decision",
+    "status_hint": "This handoff is answered on the issue page for now; this list reads it from the issue itself.",
+    "unknown_title": "This build cannot answer this request",
+    "unknown_hint": "It is still waiting. Open the issue to read its context.",
+    "answered_hint": "Recorded answers are read-only. A new request arrives as its own row."
+  }
+}

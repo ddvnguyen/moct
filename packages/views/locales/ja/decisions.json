@@ -1,0 +1,57 @@
+{
+  "page": {
+    "title": "判断待ち",
+    "pending_tab": "未処理",
+    "answered_tab": "回答済み"
+  },
+  "list": {
+    "aria": "判断待ち",
+    "loading": "判断待ちを読み込み中…",
+    "error_title": "判断待ちを読み込めませんでした",
+    "error_hint": "この一覧は課題とタスクの状態から導出されるため、読み込み失敗は「何もない」ことではありません。",
+    "retry": "再試行",
+    "empty_pending_title": "待機中の項目はありません",
+    "empty_pending_hint": "エージェントが質問すると、質問・計画・引き継ぎがここに表示されます。",
+    "empty_answered_title": "回答はまだありません",
+    "empty_answered_hint": "この画面で記録した回答はここに残ります。",
+    "load_more": "さらに読み込む",
+    "unknown_kind": "不明な出典",
+    "none_selected_title": "項目を選択",
+    "none_selected_hint": "左側の項目を選ぶと、ここで内容を確認して回答できます。"
+  },
+  "kind": {
+    "question": "質問",
+    "plan": "計画",
+    "native": "エージェントの質問",
+    "status": "ワークフローの引き継ぎ"
+  },
+  "row": {
+    "by_agent": "{{agent}}",
+    "unknown_agent": "エージェント",
+    "waiting": "{{age}} 待機"
+  },
+  "detail": {
+    "issue_link": "課題を開く",
+    "requested": "{{age}} に質問",
+    "answered": "{{age}} に回答",
+    "by": "{{actor}}",
+    "unknown_actor": "メンバー",
+    "loading": "リクエストを読み込み中…",
+    "error_title": "このリクエストを読み込めませんでした",
+    "error_hint": "待機したままです。回答は記録されていません。",
+    "retry": "再試行",
+    "answers_title": "回答",
+    "answers_empty": "回答本文は保存されていません。",
+    "no_answer": "回答なし",
+    "review_title": "判定",
+    "review_comments": "コメント",
+    "review_no_comments": "コメントなし",
+    "native_no_form_title": "構造化フォームがありません",
+    "native_no_form_hint": "この質問はテキストとしてのみ記録されたため、課題画面で回答してください。",
+    "status_title": "ワークフローの判断待ち",
+    "status_hint": "この引き継ぎは当面課題画面で回答します。この一覧は課題の状態を直接読み取ります。",
+    "unknown_title": "このビルドでは回答できません",
+    "unknown_hint": "待機したままです。課題を開いて内容を確認してください。",
+    "answered_hint": "記録済みの回答は読み取り専用です。新しいリクエストは別の行として表示されます。"
+  }
+}

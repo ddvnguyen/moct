@@ -1,0 +1,57 @@
+{
+  "page": {
+    "title": "待決策",
+    "pending_tab": "待處理",
+    "answered_tab": "已回覆"
+  },
+  "list": {
+    "aria": "待決策",
+    "loading": "正在載入待決策事項…",
+    "error_title": "無法載入待決策事項",
+    "error_hint": "此清單由議題與任務狀態推導而來，讀取失敗不代表沒有事項。",
+    "retry": "重試",
+    "empty_pending_title": "目前沒有待處理事項",
+    "empty_pending_hint": "代理提問後，問題、計畫與交接會立即出現在這裡。",
+    "empty_answered_title": "尚無回覆",
+    "empty_answered_hint": "在此頁面記錄的回覆都會保留在這裡。",
+    "load_more": "載入更多",
+    "unknown_kind": "無法辨識的來源",
+    "none_selected_title": "選擇一項",
+    "none_selected_hint": "在左側選擇一項，即可在此閱讀並回覆。"
+  },
+  "kind": {
+    "question": "問題",
+    "plan": "計畫",
+    "native": "代理提問",
+    "status": "流程交接"
+  },
+  "row": {
+    "by_agent": "{{agent}}",
+    "unknown_agent": "某個代理",
+    "waiting": "已等待 {{age}}"
+  },
+  "detail": {
+    "issue_link": "開啟議題",
+    "requested": "提問於 {{age}}",
+    "answered": "回覆於 {{age}}",
+    "by": "{{actor}}",
+    "unknown_actor": "某位成員",
+    "loading": "正在載入請求…",
+    "error_title": "無法載入此請求",
+    "error_hint": "它仍在等待，未記錄任何回覆。",
+    "retry": "重試",
+    "answers_title": "回覆",
+    "answers_empty": "未儲存回覆內容。",
+    "no_answer": "無回覆",
+    "review_title": "裁定",
+    "review_comments": "留言",
+    "review_no_comments": "無留言",
+    "native_no_form_title": "沒有結構化表單",
+    "native_no_form_hint": "此提問僅以文字進入對話記錄，請在議題頁面回覆。",
+    "status_title": "等待流程決策",
+    "status_hint": "此交接目前需在議題頁面回覆；此清單直接讀取議題狀態。",
+    "unknown_title": "目前版本無法回覆此請求",
+    "unknown_hint": "它仍在等待。請開啟議題查看上下文。",
+    "answered_hint": "已記錄的回覆為唯讀。新請求會以獨立一列出現。"
+  }
+}

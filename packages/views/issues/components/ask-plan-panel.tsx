@@ -53,13 +53,13 @@ export function AskPlanPanel({ issueId }: { issueId: string }) {
   return (
     <div className="space-y-4" data-testid="ask-plan-panel">
       {cards.map((card) => (
-        <AskPlanCard
+        <AskPlanQuestionForm
           key={card.id}
           card={card}
           onAnswer={(variables) => answer.mutateAsync(variables)}
         />
       ))}
-      {plan !== null && <PlanReview key={plan.id} plan={plan} issueId={issueId} />}
+      {plan !== null && <PlanVerdictForm key={plan.id} plan={plan} issueId={issueId} />}
     </div>
   );
 }
@@ -70,8 +70,12 @@ export function AskPlanPanel({ issueId }: { issueId: string }) {
  * `onAnswer` is the mutation itself so a failure rejects: the card awaits it,
  * marks its own error with the server's message, and the mutation's `onSuccess`
  * is what drops the card from the panel by invalidating the ask-plan read.
+ *
+ * Exported because the Decisions page (M-211) answers the same card from a
+ * different surface — the form, its readiness rule and its error handling are
+ * the card table's contract, not the issue page's.
  */
-function AskPlanCard({
+export function AskPlanQuestionForm({
   card,
   onAnswer,
 }: {
@@ -108,8 +112,23 @@ function AskPlanCard({
  * those points is refused server-side with a 409. Showing them read-only with
  * no buttons is the honest rendering of that, and it is also the safe default
  * for a status this client does not recognise.
+ *
+ * `onRecorded` and `onRejected` let a second surface (the Decisions page,
+ * M-211) refresh its own reads when a verdict lands or when the plan moved
+ * under it; the panel passes neither, because its mutation already invalidates
+ * the ask-plan query it renders from.
  */
-function PlanReview({ plan, issueId }: { plan: AgentPlan; issueId: string }) {
+export function PlanVerdictForm({
+  plan,
+  issueId,
+  onRecorded,
+  onRejected,
+}: {
+  plan: AgentPlan;
+  issueId: string;
+  onRecorded?: () => void;
+  onRejected?: () => void;
+}) {
   const { t } = useT("issues");
   const review = useReviewPlan(issueId);
   const [comments, setComments] = useState<readonly string[]>([]);
@@ -140,10 +159,12 @@ function PlanReview({ plan, issueId }: { plan: AgentPlan; issueId: string }) {
     review.mutate(
       { planId: plan.id, verdict: planVerdictBody(plan, verdict, comments) },
       {
+        onSuccess: () => onRecorded?.(),
         onError: (cause) => {
           // A 409 here means the plan moved under us — closed, superseded or
           // on another revision — so re-read as well as reporting, which is
           // what puts the current state back in front of the member.
+          onRejected?.();
           setError(
             cause instanceof Error && cause.message !== ""
               ? cause.message

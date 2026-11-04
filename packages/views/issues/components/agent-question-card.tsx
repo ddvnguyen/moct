@@ -47,6 +47,7 @@ export function AgentQuestionCard({
   taskId,
   questions,
   submit,
+  onSent,
 }: {
   issueId: string;
   /** The running turn this answer is delivered to. */
@@ -54,6 +55,12 @@ export function AgentQuestionCard({
   questions: readonly AgentQuestion[];
   /** Deliver the form's drafts somewhere other than the run's supplement path. */
   submit?: (drafts: readonly AgentAnswerDraft[]) => Promise<void>;
+  /**
+   * A surface that has to re-read after a send, and whose reads the answer
+   * mutation does not own — the Decisions page (M-211). It runs after the
+   * transport resolved, before the card shows its sent state.
+   */
+  onSent?: () => void;
 }) {
   const { t } = useT("issues");
   const supplement = useCreateTaskSupplement(issueId);
@@ -99,6 +106,7 @@ export function AgentQuestionCard({
     try {
       await deliver();
       setSent(true);
+      onSent?.();
     } catch (cause) {
       const detail =
         submit !== undefined && cause instanceof Error && cause.message !== ""
