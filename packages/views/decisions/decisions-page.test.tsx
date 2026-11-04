@@ -30,6 +30,7 @@ vi.mock("@multica/core/api", async (importOriginal) => ({
 const transports = vi.hoisted(() => ({
   answer: vi.fn(async () => undefined),
   review: vi.fn(),
+  fenced: vi.fn(async () => undefined),
   supplement: vi.fn(async () => undefined),
 }));
 
@@ -45,6 +46,10 @@ vi.mock("@multica/core/issues/mutations", () => ({
   }),
   useCreateTaskSupplement: () => ({
     mutateAsync: transports.supplement,
+    isPending: false,
+  }),
+  useAnswerNativeQuestion: () => ({
+    mutateAsync: transports.fenced,
     isPending: false,
   }),
 }));
@@ -237,6 +242,7 @@ beforeEach(() => {
   apiMock.getDecisionDetail.mockReset();
   transports.answer.mockClear();
   transports.review.mockClear();
+  transports.fenced.mockClear();
   transports.supplement.mockClear();
   apiMock.listDecisions.mockImplementation(async (_ws: string, params: { state?: string }) => ({
     items: params.state === "answered" ? ANSWERED : DECISIONS,
@@ -400,10 +406,16 @@ describe("DecisionsPage", () => {
     );
     fireEvent.click(within(view.detail()).getByRole("radio", { name: /dsh/ }));
     fireEvent.click(within(view.detail()).getByRole("button", { name: "Answer" }));
-    await waitFor(() => expect(transports.supplement).toHaveBeenCalledTimes(1));
-    // The transcript's own route: the answer reaches the running turn as a
-    // supplement, never a second write path the queue invents for it.
-    expect(transports.supplement).toHaveBeenCalledWith({ taskId: "task-1", content: "dsh" });
+    await waitFor(() => expect(transports.fenced).toHaveBeenCalledTimes(1));
+    // The transcript's own route: the answer reaches the running turn fenced to
+    // the sequence it was asked at, never an unfenced supplement and never a
+    // second write path the queue invents for it.
+    expect(transports.fenced).toHaveBeenCalledWith({
+      taskId: "task-1",
+      questionSeq: 42,
+      content: "dsh",
+    });
+    expect(transports.supplement).not.toHaveBeenCalled();
     expect(transports.answer).not.toHaveBeenCalled();
     await waitFor(() => expect(within(view.detail()).getByText("Answer sent")).toBeTruthy());
   });

@@ -40,9 +40,9 @@ import { decisionKind, type DecisionState } from "./decision-presentation";
  * Every source keeps its own write path; this pane only decides which one to
  * show. That is the whole point of the Decisions read model: a question card and
  * a plan verdict keep their issued endpoints and release fences, a native ask
- * keeps the running turn's supplement route, and only the status handoff has no
- * operation yet — it is shown with its context and a link, never a form that
- * would 404.
+ * keeps the running turn's own question-answer route, fenced to the sequence it
+ * was asked at, and only the status handoff has no operation yet — it is shown
+ * with its context and a link, never a form that would 404.
  *
  * Answered rows render the same bodies read-only: the stored answer, the
  * recorded verdict and its comments. That is response history, not a second
@@ -295,13 +295,15 @@ function SourceBody({
           </div>
         );
       }
-      // No `submit`: this is the transcript card's own transport — the answer
-      // reaches the parked turn as a supplement, exactly as it does on the
-      // issue page. The sequence fence that hardens it is M-210.
+      // No `submit`: this is the transcript card's own transport, exactly as on
+      // the issue page. The sequence comes with the ask, so the answer is fenced
+      // to the question it was written for (M-210) — a stale tab here cannot
+      // steer a second answer into a turn that already moved on.
       return (
         <AgentQuestionCard
           issueId={decision.issue_id}
           taskId={parsed.taskId}
+          questionSeq={parsed.seq}
           questions={parsed.questions}
           onSent={onChanged}
         />
