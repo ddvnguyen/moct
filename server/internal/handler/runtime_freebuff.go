@@ -101,7 +101,7 @@ type FreebuffBlock struct {
 	// InstalledVersions is what the daemon last reported having under its
 	// version store, oldest first. The daemon owns the list; the server only
 	// mirrors it.
-	InstalledVersions []FreebuffVersion `json:"installed_versions,omitempty"`
+	InstalledVersions []FreebuffVersion `json:"installed_versions"`
 	// UpdatedAt is when the daemon last reported.
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }

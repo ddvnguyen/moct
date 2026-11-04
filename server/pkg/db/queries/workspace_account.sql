@@ -30,6 +30,7 @@ SET label = $2,
     endpoint = $3,
     credential_ref = $4,
     enabled = $5,
+    engine_version = COALESCE(sqlc.narg(engine_version), engine_version),
     updated_at = now()
 WHERE id = $1
 RETURNING *;

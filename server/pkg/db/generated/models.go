@@ -1870,6 +1870,7 @@ type WorkspaceAccount struct {
 	Status          []byte             `json:"status"`
 	DaemonAccountID pgtype.Text        `json:"daemon_account_id"`
 	RuntimeID       pgtype.UUID        `json:"runtime_id"`
+	EngineVersion   string             `json:"engine_version"`
 }
 
 type WorkspaceInvitation struct {

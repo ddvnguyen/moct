@@ -684,3 +684,75 @@ func TestAccountLeaseScopesManagedAccountsToClaimingRuntime(t *testing.T) {
 		t.Fatal("signed-out B must not unblock a busy shared account")
 	}
 }
+
+func TestManagedAccountEngineVersion(t *testing.T) {
+	env := newAccountTestEnv(t)
+	rec := createAccountAs(t, testUserID, map[string]any{"managed": true, "runtime_id": env.codebuddyRuntime})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	var account WorkspaceAccountResponse
+	decodeJSON(t, rec, &account)
+	update := func(user, id, version string) *testutil.Response {
+		return testutil.Call(t, testHandler.UpdateWorkspaceAccount, withURLParams(newRequestAs(user, http.MethodPatch, "/x", map[string]any{"engine_version": version}), "id", testWorkspaceID, "accountId", id))
+	}
+	if got := update(env.memberUserID, account.ID, "0.0.196"); got.Code != http.StatusForbidden {
+		t.Fatalf("member: %d %s", got.Code, got.Body)
+	}
+	manual := mustCreateAccount(t, "engine-manual")
+	if got := update(testUserID, manual.ID, "0.0.196"); got.Code != http.StatusBadRequest {
+		t.Fatalf("unmanaged: %d %s", got.Code, got.Body)
+	}
+	if got := update(testUserID, account.ID, "../bad"); got.Code != http.StatusBadRequest {
+		t.Fatalf("invalid: %d %s", got.Code, got.Body)
+	}
+	// Before any versions have been reported, a valid pin is accepted.
+	update(testUserID, account.ID, "0.0.196").Want(http.StatusOK)
+	report := func(body map[string]any) {
+		testutil.Call(t, testHandler.ReportFreebuffDesktopAccount, withURLParam(newOwnerDaemonRequest(http.MethodPost, "/x", body), "runtimeId", env.codebuddyRuntime)).Want(http.StatusOK)
+	}
+	report(map[string]any{"versions": []map[string]string{{"version": "0.0.196", "commit": "abc"}}})
+	if got := update(testUserID, account.ID, "0.0.197"); got.Code != http.StatusConflict {
+		t.Fatalf("unknown: %d %s", got.Code, got.Body)
+	}
+	update(testUserID, account.ID, "0.0.196").Want(http.StatusOK)
+	if _, err := testPool.Exec(context.Background(), `UPDATE workspace_account SET state='connected' WHERE id=$1`, account.ID); err != nil {
+		t.Fatal(err)
+	}
+	var pending struct {
+		Accounts []map[string]any  `json:"accounts"`
+		Pins     map[string]string `json:"pins"`
+	}
+	testutil.Call(t, testHandler.GetFreebuffDesktopPending, withURLParam(newOwnerDaemonRequest(http.MethodGet, "/x", nil), "runtimeId", env.codebuddyRuntime)).Want(http.StatusOK).JSON(&pending)
+	if pending.Pins[account.DaemonAccountID] != "0.0.196" {
+		t.Fatalf("connected account pin: %#v", pending.Pins)
+	}
+	for _, row := range pending.Accounts {
+		if row["id"] == account.DaemonAccountID {
+			t.Fatalf("connected account included in lifecycle queue: %#v", row)
+		}
+	}
+	var metadata []byte
+	if err := testPool.QueryRow(context.Background(), `SELECT metadata FROM agent_runtime WHERE id=$1`, env.codebuddyRuntime).Scan(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	versions := freebuffBlockFromMetadata(metadata).InstalledVersions
+	if len(versions) != 1 || versions[0].Commit != "abc" {
+		t.Fatalf("reported versions: %#v", versions)
+	}
+	report(map[string]any{"accounts": []any{}}) // older reports must not erase the versions
+	if err := testPool.QueryRow(context.Background(), `SELECT metadata FROM agent_runtime WHERE id=$1`, env.codebuddyRuntime).Scan(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	if len(freebuffBlockFromMetadata(metadata).InstalledVersions) != 1 {
+		t.Fatal("omitted versions erased report")
+	}
+	update(testUserID, account.ID, "").Want(http.StatusOK).JSON(&account)
+	if account.EngineVersion != "" {
+		t.Fatalf("pin not cleared: %+v", account)
+	}
+	report(map[string]any{"versions": []any{}})
+	if got := update(testUserID, account.ID, "0.0.196"); got.Code != http.StatusConflict {
+		t.Fatalf("empty installed list: %d %s", got.Code, got.Body)
+	}
+}

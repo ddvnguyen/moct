@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/pkg/agent"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/freebuffrt"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -47,20 +48,22 @@ type WorkspaceAccountResponse struct {
 	Status          json.RawMessage `json:"status,omitempty"`
 	DaemonAccountID string          `json:"daemon_account_id,omitempty"`
 	RuntimeID       string          `json:"runtime_id,omitempty"`
+	EngineVersion   string          `json:"engine_version"`
 	CreatedAt       string          `json:"created_at"`
 	UpdatedAt       string          `json:"updated_at"`
 }
 
 func workspaceAccountToResponse(a db.WorkspaceAccount, includeAdminDetails bool) WorkspaceAccountResponse {
 	resp := WorkspaceAccountResponse{
-		ID:          uuidToString(a.ID),
-		WorkspaceID: uuidToString(a.WorkspaceID),
-		Provider:    a.Provider,
-		Label:       a.Label,
-		Enabled:     a.Enabled,
-		State:       a.State,
-		CreatedAt:   timestampToString(a.CreatedAt),
-		UpdatedAt:   timestampToString(a.UpdatedAt),
+		ID:            uuidToString(a.ID),
+		WorkspaceID:   uuidToString(a.WorkspaceID),
+		Provider:      a.Provider,
+		Label:         a.Label,
+		Enabled:       a.Enabled,
+		EngineVersion: a.EngineVersion,
+		State:         a.State,
+		CreatedAt:     timestampToString(a.CreatedAt),
+		UpdatedAt:     timestampToString(a.UpdatedAt),
 	}
 	if a.Endpoint.Valid {
 		resp.Endpoint = a.Endpoint.String
@@ -283,9 +286,14 @@ func (h *Handler) UpdateWorkspaceAccount(w http.ResponseWriter, r *http.Request)
 		CredentialRef *string `json:"credential_ref"`
 		Enabled       *bool   `json:"enabled"`
 		Retry         bool    `json:"retry"`
+		EngineVersion *string `json:"engine_version"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Retry && req.EngineVersion != nil {
+		writeError(w, http.StatusBadRequest, "retry and engine_version cannot be combined")
 		return
 	}
 	if req.Retry {
@@ -333,6 +341,39 @@ func (h *Handler) UpdateWorkspaceAccount(w http.ResponseWriter, r *http.Request)
 	if req.Enabled != nil {
 		params.Enabled = *req.Enabled
 	}
+	if req.EngineVersion != nil {
+		if !existing.DaemonAccountID.Valid || existing.DaemonAccountID.String == "" || !existing.RuntimeID.Valid {
+			writeError(w, http.StatusBadRequest, "engine version requires a daemon-managed account")
+			return
+		}
+		version := *req.EngineVersion
+		if version != "" {
+			if err := freebuffrt.ValidateVersion(version); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid engine version")
+				return
+			}
+			var metadata []byte
+			if err := h.DB.QueryRow(r.Context(), `SELECT metadata FROM agent_runtime WHERE id=$1 AND workspace_id=$2`, existing.RuntimeID, wsUUID).Scan(&metadata); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to load runtime versions")
+				return
+			}
+			versions := freebuffBlockFromMetadata(metadata).InstalledVersions
+			if versions != nil {
+				found := false
+				for _, installed := range versions {
+					if installed.Version == version {
+						found = true
+						break
+					}
+				}
+				if !found {
+					writeError(w, http.StatusConflict, "that engine version is not installed on the runtime")
+					return
+				}
+			}
+		}
+		params.EngineVersion = pgtype.Text{String: version, Valid: true}
+	}
 	updated, err := h.Queries.UpdateWorkspaceAccount(r.Context(), params)
 	if err != nil {
 		if isAccountLabelConflict(err) {
@@ -341,6 +382,9 @@ func (h *Handler) UpdateWorkspaceAccount(w http.ResponseWriter, r *http.Request)
 		}
 		writeError(w, http.StatusInternalServerError, "failed to update account")
 		return
+	}
+	if req.EngineVersion != nil {
+		h.requestDaemonPendingWork(uuidToString(existing.RuntimeID), protocol.PendingWorkKindFreebuffDesktop)
 	}
 	writeJSON(w, http.StatusOK, workspaceAccountToResponse(updated, true))
 }
@@ -414,12 +458,12 @@ func (h *Handler) insertManagedWorkspaceAccount(r *http.Request, wsUUID pgtype.U
 		INSERT INTO workspace_account (
 			workspace_id, provider, label, enabled, created_by, state, daemon_account_id, runtime_id
 		) VALUES ($1, $2, $3, TRUE, $4, 'requested', $5, $6)
-		RETURNING id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at, state, login_url, expires_at, error, status, daemon_account_id, runtime_id`,
+		RETURNING id, workspace_id, provider, label, endpoint, credential_ref, enabled, created_by, created_at, updated_at, state, login_url, expires_at, error, status, daemon_account_id, runtime_id, engine_version`,
 		wsUUID, accountProviderFreebuffDesktop, label, parseUUID(userID), daemonAccountID, rtUUID,
 	).Scan(
 		&acc.ID, &acc.WorkspaceID, &acc.Provider, &acc.Label, &acc.Endpoint, &acc.CredentialRef,
 		&acc.Enabled, &acc.CreatedBy, &acc.CreatedAt, &acc.UpdatedAt, &acc.State, &acc.LoginUrl,
-		&acc.ExpiresAt, &acc.Error, &acc.Status, &acc.DaemonAccountID, &acc.RuntimeID,
+		&acc.ExpiresAt, &acc.Error, &acc.Status, &acc.DaemonAccountID, &acc.RuntimeID, &acc.EngineVersion,
 	)
 	return acc, err
 }
@@ -432,11 +476,11 @@ func (h *Handler) GetFreebuffDesktopPending(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	rows, err := h.DB.Query(r.Context(), `
-		SELECT daemon_account_id, state, EXISTS (
-			SELECT 1 FROM agent_task_queue q WHERE q.account_id=workspace_account.id AND q.status IN ('dispatched','running')
-		) AS active FROM workspace_account
-		WHERE runtime_id = $1 AND provider = $2 AND daemon_account_id IS NOT NULL
-		  AND state IN ('requested','awaiting_login','removing')`,
+		SELECT daemon_account_id, state, engine_version,
+			CASE WHEN state IN ('requested','awaiting_login','removing') THEN EXISTS (
+				SELECT 1 FROM agent_task_queue q WHERE q.account_id=workspace_account.id AND q.status IN ('dispatched','running')
+			) ELSE FALSE END AS active FROM workspace_account
+		WHERE runtime_id = $1 AND provider = $2 AND daemon_account_id IS NOT NULL`,
 		rt.ID, accountProviderFreebuffDesktop)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load pending accounts")
@@ -444,24 +488,28 @@ func (h *Handler) GetFreebuffDesktopPending(w http.ResponseWriter, r *http.Reque
 	}
 	defer rows.Close()
 	pending := make([]map[string]any, 0)
+	pins := make(map[string]string)
 	for rows.Next() {
 		var id pgtype.Text
-		var state string
+		var state, version string
 		var active bool
-		if err := rows.Scan(&id, &state, &active); err != nil {
+		if err := rows.Scan(&id, &state, &version, &active); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to read pending accounts")
 			return
 		}
 		if !id.Valid {
 			continue
 		}
-		pending = append(pending, map[string]any{"id": id.String, "state": state, "active": active})
+		pins[id.String] = version
+		if state == "requested" || state == "awaiting_login" || state == "removing" {
+			pending = append(pending, map[string]any{"id": id.String, "state": state, "active": active})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to read pending accounts")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": pending})
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": pending, "pins": pins})
 }
 
 // ReportFreebuffDesktopAccount is the daemon's report. Daemon-authenticated.
@@ -482,13 +530,23 @@ func (h *Handler) ReportFreebuffDesktopAccount(w http.ResponseWriter, r *http.Re
 			Endpoint      string          `json:"endpoint"`
 			CredentialRef string          `json:"credential_ref"`
 		} `json:"accounts"`
-		Complete bool     `json:"complete"`
-		Snapshot bool     `json:"snapshot"`
-		Removed  []string `json:"removed"`
+		Complete bool               `json:"complete"`
+		Snapshot bool               `json:"snapshot"`
+		Removed  []string           `json:"removed"`
+		Versions *[]FreebuffVersion `json:"versions"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	if report.Versions != nil {
+		if _, err := h.updateFreebuffBlock(r, rt, func(b *FreebuffBlock) (bool, error) {
+			b.InstalledVersions = *report.Versions
+			return true, nil
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to store runtime versions")
+			return
+		}
 	}
 	hasErr := false
 	for _, in := range report.Accounts {
