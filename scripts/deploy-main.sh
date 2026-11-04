@@ -248,8 +248,11 @@ done
 [ "$ready_ok" = 1 ] || die "/healthz did not report status=ok and checks.migrations=ok"
 
 web_ok=0
+# The web UI redirects unauthenticated / to /login (302), so follow redirects
+# and require the final response to be 200 -- a bare 200 check fails on every
+# deploy even when the stack is healthy.
 for _ in $(seq 1 30); do
-  if curl -fsS --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$FRONTEND_PORT/" | grep -qx 200; then web_ok=1; break; fi
+  if curl -fsSL --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$FRONTEND_PORT/" | grep -qx 200; then web_ok=1; break; fi
   sleep 2
 done
 [ "$web_ok" = 1 ] || die "web did not return HTTP 200"
