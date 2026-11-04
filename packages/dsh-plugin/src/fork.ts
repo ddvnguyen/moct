@@ -57,6 +57,8 @@ export { AgentsPage, AgentDetailPage } from "@multica/views/agents";
 export type { ExtraAgentSection } from "@multica/views/agents";
 export { SkillsPage, SkillDetailPage } from "@multica/views/skills";
 export { InboxPage } from "@multica/views/inbox";
+export { DecisionsPage } from "@multica/views/decisions";
+export { decisionsOptions } from "@multica/core/decisions";
 export { ChatPage } from "@multica/views/chat";
 
 // Dialogs. The fork's pages ask for a dialog through a module-level store and

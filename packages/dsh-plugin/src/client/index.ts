@@ -23,16 +23,16 @@ import { startUnreadPoll } from "./unread-store";
  * - `sidebar.panellist` (a `list`) renders one sidebar button per registration
  *   and addresses the matching `main` cell by list id. Each entry below is one
  *   of those rows; the sidebar owns the button, the label and the selection
- *   state, which is why the menu is six rows rather than a dropdown the plugin
+ *   state, which is why the menu is seven rows rather than a dropdown the plugin
  *   would have to position inside someone else's column. The list has no
- *   grouping API, so the grouping is expressed by adjacent order (30–35) and a
+ *   grouping API, so the grouping is expressed by adjacent order (30–36) and a
  *   shared glyph family, and each label carries the product name because the
  *   collapsed rail shows only a glyph and a tooltip.
  * - `main` (a `keyed` slot) gets one cell per entry: the seat the React 19
  *   island mounts into, opening at that entry's own view. `priority: -100` is
  *   the additive convention the shipped panels use; nothing shipped is replaced.
  *
- * The sixth row is Settings: the fork's own page, with the surfaces this panel
+ * The seventh row is Settings: the fork's own page, with the surfaces this panel
  * does not render hidden and one MOCT group added. It is a rail row and not a
  * route inside another row because a settings page is a destination a reader
  * returns to, and the shell's rail is where destinations live.
@@ -52,7 +52,7 @@ export interface MulticaEntry {
   glyph: RailGlyph;
 }
 
-/** The six entries, in the order the Owner named them. */
+/** The seven entries, with Decisions beside Inbox. */
 export const MULTICA_ENTRIES: readonly MulticaEntry[] = [
   {
     id: "multica",
@@ -77,6 +77,12 @@ export const MULTICA_ENTRIES: readonly MulticaEntry[] = [
     label: "Multica Inbox",
     route: FAMILY_ROOTS.inbox,
     glyph: "inbox",
+  },
+  {
+    id: "multica-decisions",
+    label: "Multica Decisions",
+    route: FAMILY_ROOTS.decisions,
+    glyph: "decisions",
   },
   {
     id: "multica-chat",
@@ -166,7 +172,7 @@ export function apply(ctx: DshClientContext): void {
       return () => {
         for (const dispose of disposers) dispose();
       };
-    }, "multica: sidebarRight.hostPanel for the six MMX panels");
+    }, "multica: sidebarRight.hostPanel for the seven MMX panels");
   }
 
   // The rail dot's baseline count. The browser half has no teardown path —

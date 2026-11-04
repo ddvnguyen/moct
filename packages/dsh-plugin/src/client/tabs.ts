@@ -272,6 +272,8 @@ export function familyOfRoute(route: IslandRoute): string {
       return "skills";
     case "inbox":
       return "inbox";
+    case "decisions":
+      return "decisions";
     case "chat":
       return "chat";
     case "settings":

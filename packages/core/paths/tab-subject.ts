@@ -41,6 +41,8 @@ export type TabSubject =
    * `archived` is the `?view=archived` sub-list (its own list/cache).
    */
   | { kind: "inbox"; selectedKey: string | null; archived: boolean }
+  /** The Decisions container; query selection and state are URL-backed. */
+  | { kind: "decisions"; selectedKey: string | null; answered: boolean }
   /** The Chat container; `sessionId` is the `?session=` selection or null. */
   | { kind: "chat"; sessionId: string | null }
   /** A creation flow that has not produced a resource yet. */
@@ -104,6 +106,12 @@ export function parseTabSubject(url: string): TabSubject {
         selectedKey: query.get("issue") || null,
         archived: query.get("view") === "archived",
       };
+    case "decisions":
+      return {
+        kind: "decisions",
+        selectedKey: query.get("decision") || null,
+        answered: query.get("state") === "answered",
+      };
     case "chat":
       return { kind: "chat", sessionId: query.get("session") || null };
     case "runtimes":
@@ -159,6 +167,8 @@ export function tabSubjectKey(subject: TabSubject): string {
       return `attachment:${subject.id}:${subject.filename ?? ""}`;
     case "inbox":
       return `inbox:${subject.archived ? "archived" : "inbox"}:${subject.selectedKey ?? ""}`;
+    case "decisions":
+      return `decisions:${subject.answered ? "answered" : "pending"}:${subject.selectedKey ?? ""}`;
     case "chat":
       return `chat:${subject.sessionId ?? ""}`;
     case "flow":

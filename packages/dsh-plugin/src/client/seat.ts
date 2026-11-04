@@ -1,5 +1,6 @@
 import { SEAT_STYLE, attachIsland, detachIsland } from "./island";
 import type { IslandRoute } from "./navigation";
+import { attachDecisionBadge } from "./decisions-badge-store";
 import { attachUnreadBadge } from "./unread-store";
 
 /**
@@ -84,15 +85,22 @@ export function createSeatComponent(
   };
 }
 
-/** The six glyphs, one per entry, drawn so they read at rail size. */
-export type RailGlyph = "issues" | "agents" | "skills" | "inbox" | "chat" | "settings";
+/** The seven glyphs, one per entry, drawn so they read at rail size. */
+export type RailGlyph =
+  | "issues"
+  | "agents"
+  | "skills"
+  | "inbox"
+  | "decisions"
+  | "chat"
+  | "settings";
 
 /**
  * The sidebar rail glyph.
  *
  * dsh renders `sidebar.panellist` occupants inside its own button; the icon is
  * geometry only, sized from the owner props, so it inherits the shell's colour
- * and active state. The collapsed rail shows no labels, so the six entries are
+ * and active state. The collapsed rail shows no labels, so the seven entries are
  * told apart here.
  *
  * The inbox row alone is wrapped in the unread dot's host: a relative box the
@@ -101,6 +109,31 @@ export type RailGlyph = "issues" | "agents" | "skills" | "inbox" | "chat" | "set
  * painted from `unread-store`. Every other glyph renders exactly as before.
  */
 export function createRailIcon(createElement: HostCreateElement, glyph: RailGlyph) {
+  if (glyph === "decisions") {
+    let detachBadge: (() => void) | null = null;
+    const badgeRef = (node: HTMLElement | null) => {
+      if (node !== null) {
+        detachBadge = attachDecisionBadge(node);
+        return;
+      }
+      detachBadge?.();
+      detachBadge = null;
+    };
+    return function MulticaRailIcon({ size = 16 }: { size?: number }) {
+      return createElement(
+        "span",
+        { style: INBOX_GLYPH_HOST_STYLE },
+        railSvg(createElement, glyph, size),
+        createElement("span", {
+          ref: badgeRef,
+          "data-multica-decisions-badge": "",
+          "aria-hidden": "true",
+          style: DECISIONS_BADGE_STYLE,
+        }),
+      );
+    };
+  }
+
   if (glyph !== "inbox") {
     return function MulticaRailIcon({ size = 16 }: { size?: number }) {
       return railSvg(createElement, glyph, size);
@@ -159,6 +192,24 @@ const INBOX_DOT_STYLE = {
   height: 7,
   borderRadius: 9999,
   background: "var(--dsw-alias-state-business-primary, currentColor)",
+} as const;
+
+const DECISIONS_BADGE_STYLE = {
+  position: "absolute",
+  top: -6,
+  right: -8,
+  minWidth: 14,
+  height: 14,
+  padding: "0 3px",
+  alignItems: "center",
+  justifyContent: "center",
+  borderRadius: 9999,
+  background: "var(--dsw-alias-state-business-primary, currentColor)",
+  color: "var(--dsw-alias-surface-primary, white)",
+  fontSize: 9,
+  fontWeight: 700,
+  lineHeight: "14px",
+  fontVariantNumeric: "tabular-nums",
 } as const;
 
 /** One glyph's SVG, shared by every rail row. */
@@ -226,6 +277,13 @@ function glyphGeometry(
           key: "oot6mr",
           d: "M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z",
         }),
+      ];
+    case "decisions":
+      return [
+        createElement("path", { key: "page", d: "M7 3h7l4 4v14H7z" }),
+        createElement("path", { key: "fold", d: "M14 3v5h5" }),
+        createElement("path", { key: "line1", d: "M10 12h5" }),
+        createElement("path", { key: "line2", d: "M10 16h3" }),
       ];
     case "chat":
       return [

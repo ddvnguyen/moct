@@ -220,6 +220,11 @@ export function resolveTabPresentation(
       }
       return { visual: { kind: "icon", icon: "Inbox" }, title };
     }
+    case "decisions":
+      return {
+        visual: { kind: "icon", icon: "CircleDot" },
+        title: { kind: "nav", navKey: "decisions" },
+      };
     case "chat": {
       const title: TabTitleSpec =
         subject.sessionId && data.chatSessionTitle?.trim()

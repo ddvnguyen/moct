@@ -34,12 +34,14 @@ import { runtimesDeviceTab } from "./moct-runtimes";
 import { ShellButtons } from "./shell-buttons";
 import { createAgentMemorySections } from "./moct-agent-memory";
 import { UnreadReporter } from "./unread-reporter";
+import { DecisionsBadgeReporter } from "./decisions-badge-reporter";
 import { IslandVersionBadge } from "./version-badge";
 import {
   AgentDetailPage,
   AgentsPage,
   ChatPage,
   CoreProvider,
+  DecisionsPage,
   createIssueViewStore,
   ErrorBoundary,
   InboxPage,
@@ -339,11 +341,13 @@ function WorkspaceGate({
  */
 function IslandPage({
   route,
+  projectId,
   /** The agent page's host sections (the MOCT Memory tab); absent, a stock page. */
   extraAgentSections,
 }: {
   /** Settings is mounted by `IslandPages`; it needs props this switch lacks. */
   route: Exclude<IslandRoute, { view: "settings" }>;
+  projectId: string | null;
   extraAgentSections?: ReturnType<typeof createAgentMemorySections>;
 }) {
   switch (route.view) {
@@ -366,6 +370,8 @@ function IslandPage({
       return <SkillDetailPage skillId={route.skillId} />;
     case "inbox":
       return <InboxPage />;
+    case "decisions":
+      return <DecisionsPage projectId={projectId} />;
     case "chat":
       return <ChatPage />;
   }
@@ -515,6 +521,7 @@ export function IslandPages({
     <ViewStoreProvider store={viewStore}>
       <NavigationProvider value={navigation}>
         <PageChromeProvider titleInHostChrome projectId={projectId}>
+          <DecisionsBadgeReporter workspaceId={workspaceId} projectId={projectId} />
           <TabBar
             tabsStore={tabsStore}
             navigation={navigation}
@@ -570,7 +577,11 @@ export function IslandPages({
                   preferencesExtraRows={<PanelZoomRow />}
                 />
               ) : (
-                <IslandPage route={route} extraAgentSections={agentMemorySections} />
+                <IslandPage
+                  route={route}
+                  projectId={projectId}
+                  extraAgentSections={agentMemorySections}
+                />
               )}
               </div>
             </ErrorBoundary>

@@ -14,7 +14,7 @@ import { resourceKeyForUrl } from "./tabs";
  * Q8 — hide, do not delete. The fork still ships GitHub and Slack integrations,
  * billing, autopilots and squads; this panel simply never exposes them. There
  * is no dashboard chrome here (no sidebar, no command palette), and a
- * navigation to anything outside the six families below is refused rather than
+ * navigation to anything outside the seven families below is refused rather than
  * mounted, so a stray link in a shared component cannot open a surface the epic
  * asked to keep out of dsh. The code stays in the fork.
  */
@@ -26,12 +26,13 @@ export const HIDDEN_AREAS = [
   "squads",
 ] as const;
 
-/** The six families of page, each named after its path segment. */
+/** The seven families of page, each named after its path segment. */
 export const ISLAND_FAMILIES = [
   "issues",
   "agents",
   "skills",
   "inbox",
+  "decisions",
   "chat",
   "settings",
 ] as const;
@@ -56,6 +57,7 @@ export type IslandRoute =
   | WithQuery<{ view: "skills" }>
   | WithQuery<{ view: "skill"; skillId: string }>
   | WithQuery<{ view: "inbox" }>
+  | WithQuery<{ view: "decisions" }>
   | WithQuery<{ view: "chat" }>
   | WithQuery<{ view: "settings" }>;
 
@@ -67,6 +69,7 @@ export const FAMILY_ROOTS: Record<IslandFamily, IslandRoute> = {
   agents: { view: "agents" },
   skills: { view: "skills" },
   inbox: { view: "inbox" },
+  decisions: { view: "decisions" },
   chat: { view: "chat" },
   settings: { view: "settings" },
 };
@@ -86,7 +89,7 @@ function normalizeQuery(raw: string): string {
  * Read an island route out of a workspace path.
  *
  * `/w/issues` and `/w/issues/MUL-12` are the board and one issue; `/w/agents`,
- * `/w/skills`, `/w/inbox`, `/w/chat` and `/w/settings` are the other five
+ * `/w/skills`, `/w/inbox`, `/w/decisions`, `/w/chat` and `/w/settings` are the other six
  * entries, with `/w/agents/<id>` and `/w/skills/<id>` as their detail depth.
  * `null` means the path is not one of the places this panel owns.
  */
@@ -126,6 +129,8 @@ function parseFamilyPath(
       return { view: "skill", skillId: decodeURIComponent(id) };
     case "inbox":
       return id === undefined ? { view: "inbox" } : null;
+    case "decisions":
+      return id === undefined ? { view: "decisions" } : null;
     case "chat":
       return id === undefined ? { view: "chat" } : null;
     case "settings":
@@ -152,6 +157,8 @@ export function islandPathname(slug: string, route: IslandRoute): string {
       return `${base}/skills/${encodeURIComponent(route.skillId)}`;
     case "inbox":
       return `${base}/inbox`;
+    case "decisions":
+      return `${base}/decisions`;
     case "chat":
       return `${base}/chat`;
     case "settings":

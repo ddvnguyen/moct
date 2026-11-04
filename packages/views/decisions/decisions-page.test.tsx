@@ -22,6 +22,24 @@ const apiMock = vi.hoisted(() => ({
   getDecisionDetail: vi.fn(),
 }));
 
+const navigationMock = vi.hoisted(() => ({
+  pathname: "/acme/decisions",
+  search: "",
+  listeners: new Set<() => void>(),
+  push: vi.fn((path: string) => {
+    const [pathname, search = ""] = path.split("?", 2);
+    navigationMock.pathname = pathname ?? "/acme/decisions";
+    navigationMock.search = search;
+    for (const listener of navigationMock.listeners) listener();
+  }),
+  replace: vi.fn((path: string) => {
+    const [pathname, search = ""] = path.split("?", 2);
+    navigationMock.pathname = pathname ?? "/acme/decisions";
+    navigationMock.search = search;
+    for (const listener of navigationMock.listeners) listener();
+  }),
+}));
+
 vi.mock("@multica/core/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@multica/core/api")>()),
   api: apiMock,
@@ -83,7 +101,29 @@ vi.mock("@multica/core/workspace/queries", async (importOriginal) => ({
   }),
 }));
 
-vi.mock("../navigation", () => ({
+vi.mock("../navigation", async () => {
+  const { useSyncExternalStore } = await import("react");
+  return {
+    useNavigation: () => {
+      useSyncExternalStore(
+        (listener) => {
+          navigationMock.listeners.add(listener);
+          return () => navigationMock.listeners.delete(listener);
+        },
+        () => `${navigationMock.pathname}?${navigationMock.search}`,
+      );
+      return {
+        get pathname() {
+          return navigationMock.pathname;
+        },
+        get searchParams() {
+          return new URLSearchParams(navigationMock.search);
+        },
+        hash: "",
+        push: navigationMock.push,
+        replace: navigationMock.replace,
+      };
+    },
   AppLink: ({
     href,
     children,
@@ -96,7 +136,8 @@ vi.mock("../navigation", () => ({
       {children}
     </a>
   ),
-}));
+  };
+});
 
 vi.mock("../editor", () => ({
   ReadonlyContent: ({ content }: { content: string }) => (
@@ -238,6 +279,11 @@ function renderPage(client = makeClient()) {
 }
 
 beforeEach(() => {
+  navigationMock.pathname = "/acme/decisions";
+  navigationMock.search = "";
+  navigationMock.push.mockClear();
+  navigationMock.replace.mockClear();
+  navigationMock.listeners.clear();
   apiMock.listDecisions.mockReset();
   apiMock.getDecisionDetail.mockReset();
   transports.answer.mockClear();
@@ -268,6 +314,29 @@ const ANSWERED = [
 ];
 
 describe("DecisionsPage", () => {
+  it("stores queue selection in navigation and restores the selected state from the URL", async () => {
+    const initial = renderPage();
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(3));
+    const firstQuestion = initial.container.querySelector<HTMLElement>(
+      '[data-decision="question:card-1"]',
+    );
+    if (firstQuestion === null) throw new Error("the first question is not rendered");
+    fireEvent.click(firstQuestion);
+    expect(navigationMock.push).toHaveBeenCalledWith(
+      "/acme/decisions?decision=question%3Acard-1",
+    );
+    initial.unmount();
+
+    navigationMock.search = "state=answered&decision=question%3Acard-9";
+    renderPage();
+    await waitFor(() => {
+      expect(screen.getByRole("tab", { name: /Answered/ }).getAttribute("aria-selected")).toBe("true");
+      expect(screen.getAllByRole("option")).toHaveLength(1);
+    });
+    expect(screen.getAllByRole("option")[0]?.getAttribute("data-decision")).toBe("question:card-9");
+    expect(screen.getAllByRole("option")[0]?.getAttribute("aria-selected")).toBe("true");
+  });
+
   it("groups the queue by issue and keeps every request as its own row", async () => {
     renderPage();
     // Two requests on "Which store?" and one handoff on "Migrate the store".

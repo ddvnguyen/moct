@@ -48,6 +48,11 @@ describe("parseTabSubject", () => {
     ["/acme/inbox", { kind: "inbox", selectedKey: null, archived: false }],
     ["/acme/inbox?issue=MUL-9", { kind: "inbox", selectedKey: "MUL-9", archived: false }],
     ["/acme/inbox?view=archived", { kind: "inbox", selectedKey: null, archived: true }],
+    ["/acme/decisions", { kind: "decisions", selectedKey: null, answered: false }],
+    [
+      "/acme/decisions?state=answered&decision=question%3Acard-9",
+      { kind: "decisions", selectedKey: "question:card-9", answered: true },
+    ],
     [
       "/acme/inbox?view=archived&issue=MUL-9",
       { kind: "inbox", selectedKey: "MUL-9", archived: true },
@@ -107,5 +112,8 @@ describe("tabSubjectKey", () => {
     expect(
       tabSubjectKey({ kind: "attachment", id: "a1", filename: "x.pdf" }),
     ).toBe("attachment:a1:x.pdf");
+    expect(
+      tabSubjectKey({ kind: "decisions", selectedKey: "question:card-9", answered: true }),
+    ).toBe("decisions:answered:question:card-9");
   });
 });

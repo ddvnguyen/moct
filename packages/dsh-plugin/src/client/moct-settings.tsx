@@ -31,7 +31,7 @@ import {
 /**
  * The MOCT group in the settings page.
  *
- * S2-B puts the fork's real `SettingsPage` in this panel's sixth rail row. The
+ * S2-B puts the fork's real `SettingsPage` in this panel's seventh rail row. The
  * page is the web app's, so almost every group in it is about Multica itself;
  * this module adds the one group that only exists in dsh — the memory plane the
  * panel reaches through `/moct` (S2-A's closed seam) and the two policies that

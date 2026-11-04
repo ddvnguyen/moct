@@ -126,6 +126,7 @@ const VIEW_FALLBACK_NAMES = {
   skills: "Skills",
   skill: "Skill",
   inbox: "Inbox",
+  decisions: "Decisions",
   chat: "Chat",
   settings: "Settings",
 } as const;

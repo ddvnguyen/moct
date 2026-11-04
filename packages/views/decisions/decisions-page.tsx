@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo } from "react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import {
   decisionKeys,
@@ -12,6 +12,7 @@ import { useWorkspaceId } from "@multica/core/hooks";
 import { Button } from "@multica/ui/components/ui/button";
 import { CircleDot, Loader2, RefreshCw } from "@multica/ui/icons";
 import { cn } from "@multica/ui/lib/utils";
+import { useNavigation } from "../navigation";
 import { useT } from "../i18n";
 import { DecisionDetail } from "./decision-detail";
 import { DecisionList } from "./decision-list";
@@ -44,10 +45,12 @@ export interface DecisionsPageProps {
  */
 export function DecisionsPage({ projectId = null }: DecisionsPageProps) {
   const { t } = useT("decisions");
+  const navigation = useNavigation();
   const wsId = useWorkspaceId();
   const qc = useQueryClient();
-  const [state, setState] = useState<DecisionState>("pending");
-  const [selected, setSelected] = useState<string | null>(null);
+  const params = navigation.searchParams;
+  const state: DecisionState = params.get("state") === "answered" ? "answered" : "pending";
+  const selected = params.get("decision");
 
   const feed = useInfiniteQuery(
     decisionsOptions(wsId, {
@@ -55,8 +58,18 @@ export function DecisionsPage({ projectId = null }: DecisionsPageProps) {
       ...(projectId !== null ? { project_id: projectId } : {}),
     }),
   );
+  const {
+    fetchNextPage,
+    hasNextPage,
+    isError,
+    isFetchingNextPage,
+    isLoading,
+  } = feed;
 
-  const decisions = feed.data?.pages.flatMap((page) => page.items) ?? [];
+  const decisions = useMemo(
+    () => feed.data?.pages.flatMap((page) => page.items) ?? [],
+    [feed.data],
+  );
   const pendingCount = feed.data?.pages[0]?.pending_count ?? 0;
   const activeKey =
     selected !== null &&
@@ -76,8 +89,48 @@ export function DecisionsPage({ projectId = null }: DecisionsPageProps) {
   };
 
   const select = (decision: Decision): void => {
-    setSelected(decisionKey(decision));
+    updateRoute(state, decisionKey(decision));
   };
+
+  function updateRoute(nextState: DecisionState, decision: string | null): void {
+    const next = new URLSearchParams(navigation.searchParams);
+    if (nextState === "answered") next.set("state", "answered");
+    else next.delete("state");
+    if (decision === null) next.delete("decision");
+    else next.set("decision", decision);
+    const query = next.toString();
+    navigation.push(
+      `${navigation.pathname}${query === "" ? "" : `?${query}`}${navigation.hash}`,
+    );
+  }
+
+  // The selected row may be on a later page when a tab is restored. Continue
+  // the same keyset feed until it appears, or clear a selection that no longer
+  // exists in this state or project scope.
+  useEffect(() => {
+    if (selected === null || isLoading || isError) return;
+    if (decisions.some((decision) => decisionKey(decision) === selected)) return;
+    if (isFetchingNextPage) return;
+    if (hasNextPage) {
+      void fetchNextPage();
+      return;
+    }
+    const next = new URLSearchParams(navigation.searchParams);
+    next.delete("decision");
+    const query = next.toString();
+    navigation.replace(
+      `${navigation.pathname}${query === "" ? "" : `?${query}`}${navigation.hash}`,
+    );
+  }, [
+    decisions,
+    fetchNextPage,
+    hasNextPage,
+    isError,
+    isFetchingNextPage,
+    isLoading,
+    navigation,
+    selected,
+  ]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -91,19 +144,13 @@ export function DecisionsPage({ projectId = null }: DecisionsPageProps) {
         >
           <StateTab
             active={state === "pending"}
-            onClick={() => {
-              setState("pending");
-              setSelected(null);
-            }}
+            onClick={() => updateRoute("pending", null)}
             label={t(($) => $.page.pending_tab)}
             count={pendingCount}
           />
           <StateTab
             active={state === "answered"}
-            onClick={() => {
-              setState("answered");
-              setSelected(null);
-            }}
+            onClick={() => updateRoute("answered", null)}
             label={t(($) => $.page.answered_tab)}
           />
         </div>

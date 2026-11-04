@@ -9,7 +9,7 @@ import { MULTICA_ENTRIES } from "../src/client/index";
 import type { IslandRoute } from "../src/client/navigation";
 
 /**
- * The island's own window, rendered: one tab strip across the six views, one
+ * The island's own window, rendered: one tab strip across the seven views, one
  * history behind Back/Forward, and the shell's rail kept on the tab that is
  * showing (M-197).
  *

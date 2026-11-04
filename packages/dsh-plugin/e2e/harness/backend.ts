@@ -198,6 +198,34 @@ export function installBackend(options: BackendOptions = {}): void {
     if (/^\/multica\/api\/workspaces\/[^/]+\/members/.test(path)) {
       return json([MEMBER]);
     }
+    if (/^\/multica\/api\/workspaces\/[^/]+\/decisions(?:\?|$)/.test(url)) {
+      return json({
+        items: [
+          {
+            kind: "question",
+            source_id: "question-1",
+            issue_id: issue(1).id,
+            issue_title: issue(1).title,
+            project_id: null,
+            issue_revision: 1,
+            agent_id: "agent-1",
+            response_id: null,
+            actor_id: null,
+            requested_at: "2026-01-01T00:00:00Z",
+            task_id: null,
+            question_seq: 1,
+            sort_at: "2026-01-01T00:00:00Z",
+            status: "pending",
+            receipt_reason: null,
+          },
+        ],
+        pending_count: 1,
+        next_cursor: null,
+      });
+    }
+    if (/^\/multica\/api\/workspaces\/[^/]+\/decisions\//.test(path)) {
+      return json({ question: "Which option should we use?" });
+    }
     if (url.startsWith("/multica/api/workspaces")) {
       return json(options.workspaces ?? [WORKSPACE]);
     }

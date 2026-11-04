@@ -32,6 +32,7 @@ const ROUTES: ReadonlyArray<{ label: string; params: Record<string, string>; mar
   { label: "skills", params: { route: "skills" }, marker: "Release notes" },
   { label: "skill", params: { route: "skill", id: "skill-1" }, marker: "Release notes" },
   { label: "inbox", params: { route: "inbox" }, marker: "Inbox row 1" },
+  { label: "decisions", params: { route: "decisions" }, marker: "Decisions" },
   { label: "chat", params: { route: "chat" } },
 ];
 
@@ -170,5 +171,15 @@ test.describe("island smoke sweep", () => {
       );
     }
     report(findings);
+  });
+
+  test("Decisions renders with its pending count", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1300 });
+    await page.goto(href({ route: "decisions" }));
+    await expect(page.getByRole("heading", { name: "Decisions" })).toBeVisible();
+    await expect(page.getByRole("tab", { name: "Pending 1" })).toBeVisible();
+    await expect(page.getByRole("option", { name: /Question/ })).toBeVisible();
+    await expect(page.getByText("Rail click stays warm").first()).toBeVisible();
+    await page.screenshot({ path: "test-results/m212-decisions.png", fullPage: true });
   });
 });

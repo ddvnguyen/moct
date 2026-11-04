@@ -48,6 +48,8 @@ function readRoute(): IslandRoute {
         return { view: "skill", skillId: id === "" ? "skill-1" : id };
       case "inbox":
         return { view: "inbox" };
+      case "decisions":
+        return { view: "decisions" };
       case "chat":
         return { view: "chat" };
       case "settings":

@@ -15,6 +15,7 @@ import { createRailIcon, createSeatComponent } from "../src/client/seat";
 import { bindShell, selectShellPanel } from "../src/client/shell";
 import type { DshLayout } from "../src/dsh";
 import { setUnread, startUnreadPoll } from "../src/client/unread-store";
+import { getDecisionPendingCount, setDecisionPendingCount } from "../src/client/decisions-badge-store";
 
 // `apply` starts the page-lifetime unread poller; stop the one it started so
 // no interval outlives this file. A repeat call returns the live stop.
@@ -111,12 +112,12 @@ describe("client apply", () => {
 
     const rows = byName(registrations, "sidebar.panellist");
     const seats = byName(registrations, "main");
-    expect(rows).toHaveLength(6);
-    expect(seats).toHaveLength(6);
-    expect(MULTICA_ENTRIES).toHaveLength(6);
+    expect(rows).toHaveLength(7);
+    expect(seats).toHaveLength(7);
+    expect(MULTICA_ENTRIES).toHaveLength(7);
   });
 
-  it("labels the six entries and keeps the rail order", () => {
+  it("labels the seven entries and keeps the rail order", () => {
     const { ctx, registrations } = fakeSlots();
     apply(ctx);
 
@@ -126,14 +127,15 @@ describe("client apply", () => {
       "Multica Agents",
       "Multica Skills",
       "Multica Inbox",
+      "Multica Decisions",
       "Multica Chat",
       "Multica Settings",
     ]);
     // A list slot has no grouping API: adjacent order is the grouping, and each
     // row's id is its own, so no shipped row is replaced.
-    expect(rows.map((entry) => entry.options.order)).toEqual([30, 31, 32, 33, 34, 35]);
+    expect(rows.map((entry) => entry.options.order)).toEqual([30, 31, 32, 33, 34, 35, 36]);
     for (const row of rows) expect(row.options.key).toBeUndefined();
-    expect(new Set(rows.map((entry) => entry.options.id)).size).toBe(6);
+    expect(new Set(rows.map((entry) => entry.options.id)).size).toBe(7);
     expect(rows[0]?.options.id).toBe(MULTICA_PANEL_ID);
   });
 
@@ -189,10 +191,35 @@ describe("client apply", () => {
       FAMILY_ROOTS.agents,
       FAMILY_ROOTS.skills,
       FAMILY_ROOTS.inbox,
+      FAMILY_ROOTS.decisions,
       FAMILY_ROOTS.chat,
       FAMILY_ROOTS.settings,
     ]);
     configureHostRuntime(null);
+  });
+});
+
+describe("Decisions rail badge", () => {
+  afterEach(() => setDecisionPendingCount(0));
+
+  it("paints the pending count independently on its own badge node", () => {
+    setDecisionPendingCount(4);
+    const Icon = createRailIcon(createElement as never, "decisions") as (
+      props: { size?: number },
+    ) => ReactElement;
+    const view = render(createElement(Icon));
+    const badge = view.container.querySelector<HTMLElement>("[data-multica-decisions-badge]");
+    expect(badge?.textContent).toBe("4");
+    expect(badge?.style.display).toBe("inline-flex");
+
+    setUnread(2);
+    expect(getDecisionPendingCount()).toBe(4);
+    setDecisionPendingCount(120);
+    expect(badge?.textContent).toBe("99+");
+    setDecisionPendingCount(0);
+    expect(badge?.style.display).toBe("none");
+    setUnread(0);
+    view.unmount();
   });
 });
 

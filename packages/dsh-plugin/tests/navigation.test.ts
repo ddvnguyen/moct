@@ -34,10 +34,14 @@ describe("parseIslandRoute", () => {
     });
   });
 
-  it("reads the other five entries of the menu", () => {
+  it("reads the other six entries of the menu", () => {
     expect(parseIslandRoute("/demo/agents")).toEqual({ view: "agents" });
     expect(parseIslandRoute("/demo/skills")).toEqual({ view: "skills" });
     expect(parseIslandRoute("/demo/inbox")).toEqual({ view: "inbox" });
+    expect(parseIslandRoute("/demo/decisions?state=answered&decision=question%3A1")).toEqual({
+      view: "decisions",
+      query: "state=answered&decision=question%3A1",
+    });
     expect(parseIslandRoute("/demo/chat")).toEqual({ view: "chat" });
     expect(parseIslandRoute("/demo/settings")).toEqual({ view: "settings" });
     // Settings addresses its page through the query, never a segment.
@@ -89,6 +93,7 @@ describe("islandPath", () => {
       { view: "skills" as const },
       { view: "skill" as const, skillId: "skill-3" },
       { view: "inbox" as const },
+      { view: "decisions" as const },
       { view: "chat" as const, query: "session=abc" },
       { view: "inbox" as const, query: "view=archived" },
       { view: "settings" as const },
@@ -107,6 +112,7 @@ describe("islandPath", () => {
     expect(islandPathname("demo", FAMILY_ROOTS.agents)).toBe("/demo/agents");
     expect(islandPathname("demo", FAMILY_ROOTS.skills)).toBe("/demo/skills");
     expect(islandPathname("demo", FAMILY_ROOTS.inbox)).toBe("/demo/inbox");
+    expect(islandPathname("demo", FAMILY_ROOTS.decisions)).toBe("/demo/decisions");
     expect(islandPathname("demo", FAMILY_ROOTS.chat)).toBe("/demo/chat");
     expect(islandPathname("demo", FAMILY_ROOTS.settings)).toBe("/demo/settings");
   });
@@ -220,6 +226,23 @@ describe("createIslandNavigation over the window's history (M-197)", () => {
     };
     return createTabsStore(createIslandStorage(backing as any), "demo");
   }
+
+  it("restores Decisions selection through the window's Back and Forward history", () => {
+    const store = createTabsStore(createIslandStorage(), "demo");
+    store.getState().railEntry(FAMILY_ROOTS.decisions);
+    const navigation = createIslandNavigation({ slug: "demo", tabs: store });
+
+    navigation.push("/demo/decisions?state=answered&decision=question%3Acard-9");
+    expect(store.getState().activeTab()?.url).toBe(
+      "/demo/decisions?state=answered&decision=question%3Acard-9",
+    );
+    navigation.back();
+    expect(store.getState().activeTab()?.url).toBe("/demo/decisions");
+    navigation.forward?.();
+    expect(store.getState().activeTab()?.url).toBe(
+      "/demo/decisions?state=answered&decision=question%3Acard-9",
+    );
+  });
 
   it("reads the active tab's pathname and query after tab changes", () => {
     const store = tabs();
