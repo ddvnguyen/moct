@@ -49,8 +49,13 @@ type WorkspaceAccountResponse struct {
 	DaemonAccountID string          `json:"daemon_account_id,omitempty"`
 	RuntimeID       string          `json:"runtime_id,omitempty"`
 	EngineVersion   string          `json:"engine_version"`
-	CreatedAt       string          `json:"created_at"`
-	UpdatedAt       string          `json:"updated_at"`
+
+	// InstalledVersions is what the account's runtime last reported having;
+	// the UI offers these as engine-version choices. Set on list only.
+	InstalledVersions []FreebuffVersion `json:"installed_versions,omitempty"`
+
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 func workspaceAccountToResponse(a db.WorkspaceAccount, includeAdminDetails bool) WorkspaceAccountResponse {
@@ -132,11 +137,39 @@ func (h *Handler) ListWorkspaceAccounts(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	admin := roleAllowed(member.Role, "owner", "admin")
+	versions := h.runtimeInstalledVersions(r.Context(), wsUUID)
 	out := make([]WorkspaceAccountResponse, 0, len(accounts))
 	for _, a := range accounts {
-		out = append(out, workspaceAccountToResponse(a, admin))
+		resp := workspaceAccountToResponse(a, admin)
+		if a.RuntimeID.Valid && a.DaemonAccountID.Valid && a.DaemonAccountID.String != "" {
+			resp.InstalledVersions = versions[resp.RuntimeID]
+		}
+		out = append(out, resp)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+}
+
+// runtimeInstalledVersions maps runtime id to the engine versions its daemon
+// last reported. Runtimes that reported none are absent. A lookup failure
+// yields an empty map: the account list still works, only without choices.
+func (h *Handler) runtimeInstalledVersions(ctx context.Context, wsUUID pgtype.UUID) map[string][]FreebuffVersion {
+	out := map[string][]FreebuffVersion{}
+	rows, err := h.DB.Query(ctx, `SELECT id, metadata FROM agent_runtime WHERE workspace_id=$1 AND metadata->'freebuff' IS NOT NULL`, wsUUID)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id pgtype.UUID
+		var metadata []byte
+		if err := rows.Scan(&id, &metadata); err != nil {
+			continue
+		}
+		if v := freebuffBlockFromMetadata(metadata).InstalledVersions; len(v) > 0 {
+			out[uuidToString(id)] = v
+		}
+	}
+	return out
 }
 
 // CreateWorkspaceAccount adds an account (owner/admin).

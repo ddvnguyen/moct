@@ -716,6 +716,31 @@ func TestManagedAccountEngineVersion(t *testing.T) {
 		t.Fatalf("unknown: %d %s", got.Code, got.Body)
 	}
 	update(testUserID, account.ID, "0.0.196").Want(http.StatusOK)
+	// The list carries the runtime's installed versions for managed accounts only.
+	var listed struct {
+		Accounts []WorkspaceAccountResponse `json:"accounts"`
+	}
+	testutil.Call(t, testHandler.ListWorkspaceAccounts, withURLParam(
+		newRequestAs(testUserID, http.MethodGet, "/x", nil), "id", testWorkspaceID,
+	)).Want(http.StatusOK).JSON(&listed)
+	sawManaged, sawManual := false, false
+	for _, row := range listed.Accounts {
+		switch row.ID {
+		case account.ID:
+			sawManaged = true
+			if len(row.InstalledVersions) != 1 || row.InstalledVersions[0].Version != "0.0.196" || row.InstalledVersions[0].Commit != "abc" {
+				t.Fatalf("managed account installed_versions: %#v", row.InstalledVersions)
+			}
+		case manual.ID:
+			sawManual = true
+			if len(row.InstalledVersions) != 0 {
+				t.Fatalf("unmanaged account exposed installed_versions: %#v", row.InstalledVersions)
+			}
+		}
+	}
+	if !sawManaged || !sawManual {
+		t.Fatalf("list omitted accounts: managed=%v manual=%v", sawManaged, sawManual)
+	}
 	if _, err := testPool.Exec(context.Background(), `UPDATE workspace_account SET state='connected' WHERE id=$1`, account.ID); err != nil {
 		t.Fatal(err)
 	}
