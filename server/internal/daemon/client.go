@@ -869,6 +869,7 @@ func (c *Client) GetFreebuffPending(ctx context.Context, runtimeID string) (Free
 // FreebuffDesktopPending is what the user asked the daemon to do to a
 // workspace's daemon-managed freebuff-desktop accounts.
 type FreebuffDesktopPending struct {
+	Pins     map[string]string `json:"pins"`
 	Accounts []struct {
 		ID     string `json:"id"`
 		State  string `json:"state"`

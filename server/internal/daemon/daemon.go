@@ -481,9 +481,11 @@ type Daemon struct {
 	// break. Read it through daemonLifecycleCtx.
 	lifecycleCtx context.Context
 
-	freebuffDesktopLogins     sync.Map // runtime/account key -> context.CancelFunc
-	freebuffDesktopInstances  sync.Map // runtime/account key -> *freebuffDesktopInstance
-	freebuffDesktopInstanceMu sync.Mutex
+	freebuffDesktopLogins       sync.Map // runtime/account key -> context.CancelFunc
+	freebuffDesktopInstances    sync.Map // runtime/account key -> *freebuffDesktopInstance
+	freebuffDesktopInstanceMu   sync.Mutex
+	freebuffDesktopReservations map[string]int    // guarded by freebuffDesktopInstanceMu
+	freebuffDesktopFailedPins   map[string]string // guarded by freebuffDesktopInstanceMu
 
 	// dshInstallInFlight is true while an automatic DSH profile install is
 	// running. Read when a verdict becomes an offline reason, so the server can
@@ -8928,6 +8930,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if !ok {
 			return TaskResult{}, errors.New("managed Freebuff Desktop runtime is unavailable")
 		}
+		release := d.reserveFreebuffDesktopAccount(rt.ID, task.Agent.AccountDaemonID)
+		defer release()
 		accountCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		client, err := d.ensureFreebuffDesktopInstance(accountCtx, rt, task.Agent.AccountDaemonID)
 		cancel()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,17 @@ func freebuffEngineVersion(runtimeID string) string {
 	return pin
 }
 
+var freebuffAccountPins sync.Map // runtimeID/accountID -> string
+
+func freebuffAccountEngineVersion(runtimeID, accountID string) string {
+	if v, ok := freebuffAccountPins.Load(freebuffLoginKey(runtimeID, accountID)); ok {
+		if pin, ok := v.(string); ok && pin != "" {
+			return pin
+		}
+	}
+	return freebuffEngineVersion(runtimeID)
+}
+
 func freebuffLoginKey(runtimeID, accountID string) string { return runtimeID + "/" + accountID }
 
 // freebuffAccount is the slice of the orchestrator the account flow uses. It
@@ -92,8 +104,8 @@ type freebuffAccount interface {
 // and returns its client and a stop function. It is a variable so tests can run
 // the account flow without a real orchestrator.
 var startFreebuffAccount = func(ctx context.Context, runtimeID, accountID string) (freebuffAccount, func(), error) {
-	cfg := agent.Config{RuntimeID: runtimeID}
-	if pin := freebuffEngineVersion(runtimeID); pin != "" {
+	cfg := agent.Config{RuntimeID: runtimeID, Logger: slog.Default().With("account_id", accountID)}
+	if pin := freebuffAccountEngineVersion(runtimeID, accountID); pin != "" {
 		cfg.Env = map[string]string{agent.FreebuffEnvAppVersion: pin}
 	}
 	dir, err := agent.EnsureFreebuffAccountDir(cfg, accountID)
