@@ -50,6 +50,64 @@ back for review. Self-hostable, works with the agent CLIs you already use, no lo
 
 ---
 
+## multica-moct-x
+
+> **This repository is a fork.** Everything below the fork section is upstream
+> `multica-ai/multica` (`v0.6.5`; fork base `cbd75011`, recorded in
+> [`packages/dsh-plugin/FORK.md`](packages/dsh-plugin/FORK.md)). The section
+> describes the fork's own integration; upstream content starts at
+> [What is Multica?](#what-is-multica) and is kept intact.
+
+**multica-moct-x** runs this fork of Multica inside DeepSeek Harness (dsh) as
+a native plugin, on top of MOCT — the team-memory service. Two backends, two
+databases, one thin seam; no iframe, no loopback page.
+
+```mermaid
+flowchart LR
+  subgraph dsh["dsh shell (browser + host)"]
+    IS["React 19 island<br/>@multica/dsh-plugin"]
+  end
+  MB["multica-be<br/>Go + PostgreSQL<br/>WORK PLANE"] --> PG[("issues, board,<br/>agents, skills")]
+  D["Multica daemon"] --> MB
+  D -->|"pre-run memory inject<br/>+ multica moct-mcp tools"| MO["moct-be<br/>TS + Turso<br/>MEMORY PLANE"]
+  MO --> T[("typed memory,<br/>decisions, conventions")]
+  IS -->|"/multica/* (proxied)"| MB
+```
+
+- **One writer per entity**: `multica-be` owns issues/threads/board/agents;
+  `moct-be` owns memory. The seam is one typed HTTP client, and *memory never
+  blocks a run* — if MOCT is down, tasks run without it.
+- **The UI is a plugin** (`packages/dsh-plugin`): the fork's own board and
+  issue page in a React 19 island, transport proxied through the dsh host so
+  no Multica token reaches the browser. GitHub/Slack integrations, billing,
+  autopilots and squads are **hidden in the panel, not deleted** — they stay
+  reachable from the Multica web app.
+
+| Doc | What it covers |
+|---|---|
+| [docs/moct-x/architecture.md](docs/moct-x/architecture.md) | two backends, ownership, identity split, ADR summary |
+| [docs/moct-x/seam.md](docs/moct-x/seam.md) | the MOCT seam: inject, tools, config, failure mode |
+| [docs/moct-x/dsh-plugin.md](docs/moct-x/dsh-plugin.md) | the dsh plugin: island, proxy, fork-entry gate |
+| [docs/moct-x/interactions.md](docs/moct-x/interactions.md) | ask/plan parity: parked questions answered through the steer path |
+| [docs/moct-x/operations.md](docs/moct-x/operations.md) | lanes, `deploy/dsh-z`, env vars, CI, runbooks |
+| [docs/moct-x/fork-and-upstream.md](docs/moct-x/fork-and-upstream.md) | fork bases, divergence map, upstream merges |
+| [docs/moct-x/glossary.md](docs/moct-x/glossary.md) | work/memory plane, seam, lane, island, ref |
+| [docs/moct-seam.md](docs/moct-seam.md) | the seam contract itself (ref grammar, endpoints, write semantics) |
+
+**Build/run on a dsh lane:** provision the proving lane with
+`bash deploy/dsh-z/deploy.sh` (idempotent; loopback-only; see
+[deploy/dsh-z/README.md](deploy/dsh-z/README.md)). Develop the plugin with
+`pnpm --filter @multica/dsh-plugin build`, `pnpm --filter @multica/dsh-plugin test`, or `pnpm --filter @multica/dsh-plugin lint` (see
+[packages/dsh-plugin/README.md](packages/dsh-plugin/README.md)). Upstream
+build/self-host instructions below apply unchanged.
+
+Verified at `multica-moct` commit `ac8a04078`.
+
+**Unverified:** live lane behavior and external MOCT internals were not re-tested;
+see the Unverified sections in the linked documents.
+
+---
+
 ## What is Multica?
 
 You already run Claude Code, Codex, and three other agents. Each one lives in its own terminal
