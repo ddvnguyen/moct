@@ -26,6 +26,9 @@ func (b Bundle) OrchestratorPath() string {
 // manifest. Empty for a bundle outside a version store.
 func (b Bundle) Version() (version, commit string) {
 	if m, ok := readBundleManifest(b.ResourcesDir); ok {
+		if m.Commit == "" {
+			m.Commit = readBuildCommit(b.ResourcesDir)
+		}
 		return m.Version, m.Commit
 	}
 	if parent := filepath.Base(filepath.Dir(b.ResourcesDir)); parent == versionsDirName {

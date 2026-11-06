@@ -106,6 +106,11 @@ func InstalledVersions(runtimeDir string) []InstalledBundle {
 		if m, ok := readBundleManifest(dir); ok {
 			commit = m.Commit
 		}
+		if commit == "" {
+			// Installs written before commitSha was read carry a manifest
+			// without a commit; the bundle's build-info.json still has it.
+			commit = readBuildCommit(dir)
+		}
 		out = append(out, InstalledBundle{Version: version, Commit: commit, Dir: dir})
 	}
 	sort.Slice(out, func(i, j int) bool { return compareVersions(out[i].Version, out[j].Version) < 0 })
