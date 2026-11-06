@@ -5376,7 +5376,27 @@ func (d *Daemon) restartTargetBinary() (string, error) {
 		d.logger.Warn("brew install detected but prefix could not be resolved; restart may fail",
 			"executable", newBin)
 	}
-	return cli.StableExecutablePath(newBin, d.brewPrefix, d.brewInstall), nil
+	target := cli.StableExecutablePath(newBin, d.brewPrefix, d.brewInstall)
+	invocationName := ""
+	if len(os.Args) > 0 {
+		invocationName = filepath.Base(os.Args[0])
+	}
+	targetName := strings.TrimSuffix(filepath.Base(target), " (deleted)")
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) && len(os.Args) > 0 && filepath.IsAbs(os.Args[0]) && invocationName == targetName {
+		// On Linux, os.Executable reports the physical release path. A deploy
+		// may prune that release while this daemon is still running, even though
+		// argv[0] retains the stable `current` path used to launch it. Resolve
+		// that invocation path only when the physical target is gone; other
+		// filesystem errors must not silently switch restart targets.
+		if invocationPath, resolveErr := filepath.EvalSymlinks(os.Args[0]); resolveErr == nil {
+			if info, statErr := os.Stat(invocationPath); statErr == nil && info.Mode().IsRegular() {
+				d.logger.Info("daemon executable release is missing; using invocation path for restart",
+					"missing_binary", target, "invocation_binary", invocationPath)
+				return invocationPath, nil
+			}
+		}
+	}
+	return target, nil
 }
 
 // pollLoop runs the machine-level batch claim poller (MUL-4257): a single
