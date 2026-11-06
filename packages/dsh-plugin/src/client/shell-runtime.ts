@@ -5,8 +5,8 @@
  * context and hands the island a small structural bridge — the same module
  * setter pattern `configureHostRuntime` uses for `createElement`. Nothing set
  * means no shell integration: the header keeps its plain layout and the
- * Files/Terminal buttons do not render at all, so a host without these
- * services keeps applying cleanly.
+ * side-panel toggle does not render at all, so a host without these services
+ * keeps applying cleanly.
  */
 
 import type {
@@ -26,11 +26,13 @@ export interface ShellBridge {
   /** The host's daemon id, used to filter `local_directory` refs; may be empty. */
   daemonId: string;
   /**
-   * The layout's panel selection, for the no-`hostPanel` fallback: the
-   * Conversation gets the main column back before a tab opens. Absent in a
-   * host built without ui-layout, where there is nothing to drop.
+   * Session navigation, for the no-`hostPanel` case: the bound Session has to
+   * be the on-screen one before the Sidebar has anything to draw, and selecting
+   * a Session is the shell's navigation, not the controllers' (their selection
+   * lives outside them). Absent when the host has no workspace UI to navigate
+   * with.
    */
-  selectPanel: ((panelId: string | null) => void) | null;
+  selectSession: ((sessionId: string) => void) | null;
 }
 
 let bridge: ShellBridge | null = null;

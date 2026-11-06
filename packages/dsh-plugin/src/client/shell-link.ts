@@ -1,14 +1,14 @@
 /**
- * Resolving what the Files/Terminal buttons address (M-159).
+ * Resolving what the header's side-panel toggle addresses (M-159).
  *
  * One Multica Project equals one dsh Workspace (a folder). The folder comes
  * from the selected project's `local_directory` resource; "All projects" falls
  * back to the host's `workspaceFolder` config, empty meaning none. For a
  * folder the bridge matches the dsh Workspace by normalized path — creating
  * one when none exists (`workspaces.create` is idempotent) — and binds the
- * Session the sidebar surface should open the files/terminal tab under: the
- * on-screen one when it belongs to that Workspace, otherwise the Workspace's
- * first Session, otherwise a new Session in it.
+ * Session the sidebar surface works on: the on-screen one when it belongs to
+ * that Workspace, otherwise the Workspace's first Session, otherwise a new
+ * Session in it.
  *
  * Everything here is pure: the bridges carry real services, this module only
  * decides. Tests cover each rule separately.
@@ -120,6 +120,17 @@ export function sessionSurfaceMounted(
 export const SIDEBAR_NO_SESSION_MESSAGE = "no session surface is mounted";
 
 /**
+ * The failure the dsh face raises for a write with no Session on screen.
+ *
+ * The fallback path can reach the same state by waiting too long for the
+ * Session it just selected to be drawn (`waitForMountedSession`), so it raises
+ * this exact error rather than a new message: one note path covers both.
+ */
+export function noSessionSurfaceError(): Error {
+  return new Error(`sidebarRight: ${SIDEBAR_NO_SESSION_MESSAGE}`);
+}
+
+/**
  * Whether an open or toggle died on exactly the no-session-surface state.
  *
  * Checked after the call, because a session can leave between the pre-check
@@ -132,24 +143,24 @@ export function isNoSessionSurfaceError(cause: unknown): boolean {
 
 export type DisabledReason = "project" | "default" | "project-no-folder" | "no-folder" | "no-session";
 
-/** The no-session copy the disabled toggle and a failed open both surface. */
+/** The copy a reveal that never landed surfaces. */
 export const NO_SESSION_SURFACE_NOTE =
-  "MMX owns the main column, so the dsh sidebar has no session to open tabs in";
+  "The dsh side panel needs a session in the project folder";
 
 /**
- * The full notebook's copy for one reason, the way the disabled state reads.
+ * The tooltip copy for one reason, the way the disabled state reads.
  *
- * The M-159 no-session throw is shell state, not a glitch — MMX owning the
- * main column leaves the sidebar with no session surface — so it says why the
- * way the disabled buttons do, instead of the controller's raw error text
- * leaking into the header.
+ * The no-session throw is shell state, not a glitch — a host without card C's
+ * `hostPanel` draws no sidebar until a Session owns the main column — so it
+ * says why the way the disabled state does, instead of the controller's raw
+ * error text leaking into the header.
  */
 export function describe(reason: DisabledReason, folder: string | null = null): string {
   if (reason === "no-session") return NO_SESSION_SURFACE_NOTE;
   return disabledTooltip(reason, folder);
 }
 
-/** The tooltip for a disabled pair of buttons. */
+/** The tooltip for the disabled toggle. */
 export function disabledTooltip(
   reason: DisabledReason,
   folder: string | null,
@@ -157,7 +168,7 @@ export function disabledTooltip(
   switch (reason) {
     case "project":
     case "default":
-      return "Files and Terminal are ready";
+      return "Open the dsh side panel";
     case "project-no-folder":
       return "Link a folder to this project";
     case "no-folder":
@@ -223,56 +234,145 @@ export function boundSessionId(
 }
 
 /**
- * One open intent, already resolved against the sidebar surface's abilities.
+ * What one press of the header's panel toggle does.
  *
- * With card C's `hostPanel` deployed the sidebar shows beside a hosted main
- * panel, and Session-bound tabs open through `openTabIn`; the plain `openTab`
- * acts on the on-screen Session. No `hostPanel` is the fallback: the main
- * panel is dropped (`layout.selectPanel(null)`) first, then the tab opens.
+ * `toggle` flips the Sidebar that is already on screen — the same call dsh's
+ * own header control makes, so the reader gets the column, its tabs and its
+ * Start guide exactly as dsh draws them. `retarget` is the hosted case: the
+ * column is drawn beside MMX, and it has to be told which Session's folder it
+ * edits before it opens, or Files and Terminal would point at whichever
+ * Session the Conversation last had. `reveal` is the case the controller
+ * cannot answer on its own: no Session is on screen (MMX owns the main column
+ * and the host has neither `hostPanel` nor `selectHostedSession`), so the
+ * folder's Session has to be put on screen before the column has anything to
+ * draw.
  */
-export type OpenIntent =
-  | { kind: "openTab"; tabKind: string; sessionId?: string }
-  | { kind: "fallback"; tabKind: string; selectFirst: boolean; sessionId?: string };
+export type ToggleIntent =
+  | { kind: "toggle" }
+  | { kind: "retarget"; sessionId: string | null }
+  | { kind: "reveal"; sessionId: string | null };
 
 /**
- * Plan the call a button press makes.
+ * Plan the call one press makes.
  *
- * `openTabIn` exists on the face regardless of card C; in-session opening
- * keeps MMX bound to the Workspace's Session instead of retargeting whatever
- * the Conversation has selected. A fallback also selects the Conversation
- * first, because the on-screen Session and the tab strip only exist while the
- * Conversation owns the right sidebar's surface.
+ * The column always shows the Session bound to the project's folder. With card
+ * C it renders beside MMX, so the press names that Session
+ * (`selectHostedSession`) and flips the column, leaving the main column where it
+ * is. Without it the only surface is the on-screen Session, and the press has to
+ * bring the folder's own Session on screen first — otherwise the column opens
+ * on somebody else's workspace. A host that hosts the panel but cannot name a
+ * Session is left to toggle what it shows, since moving the column would mean
+ * leaving MMX.
  */
-export function planSidebarOpen(input: {
+export function planSidebarToggle(input: {
   hasHostPanel: boolean;
-  boundSessionId: string | null;
+  canNameSession: boolean;
   mountedSessionId: string | undefined;
-  tabKind: string;
-}): OpenIntent {
-  const sessionId =
-    input.boundSessionId === null || input.boundSessionId === input.mountedSessionId
-      ? undefined
-      : input.boundSessionId;
-  if (input.hasHostPanel) {
-    return { kind: "openTab", tabKind: input.tabKind, sessionId };
+  boundSessionId: string | null;
+}): ToggleIntent {
+  const mounted = input.mountedSessionId?.trim();
+  const onScreen = mounted !== undefined && mounted !== "";
+  // The column already edits the project's folder: flip it, nothing to move.
+  if (onScreen && input.boundSessionId === mounted) return { kind: "toggle" };
+  if (input.hasHostPanel && input.canNameSession) {
+    return { kind: "retarget", sessionId: input.boundSessionId };
   }
-  // Dropped panel first so the Session surface mounts; then the tab.
-  return { kind: "fallback", tabKind: input.tabKind, selectFirst: true, sessionId };
+  // A host that hosts the panel but cannot name the column's Session keeps the
+  // column on the Session it draws; moving it would mean leaving MMX.
+  if (onScreen && input.hasHostPanel) return { kind: "toggle" };
+  return { kind: "reveal", sessionId: input.boundSessionId };
 }
 
-/** The two tab kinds the buttons open, as the sidebar faces name them. */
-export const FILES_TAB_KIND = "files";
-export const TERMINAL_TAB_KIND = "terminal";
+/**
+ * The toggle's tooltip: what a press does, and on which folder.
+ *
+ * @param expanded - whether the Sidebar is shown right now (pressed state).
+ * @param folder - the folder the column would show; never null when enabled.
+ */
+export function panelToggleTitle(expanded: boolean, folder: string): string {
+  return expanded ? "Close the dsh side panel" : `Open the dsh side panel on ${folder}`;
+}
+
+/** How long a fallback waits for the shell to draw the Session it selected. */
+export const SESSION_MOUNT_TIMEOUT_MS = 5000;
+
+/**
+ * Wait for the sidebar's on-screen Session to become `sessionId`.
+ *
+ * Selecting a Session is a navigation: the shell re-renders, the runtime mints
+ * that Session's store, and only then does the sidebar adopt it. Opening a tab
+ * before that lands writes into no surface at all, so the fallback waits — on
+ * the controller's own `mounted` snapshot, which is what its writes read —
+ * and gives up after `timeoutMs` instead of hanging the button.
+ *
+ * @param sidebarRight - the sidebar face whose `mounted` snapshot is watched.
+ * @param sessionId - the Session the tab must open under.
+ * @param options - timeout and poll interval; defaults are the module's.
+ * @returns whether the Session became the on-screen one in time.
+ */
+export async function waitForMountedSession(
+  sidebarRight: Pick<SidebarRightLike, "mounted">,
+  sessionId: string,
+  options: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<boolean> {
+  const mounted = sidebarRight.mounted;
+  if (mounted.getSnapshot() === sessionId) return true;
+  const timeoutMs = options.timeoutMs ?? SESSION_MOUNT_TIMEOUT_MS;
+  const intervalMs = options.intervalMs ?? 100;
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let unsubscribe: () => void = () => {};
+    const finish = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      unsubscribe();
+      if (timer !== null) clearTimeout(timer);
+      resolve(value);
+    };
+    const check = (): boolean => {
+      if (mounted.getSnapshot() === sessionId) {
+        finish(true);
+        return true;
+      }
+      return false;
+    };
+    unsubscribe = mounted.subscribe(check);
+    if (check()) return;
+    const deadline = Date.now() + timeoutMs;
+    const poll = (): void => {
+      if (settled || check()) return;
+      if (Date.now() >= deadline) {
+        finish(false);
+        return;
+      }
+      timer = setTimeout(poll, intervalMs);
+    };
+    timer = setTimeout(poll, intervalMs);
+  });
+}
 
 /** Structural subset of the dsh `sidebarRight` face the bridge uses. */
 export interface SidebarRightLike {
-  readonly mounted: { getSnapshot(): string | undefined };
-  openTab(kind: string, options?: { params?: unknown }): void;
-  openTabIn?(sessionId: string, kind: string, options?: { params?: unknown }): void;
+  readonly mounted: {
+    getSnapshot(): string | undefined;
+    subscribe(listener: () => void): () => void;
+  };
   toggleExpanded(): void;
   isExpanded(): boolean;
+  /** Card C publishes the same fact as a subscribable; absent before it ships. */
+  expanded?: {
+    getSnapshot(): boolean;
+    subscribe(listener: () => void): () => void;
+  };
   /** Card C's opt-in: the sidebar beside a hosted `main` panel. Optional face. */
   hostPanel?(panelId: string): () => void;
+  /**
+   * Card C's target for the hosted column; absent before it ships. Naming a
+   * Session is what makes Files and Terminal open on the project's folder
+   * while MMX keeps the main column.
+   */
+  selectHostedSession?(sessionId: string): () => void;
 }
 
 /** Structural subset of the dsh `workspaces` face the bridge uses. */
@@ -282,6 +382,12 @@ export interface WorkspacesLike {
     subscribe(listener: () => void): () => void;
   };
   create(input: { path: string }): Promise<WorkspaceLike>;
+}
+
+/** Structural subset of the dsh session navigation face the bridge uses. */
+export interface SessionNavigationLike {
+  /** Select a Session and show its Conversation, as the shell's own lists do. */
+  openSession(target: string): void;
 }
 
 /** Structural subset of the dsh `sessions` face the bridge uses. */

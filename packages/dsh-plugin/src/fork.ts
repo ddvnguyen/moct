@@ -90,6 +90,10 @@ export { cn } from "@multica/ui/lib/utils";
 export {
   ArrowLeft,
   ArrowRight,
+  // `PanelRight*` is the header's side-panel toggle (M-159): the same edge
+  // glyph the dsh right sidebar's own control draws.
+  PanelRight,
+  PanelRightClose,
   ListX,
   Plus,
   RefreshCw,
