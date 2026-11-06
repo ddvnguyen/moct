@@ -664,7 +664,7 @@ func TestDshResumeReachableAgreesWithTheGate(t *testing.T) {
 
 			task := Task{PriorSessionID: "sess-1", PriorWorkDir: tc.priorWorkDir}
 			taskCtx := execenv.TaskContextForEnv{}
-			gate := gateResumeToReachableSession(&task, &taskCtx, "dsh", env.WorkDir, true, false, false, slog.Default())
+			gate := gateResumeToReachableSession(&task, &taskCtx, "dsh", env.WorkDir, true, false, false, false, slog.Default())
 
 			if decision != gate {
 				t.Fatalf("decision says reachable = %v, the gate says %v", decision, gate)

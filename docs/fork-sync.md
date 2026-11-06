@@ -47,7 +47,7 @@ Computed per run; the table maps where conflicts land, not a substitute for it.
 | Supplement data layer | `server/pkg/db/queries/supplement.sql`, `server/pkg/db/generated/{supplement,agent}.sql.go` |
 | Tab header, sidebar, dsh island | `packages/dsh-plugin/**` |
 | Fork UI primitives and copy | `packages/ui/components/ui/*`, `packages/views/locales/*/issues.json` |
-| Migrations we own | `server/migrations/595+` (upstream was at 594 on v0.7.2) |
+| Migrations we own | `server/migrations/617+` (upstream reached 616 on v0.8.1; the v0.8.1 sync moved our 595–614 to 617–636) |
 
 ## Rules
 
@@ -55,6 +55,12 @@ Computed per run; the table maps where conflicts land, not a substitute for it.
 - Migration numbers are shared: it warns when an upstream migration reuses a
   number we already spent. Renumber ours; never edit a released upstream
   migration.
+- The version key in `schema_migrations` is the full file stem
+  (`migrations.ExtractVersion`), not the number. Moving a migration to a new
+  stem is therefore two changes: the files, and one entry in
+  `forkMigrationRenames` (`server/cmd/migrate/migrate_fork_renumber.go`) so a
+  lane that already recorded the old stem renames its row instead of re-running
+  the SQL. Gate keys in `server/cmd/migrate/main.go` follow the files.
 - The sync runs on the Freebuff Desktop lane via the Orchestrator (Owner
   decision), not from a free-runtime run.
 - Do not force-push `multica-moct`; the sync lands as a merge commit.

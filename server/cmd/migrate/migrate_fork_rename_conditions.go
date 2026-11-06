@@ -13,11 +13,11 @@ import (
 // The sync (#52 "Stack: upstream v0.7.1 + freebuff runtime + accounts") moved
 // migrations the fork had already shipped to lane databases under other
 // numbers onto new version rows — SQL the same now ships as
-// 596_agent_question_card … 602_task_supplement_mode where those databases
+// 618_agent_question_card … 624_task_supplement_mode where those databases
 // recorded running it as their old numbers. Such a database has the objects
 // but carries no schema_migrations row for the new versions, so `migrate up`
 // re-runs non-idempotent CREATEs and aborts the whole run (M-166/M-167:
-// 596_agent_question_card dies with `relation "agent_question_card" already
+// 618_agent_question_card dies with `relation "agent_question_card" already
 // exists`).
 //
 // Each condition here returns apply=false with a reason — the runner records
@@ -29,7 +29,7 @@ import (
 // pinned connection the SQL itself would use, so unqualified names resolve
 // exactly where the migration would have created them.
 //
-// 599_agent_task_queue_blocked is a DROP + ADD CONSTRAINT pair that passes
+// 621_agent_task_queue_blocked is a DROP + ADD CONSTRAINT pair that passes
 // either way on an already-applied database, so it is deliberately not gated.
 
 // renamerObject is one object a renumbered migration created, checked by kind
@@ -132,29 +132,29 @@ func whenRenamedObjectsAllPresent(objects []renamerObject) migrationCondition {
 // renamerObjectsListing groups each renumbered migration's created objects, in
 // the order its SQL creates them, for the conditions map below and its tests.
 
-var objects596AgentQuestionCard = []renamerObject{
+var objects618AgentQuestionCard = []renamerObject{
 	{kind: "table", name: "agent_question_card"},
 	{kind: "index", name: "idx_aqc_issue"},
 	{kind: "index", name: "idx_aqc_open"},
 	{kind: "index", name: "idx_aqc_task"},
 }
 
-var objects597AgentPlan = []renamerObject{
+var objects619AgentPlan = []renamerObject{
 	{kind: "table", name: "agent_plan"},
 	{kind: "index", name: "idx_ap_issue"},
 	{kind: "index", name: "idx_ap_task"},
 }
 
-var objects598AgentPlanReview = []renamerObject{
+var objects620AgentPlanReview = []renamerObject{
 	{kind: "table", name: "agent_plan_review"},
 	{kind: "index", name: "idx_apr_plan"},
 }
 
-var objects600ProjectSettings = []renamerObject{
+var objects622ProjectSettings = []renamerObject{
 	{kind: "column", name: "settings", table: "project"},
 }
 
-var objects601WorkspaceAccount = []renamerObject{
+var objects623WorkspaceAccount = []renamerObject{
 	{kind: "table", name: "workspace_account"},
 	{kind: "index", name: "idx_workspace_account_workspace"},
 	{kind: "column", name: "account_mode", table: "agent"},
@@ -163,7 +163,7 @@ var objects601WorkspaceAccount = []renamerObject{
 	{kind: "column", name: "account_id", table: "agent_task_queue"},
 }
 
-var objects602TaskSupplementMode = []renamerObject{
+var objects624TaskSupplementMode = []renamerObject{
 	{kind: "column", name: "mode", table: "task_supplement"},
 	{kind: "constraint", name: "task_supplement_mode_check", table: "task_supplement"},
 }

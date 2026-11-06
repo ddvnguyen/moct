@@ -1,0 +1,59 @@
+{
+  "page": {
+    "title": "Decisiones",
+    "pending_tab": "Pendientes",
+    "answered_tab": "Respondidas"
+  },
+  "list": {
+    "aria": "Decisiones",
+    "loading": "Cargando decisiones…",
+    "error_title": "No se han podido cargar las decisiones",
+    "error_hint": "La cola se deriva del estado de las tareas y las ejecuciones, así que un fallo de lectura no significa que esté vacía.",
+    "retry": "Reintentar",
+    "empty_pending_title": "Nada en espera",
+    "empty_pending_hint": "Las preguntas, los planes y los traspasos aparecen aquí en cuanto un agente pregunta.",
+    "empty_answered_title": "Aún no hay respuestas",
+    "empty_answered_hint": "Cada respuesta registrada desde esta página se conserva aquí.",
+    "load_more": "Cargar más",
+    "unknown_kind": "Origen no reconocido",
+    "none_selected_title": "Selecciona una solicitud",
+    "none_selected_hint": "Elige una a la izquierda para leerla y responderla aquí."
+  },
+  "kind": {
+    "question": "Pregunta",
+    "plan": "Plan",
+    "native": "Pregunta de agente",
+    "status": "Traspaso de flujo"
+  },
+  "row": {
+    "by_agent": "{{agent}}",
+    "unknown_agent": "Un agente",
+    "waiting": "esperando {{age}}"
+  },
+  "detail": {
+    "issue_link": "Abrir tarea",
+    "requested": "Preguntado {{age}}",
+    "answered": "Respondido {{age}}",
+    "by": "{{actor}}",
+    "unknown_actor": "Un miembro",
+    "loading": "Cargando la solicitud…",
+    "error_title": "No se ha podido cargar esta solicitud",
+    "error_hint": "Sigue en espera: no se ha respondido nada.",
+    "error_hint_answered": "No se ha podido leer esta solicitud. Inténtalo de nuevo.",
+    "retry": "Reintentar",
+    "answers_title": "Respuesta",
+    "answers_empty": "No se ha guardado ningún texto de respuesta.",
+    "no_answer": "Sin respuesta",
+    "review_title": "Veredicto",
+    "rationale_title": "Justificación",
+    "review_comments": "Comentarios",
+    "review_no_comments": "Sin comentarios",
+    "native_no_form_title": "Sin formulario estructurado",
+    "native_no_form_hint": "Esta pregunta llegó a la transcripción solo como texto, así que se responde en la página de la tarea.",
+    "status_title": "Esperando una decisión del flujo",
+    "status_hint": "Por ahora este traspaso se responde en la página de la tarea; esta lista lo lee desde la propia tarea.",
+    "unknown_title": "Esta compilación no puede responder a esta solicitud",
+    "unknown_hint": "Sigue en espera. Abre la tarea para leer su contexto.",
+    "answered_hint": "Las respuestas registradas son de solo lectura. Una nueva solicitud llega como su propia fila."
+  }
+}

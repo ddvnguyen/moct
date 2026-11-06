@@ -8,7 +8,13 @@
     "of_total": "{{visible}} / {{total}}",
     "list_load_failed": "無法載入智慧體列表",
     "list_load_failed_default": "獲取智慧體列表時出錯。",
-    "try_again": "重試"
+    "try_again": "重試",
+    "search": "搜尋 AI 代理",
+    "scope_title": {
+      "mine": "我的 AI 代理",
+      "all": "全部 AI 代理",
+      "archived": "已歸檔 AI 代理"
+    }
   },
   "scope": {
     "mine": "我的",
@@ -43,7 +49,15 @@
   },
   "empty": {
     "title": "還沒有智慧體",
-    "description": "建立智慧體後，即可把任務分配給它。"
+    "description": "建立智慧體後，即可把任務分配給它。",
+    "setup": {
+      "label": "設定步驟",
+      "runtime": "接入執行時",
+      "agent": "建立 AI 代理",
+      "issue": "指派一個任務給它",
+      "done": "（已完成）",
+      "connect_runtime": "去接入"
+    }
   },
   "no_matches": {
     "title": "無匹配項",
@@ -156,7 +170,12 @@
     "runtime_required_toast": "請先繫結執行時，再執行該智慧體。",
     "assign_work": "分配工作",
     "more_actions_aria": "智慧體操作",
-    "updated": "{{when}}更新"
+    "updated": "{{when}}更新",
+    "settings": "設定",
+    "copy_link": "複製連結",
+    "copy_id": "複製 AI 代理 ID",
+    "link_copied_toast": "連結已複製",
+    "id_copied_toast": "AI 代理 ID 已複製"
   },
   "inspector": {
     "section_profile": "資料",
@@ -337,7 +356,8 @@
       "prompt_assistant": "幫助團隊規劃和撰寫專案",
       "thinking": "正在更新草稿…",
       "placeholder": "描述你需要的智慧體…",
-      "send": "傳送訊息"
+      "send": "傳送訊息",
+      "conversation_tab": "對話"
     },
     "live_draft": "智慧體配置",
     "live_draft_hint": "可直接修改草稿。",
@@ -363,7 +383,8 @@
       "runtime": "選擇執行時",
       "configure": "配置",
       "done": "完成",
-      "aria": "建立智慧體步驟"
+      "aria": "建立智慧體步驟",
+      "progress": "第 {{current}} 步，共 {{total}} 步"
     },
     "configure_title": "配置智慧體",
     "ask_ai": "讓 AI 幫我寫",
@@ -693,7 +714,8 @@
       "redacted_title": "已配置——對你隱藏",
       "redacted_hint": "只有該智慧體的建立者才能檢視或修改它可使用的應用。",
       "shared_warning": "該智慧體已共享。能夠執行該智慧體的人可以透過它使用你在此啟用的 Composio 應用。如果這些應用涉及敏感資料，請改用\"私有\"或縮小訪問範圍。",
-      "workspace_warning": "公開給工作區：工作區內任何成員都可以透過該智慧體使用這些 Composio 應用。"
+      "workspace_warning": "公開給工作區：工作區內任何成員都可以透過該智慧體使用這些 Composio 應用。",
+      "open_settings": "開啟設定"
     },
     "runtime_config": {
       "mode_label": "路由模式",
@@ -1046,5 +1068,45 @@
     "label": "帳號",
     "runtime_default": "執行環境預設",
     "hint": "執行此智慧體所用的 Freebuff-CLI 帳號。"
+  },
+  "sections": {
+    "runs_count_other": "{{count}} 次執行",
+    "recent_this_week_other": "本週 {{count}} 次",
+    "view_all": "查看全部",
+    "open": "開啟",
+    "edit": "編輯",
+    "add": "新增",
+    "manage": "管理",
+    "instructions_empty": "還沒有指令。"
+  },
+  "panel": {
+    "status": "狀態",
+    "runs_7d": "執行（7 天）",
+    "edit_access_aria": "訪問權限：{{value}}。變更訪問權限",
+    "all_settings": "全部設定"
+  },
+  "intro": {
+    "title": "招募第一位 AI 隊友",
+    "description": "AI 代理像團隊成員一樣接任務：在你的執行時上用 Claude Code、Codex 等工具動手做，做完在評論裡交付。",
+    "slides": {
+      "describe": {
+        "title": "一句話說清它做什麼",
+        "description": "描述職責，選好執行時和模型，就能建立。之後隨時改指令、加 skill。"
+      },
+      "assign": {
+        "title": "像同事一樣分配任務",
+        "description": "在任何任務的負責人裡選它。它會自己開工，不用盯著。"
+      },
+      "deliver": {
+        "title": "看它做事，在評論裡交付",
+        "description": "執行過程即時可見；完成後在任務評論裡交付結果和 PR。"
+      }
+    },
+    "art": {
+      "prompt": "審查前端 PR，重點看無障礙和效能，結論寫在 PR 評論裡。",
+      "issue_title": "定價頁行動版排版錯位",
+      "comment": "修好了：價格卡片在 375px 下改為單欄。已開 PR，測試通過。",
+      "step_read": "讀取 {{file}}"
+    }
   }
 }

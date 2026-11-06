@@ -397,7 +397,7 @@ describe("mountIsland", () => {
     expect(requests.some((url) => url.includes("issues"))).toBe(true);
   });
 
-  it("keeps an agent route when its real Settings tab updates the view query", async () => {
+  it("keeps an agent route when its in-panel settings entry updates the view query", async () => {
     stubBackend({ agents: [AGENT] });
     const host = hostElement();
     act(() =>
@@ -420,11 +420,14 @@ describe("mountIsland", () => {
       expect(host.shadowRoot?.textContent ?? "").toContain("Assign work");
     });
 
-    const settingsTab = [...(host.shadowRoot?.querySelectorAll<HTMLButtonElement>("[role='tab']") ?? [])].find(
-      (tab) => tab.textContent?.trim() === "Settings",
+    // v0.8.1 replaced the agent page's tab strip with the properties panel, so
+    // the settings entry is the panel's "All settings" row; it must still route
+    // through `?view=` so the island's own tab URL keeps up.
+    const settingsEntry = [...(host.shadowRoot?.querySelectorAll<HTMLButtonElement>("button") ?? [])].find(
+      (button) => button.textContent?.trim() === "All settings",
     );
-    expect(settingsTab).toBeDefined();
-    act(() => settingsTab?.click());
+    expect(settingsEntry).toBeDefined();
+    act(() => settingsEntry?.click());
 
     await settle(() => {
       const persisted = localStorage.getItem("multica.dsh.tabs.v1");

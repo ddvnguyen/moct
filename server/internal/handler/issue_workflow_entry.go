@@ -50,6 +50,19 @@ func (h *Handler) applyIssueWorkflow(ctx context.Context, q *db.Queries, prev db
 	if err != nil || def == nil {
 		return nil, err
 	}
+	// Keeping the current status is never a rejected write, even when the
+	// workflow no longer lists it.
+	statusChanging := params.Status.Valid && params.Status.String != prev.Status
+	if def == nil {
+		if !statusChanging {
+			return nil, nil
+		}
+		outside, err := issueworkflow.OutsideProject(ctx, h.Queries, prev.WorkspaceID)
+		if err != nil {
+			return nil, err
+		}
+		return nil, issueworkflow.CheckStatusOutsideProject(outside, params.Status.String)
+	}
 	projectMoving := params.ProjectID != prev.ProjectID
 	if projectMoving && !statusExplicit && !def.IsDefault && !def.Has(prev.Status) {
 		target := issueworkflow.MoveTarget(*def, prev.Status, func(key string) string {
@@ -57,7 +70,9 @@ func (h *Handler) applyIssueWorkflow(ctx context.Context, q *db.Queries, prev db
 		})
 		params.Status = pgtype.Text{String: target, Valid: true}
 	}
-	if params.Status.Valid {
+	// A move into a Default project keeps the issue's status, as it is never
+	// mapped; a named workflow must list the status the issue lands on.
+	if params.Status.Valid && (statusChanging || (projectMoving && !def.IsDefault)) {
 		if err := issueworkflow.CheckStatus(def, params.Status.String); err != nil {
 			return nil, err
 		}
@@ -66,8 +81,7 @@ func (h *Handler) applyIssueWorkflow(ctx context.Context, q *db.Queries, prev db
 	// made for a step the issue has left, and applying it would undo that move.
 	// Default without handoffs keeps the pre-workflow behavior, so workspaces
 	// that never adopt workflows see no change.
-	if run != nil && run.WorkflowStep.Valid && run.WorkflowStep.String != prev.Status &&
-		(!def.IsDefault || def.HandsOffAnywhere()) &&
+	if workflowStepMoved(def, prev.Status, run) &&
 		statusExplicit && params.Status.Valid && params.Status.String != prev.Status {
 		return nil, h.stepMovedError(ctx, q, prev, run.WorkflowStep.String)
 	}
@@ -99,6 +113,13 @@ func (h *Handler) applyIssueWorkflow(ctx context.Context, q *db.Queries, prev db
 	params.AssigneeType = pgtype.Text{String: assigneeType, Valid: true}
 	params.AssigneeID = assigneeID
 	return &workflowHandoff{def: *def, step: step, project: project}, nil
+}
+
+// workflowStepMoved shares the step guard with the claim brief so a run is
+// never told to advance a step its status changes cannot act on.
+func workflowStepMoved(def *issueworkflow.Definition, status string, run *db.AgentTaskQueue) bool {
+	return def != nil && run != nil && run.WorkflowStep.Valid && run.WorkflowStep.String != status &&
+		(!def.IsDefault || def.HandsOffAnywhere())
 }
 
 // workflowHandoffPayload describes a handoff on the issue:updated event, so
@@ -208,11 +229,16 @@ func (h *Handler) stepMovedError(ctx context.Context, q *db.Queries, issue db.Is
 		StepName:        resolver.Name(ctx, q, step),
 		Current:         issue.Status,
 		CurrentName:     resolver.Name(ctx, q, issue.Status),
-	}
-	if last, err := q.GetLastIssueStatusChange(ctx, issue.ID); err == nil && last.ActorID.Valid {
-		out.MovedBy = h.actorDisplayName(ctx, issue.WorkspaceID, last.ActorType.String, last.ActorID)
+		MovedBy:         h.lastIssueStatusMover(ctx, issue),
 	}
 	return out
+}
+
+func (h *Handler) lastIssueStatusMover(ctx context.Context, issue db.Issue) string {
+	if last, err := h.Queries.GetLastIssueStatusChange(ctx, issue.ID); err == nil && last.ActorID.Valid {
+		return h.actorDisplayName(ctx, issue.WorkspaceID, last.ActorType.String, last.ActorID)
+	}
+	return ""
 }
 
 // workflowHandoffBrief renders the brief a handoff's agent or squad will
@@ -346,13 +372,17 @@ func (h *Handler) claimProjectWorkflow(ctx context.Context, issue db.Issue, task
 	}
 	in := h.workflowBriefInput(ctx, issue, *def, project)
 	in.LegacyRuntimeRules = legacyRuntimeRules
-	if !taskRunsForAssignee(issue, task) {
+	stepMoved := workflowStepMoved(def, issue.Status, task)
+	if stepMoved {
+		in.BoundStep = task.WorkflowStep.String
+		in.MovedBy = h.lastIssueStatusMover(ctx, issue)
+	} else if !taskRunsForAssignee(issue, task) {
 		in.Observer = true
 		if issue.AssigneeType.Valid && issue.AssigneeID.Valid {
 			in.AssigneeName = h.actorDisplayName(ctx, issue.WorkspaceID, issue.AssigneeType.String, issue.AssigneeID)
 		}
 	}
-	return &TaskProjectWorkflowData{Brief: issueworkflow.Brief(in)}
+	return &TaskProjectWorkflowData{Brief: issueworkflow.Brief(in), stepMoved: stepMoved}
 }
 
 // taskRunsForAssignee reports whether a run works on the issue as its

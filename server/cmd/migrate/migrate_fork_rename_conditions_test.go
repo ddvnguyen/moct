@@ -18,7 +18,7 @@ import (
 // shape, so the gates must recognize the same objects the SQL creates, not
 // stand-ins.
 var renamerConditionCases = map[string][]string{
-	"596_agent_question_card": {
+	"618_agent_question_card": {
 		`CREATE TABLE agent_question_card (
 			id UUID PRIMARY KEY,
 			status TEXT NOT NULL DEFAULT 'open',
@@ -28,7 +28,7 @@ var renamerConditionCases = map[string][]string{
 		`CREATE INDEX idx_aqc_open ON agent_question_card (created_at) WHERE status = 'open'`,
 		`CREATE INDEX idx_aqc_task ON agent_question_card (created_at) WHERE status = 'open'`,
 	},
-	"597_agent_plan": {
+	"619_agent_plan": {
 		`CREATE TABLE agent_plan (
 			id UUID PRIMARY KEY,
 			status TEXT NOT NULL,
@@ -37,7 +37,7 @@ var renamerConditionCases = map[string][]string{
 		`CREATE INDEX idx_ap_issue ON agent_plan (created_at DESC)`,
 		`CREATE INDEX idx_ap_task ON agent_plan (created_at) WHERE status <> 'open'`,
 	},
-	"598_agent_plan_review": {
+	"620_agent_plan_review": {
 		`CREATE TABLE agent_plan_review (
 			id UUID PRIMARY KEY,
 			plan_id UUID NOT NULL,
@@ -46,13 +46,13 @@ var renamerConditionCases = map[string][]string{
 		`CREATE INDEX idx_apr_plan ON agent_plan_review (plan_id, created_at DESC)`,
 	},
 	// project.settings and the account columns ride inside their table fixtures.
-	"600_project_settings": {
+	"622_project_settings": {
 		`CREATE TABLE project (
 			id UUID PRIMARY KEY,
 			settings JSONB NOT NULL DEFAULT '{}'
 		)`,
 	},
-	"601_workspace_account": {
+	"623_workspace_account": {
 		`CREATE TABLE workspace_account (
 			id UUID PRIMARY KEY,
 			workspace_id UUID NOT NULL
@@ -70,7 +70,7 @@ var renamerConditionCases = map[string][]string{
 			account_id UUID
 		)`,
 	},
-	"602_task_supplement_mode": {
+	"624_task_supplement_mode": {
 		`CREATE TABLE task_supplement (
 			id UUID PRIMARY KEY,
 			mode TEXT NOT NULL DEFAULT 'steer'
@@ -138,9 +138,9 @@ func TestRenamedMigrationConditionOpensWithoutItsIndex(t *testing.T) {
 
 	schema := createScratchSchema(t, ctx, adminPool, "migrate_fork_rename_partial_")
 	pool := openTestPoolWithSearchPath(t, schema+", public")
-	condition := upMigrationConditions["596_agent_question_card"]
+	condition := upMigrationConditions["618_agent_question_card"]
 	if condition == nil {
-		t.Fatalf("no up condition registered for 596_agent_question_card")
+		t.Fatalf("no up condition registered for 618")
 	}
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
@@ -148,7 +148,7 @@ func TestRenamedMigrationConditionOpensWithoutItsIndex(t *testing.T) {
 	}
 	defer conn.Release()
 
-	if _, err := conn.Exec(ctx, renamerConditionCases["596_agent_question_card"][0]); err != nil {
+	if _, err := conn.Exec(ctx, renamerConditionCases["618_agent_question_card"][0]); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
 	apply, reason, err := condition(ctx, conn)

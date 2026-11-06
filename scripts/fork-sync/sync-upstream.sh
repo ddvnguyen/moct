@@ -130,7 +130,7 @@ case "$merge_status" in
 esac
 
 # Layout: tree OID, the conflicting files, a blank line, then auto-merge notes.
-conflicts=$(printf '%s\n' "$merge_tree" | awk 'NR == 1 { next } /^$/ { exit } NF { print }')
+conflicts=$(printf '%s\n' "$merge_tree" | awk 'NR == 1 { next } /^$/ { files_done = 1 } !files_done && NF { print }')
 conflict_count=$(count_lines <<<"$conflicts")
 
 # A file is fork-owned when our branch changed it since the merge base: those
@@ -185,7 +185,9 @@ fi
 
 if [ "$collision_count" -gt 0 ]; then
   printf '\nmigration number collisions:\n%s' "$collisions"
-  printf 'Renumber the fork migration(s) before merging; schema_migrations keys on the number.\n'
+  printf 'Renumber the fork migration(s) before merging, and extend forkMigrationRenames in\n'
+  printf 'server/cmd/migrate so rows recorded under the old stem move to the new one: the\n'
+  printf 'schema_migrations version key is the full file stem, not the number.\n'
 fi
 
 if [ "$mode" = check ]; then
