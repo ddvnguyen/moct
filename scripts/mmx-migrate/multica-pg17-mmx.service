@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# MMX PG17 target — systemd user unit for reboot survival.
+#
+# Install (rendered by start-pg17.sh --install-unit, which substitutes
+# __MMX_MIGRATE_DIR__ with this repo's scripts/mmx-migrate/ path):
+#
+#   bash scripts/mmx-migrate/start-pg17.sh --install-unit
+#   systemctl --user enable --now multica-pg17-mmx.service
+#
+# The unit deliberately never touches multica-main or the lane services.
+[Unit]
+Description=MMX PG17 target — multica-pg17-mmx (loopback, data-only migration)
+Documentation=docs/mmx-migrate.md
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/bash __MMX_MIGRATE_DIR__/start-pg17.sh
+ExecStop=/usr/bin/podman stop multica-pg17-mmx
+TimeoutStartSec=120
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
