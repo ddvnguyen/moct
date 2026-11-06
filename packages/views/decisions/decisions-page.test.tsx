@@ -426,7 +426,9 @@ describe("DecisionsPage", () => {
     renderPage();
     await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(3));
     fireEvent.click(screen.getByRole("tab", { name: /Answered/ }));
-    await waitFor(() => expect(screen.getByText("Postgres, please")).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByText("Postgres · Postgres, please")).toBeTruthy(),
+    );
     // Actor and time come with the stored answer, not just the text.
     expect(screen.getByText("Ada Lovelace")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Answer" })).toBeNull();
@@ -435,6 +437,77 @@ describe("DecisionsPage", () => {
         "Recorded answers are read-only. A new request arrives as its own row.",
       ),
     ).toBeTruthy();
+  });
+
+  describe("answered question display", () => {
+    // The stored answer is the list of option *indexes* the member picked, so an
+    // answered ask has to resolve them against the questions it asked (M-241).
+    function showAnswer(detail: Record<string, unknown>) {
+      apiMock.getDecisionDetail.mockImplementation(async () => ({
+        ...DETAILS["question:card-1"],
+        status: "answered",
+        answered_by: "member-1",
+        answered_at: "2026-11-03T12:00:00Z",
+        ...detail,
+      }));
+    }
+
+    async function openAnswered() {
+      const view = renderPage();
+      await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(3));
+      fireEvent.click(screen.getByRole("tab", { name: /Answered/ }));
+      await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(1));
+      await waitFor(() =>
+        expect(within(view.detail()).getByText("Which store?")).toBeTruthy(),
+      );
+      return view;
+    }
+
+    it("renders the chosen option label, never its index", async () => {
+      showAnswer({ answers: [{ selected: [1], text: "" }] });
+      const view = await openAnswered();
+      expect(within(view.detail()).getByText("SQLite")).toBeTruthy();
+      expect(within(view.detail()).queryByText("1.2")).toBeNull();
+    });
+
+    it("comma-joins every label of a multiple answer", async () => {
+      showAnswer({
+        questions: [
+          {
+            prompt: "Which store?",
+            multiple: true,
+            options: [
+              { label: "Postgres" },
+              { label: "SQLite" },
+              { label: "Mongo" },
+            ],
+          },
+        ],
+        answers: [{ selected: [0, 2], text: "" }],
+      });
+      const view = await openAnswered();
+      expect(within(view.detail()).getByText("Postgres, Mongo")).toBeTruthy();
+    });
+
+    it("shows a written answer on its own", async () => {
+      showAnswer({ answers: [{ selected: [], text: "A managed replica" }] });
+      const view = await openAnswered();
+      expect(within(view.detail()).getByText("A managed replica")).toBeTruthy();
+      expect(within(view.detail()).queryByText("No answer")).toBeNull();
+    });
+
+    it("drops an out-of-range option index instead of rendering it", async () => {
+      showAnswer({ answers: [{ selected: [7], text: "" }] });
+      const view = await openAnswered();
+      expect(within(view.detail()).getByText("No answer")).toBeTruthy();
+      expect(within(view.detail()).queryByText("1.8")).toBeNull();
+    });
+
+    it("keeps the valid labels of an answer that also names a stale option", async () => {
+      showAnswer({ answers: [{ selected: [0, 7], text: "" }] });
+      const view = await openAnswered();
+      expect(within(view.detail()).getByText("Postgres")).toBeTruthy();
+    });
   });
 
   it("answers a native ask through the parked turn, and shows its receipt", async () => {

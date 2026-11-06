@@ -197,7 +197,7 @@ function SourceBody({
       if (state === "answered" || !isDecisionAnswerable("question")) {
         return (
           <StoredAnswers
-            questions={parsed.questions.map((question) => question.question)}
+            questions={parsed.questions}
             answers={parsed.answers}
             actor={actorLabel(parsed.answeredBy)}
             at={parsed.answeredAt}
@@ -476,7 +476,7 @@ function StoredAnswers({
   at,
   hint,
 }: {
-  questions: readonly string[];
+  questions: readonly AgentQuestion[];
   answers: readonly AgentAnswerDraft[];
   actor: string | null;
   at: string | null;
@@ -506,19 +506,29 @@ function StoredAnswers({
       <ol className="space-y-2">
         {questions.map((question, index) => {
           const answer = answers[index];
+          // The stored answer is the option *indexes* the member picked, so the
+          // labels come from the questions this card asked (`1.1` means nothing
+          // to the reader; "Alpha" is the answer they gave). An index the card
+          // no longer holds is dropped rather than rendered as a number.
+          const picked = (answer?.selected ?? []).flatMap((option) => {
+            const label = question.options[option]?.label;
+            return label === undefined ? [] : [label];
+          });
           const written = answer?.text?.trim() ?? "";
-          const picks = (answer?.selected ?? [])
-            .map((option) => `${index + 1}.${option + 1}`)
-            .join(", ");
           return (
-            <li key={`${index}:${question}`} className="rounded-md border px-3 py-2">
-              <p className="text-caption text-muted-foreground">{question}</p>
+            <li
+              key={`${index}:${question.question}`}
+              className="rounded-md border px-3 py-2"
+            >
+              <p className="text-caption text-muted-foreground">
+                {question.question}
+              </p>
               <p className="mt-0.5 whitespace-pre-wrap text-body text-foreground">
-                {written !== ""
-                  ? written
-                  : picks !== ""
-                    ? picks
-                    : t(($) => $.detail.no_answer)}
+                {picked.length === 0 && written === ""
+                  ? t(($) => $.detail.no_answer)
+                  : [picked.join(", "), written]
+                      .filter((part) => part !== "")
+                      .join(" · ")}
               </p>
             </li>
           );
