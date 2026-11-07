@@ -334,6 +334,8 @@ WITH victims AS (
   FROM agent_task_queue task
   JOIN agent_runtime runtime ON runtime.id = task.runtime_id
   WHERE task.status IN ('dispatched', 'running', 'waiting_local_directory')
+    AND NOT (task.status = 'running' AND runtime.provider = 'dsh'
+      AND COALESCE(runtime.metadata -> 'capabilities' ? 'detached-runtime-v1', false))
     AND runtime.status = 'offline'
     AND COALESCE(runtime.last_seen_at, runtime.updated_at) <
         now() - make_interval(secs => @reconnect_grace_secs::double precision)

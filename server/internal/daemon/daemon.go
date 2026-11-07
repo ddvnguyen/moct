@@ -5390,7 +5390,27 @@ func (d *Daemon) restartTargetBinary() (string, error) {
 		d.logger.Warn("brew install detected but prefix could not be resolved; restart may fail",
 			"executable", newBin)
 	}
-	return cli.StableExecutablePath(newBin, d.brewPrefix, d.brewInstall), nil
+	target := cli.StableExecutablePath(newBin, d.brewPrefix, d.brewInstall)
+	invocationName := ""
+	if len(os.Args) > 0 {
+		invocationName = filepath.Base(os.Args[0])
+	}
+	targetName := strings.TrimSuffix(filepath.Base(target), " (deleted)")
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) && len(os.Args) > 0 && filepath.IsAbs(os.Args[0]) && invocationName == targetName {
+		// On Linux, os.Executable reports the physical release path. A deploy
+		// may prune that release while this daemon is still running, even though
+		// argv[0] retains the stable `current` path used to launch it. Resolve
+		// that invocation path only when the physical target is gone; other
+		// filesystem errors must not silently switch restart targets.
+		if invocationPath, resolveErr := filepath.EvalSymlinks(os.Args[0]); resolveErr == nil {
+			if info, statErr := os.Stat(invocationPath); statErr == nil && info.Mode().IsRegular() {
+				d.logger.Info("daemon executable release is missing; using invocation path for restart",
+					"missing_binary", target, "invocation_binary", invocationPath)
+				return invocationPath, nil
+			}
+		}
+	}
+	return target, nil
 }
 
 // pollLoop runs the machine-level batch claim poller (MUL-4257): a single
@@ -5802,6 +5822,31 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 	return cancelled
 }
 
+type detachedShutdownKey struct{}
+
+type detachedShutdownState struct {
+	root      context.Context
+	started   atomic.Bool
+	cancelled <-chan struct{}
+}
+
+func (s *detachedShutdownState) preserve() bool {
+	if s == nil || !s.started.Load() || s.root.Err() == nil {
+		return false
+	}
+	select {
+	case <-s.cancelled:
+		return false
+	default:
+		return true
+	}
+}
+
+func detachedShutdownFromContext(ctx context.Context) *detachedShutdownState {
+	s, _ := ctx.Value(detachedShutdownKey{}).(*detachedShutdownState)
+	return s
+}
+
 func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	d.mu.Lock()
 	rt, tracked := d.runtimeIndex[task.RuntimeID]
@@ -5918,6 +5963,8 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		pollInterval = 5 * time.Second
 	}
 	cancelledByPoll := d.watchTaskCancellation(runCtx, task.ID, pollInterval, taskLog)
+	detachedState := &detachedShutdownState{root: ctx, cancelled: cancelledByPoll}
+	runCtx = context.WithValue(runCtx, detachedShutdownKey{}, detachedState)
 	go func() {
 		select {
 		case <-cancelledByPoll:
@@ -5927,6 +5974,10 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}()
 
 	result, err := d.runner.run(runCtx, task, provider, slot, taskLog)
+	if detachedState.preserve() && errors.Is(err, context.Canceled) {
+		taskLog.Info("leaving detached task running for recovery after daemon shutdown")
+		return
+	}
 	if errors.Is(err, errStartClaimRejected) {
 		// The row belongs to another claim (or is terminal). A task-id-only
 		// failure callback from this stale delivery could kill its new owner.
@@ -6025,7 +6076,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		return
 	}
 
-	// Only the parent (daemon) context identifies shutdown. A cancelled agent
+// Only the parent (daemon) context identifies shutdown. A cancelled agent
 	// with a live parent remains a deliberate cancellation; server terminal
 	// states and poll cancellation have already taken precedence above.
 	// Infrastructure interruptions carry a diagnostic, matching server-side orphan
@@ -6035,7 +6086,10 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		result.Comment = "daemon shut down while task was in flight"
 	}
 
-	d.reportTaskResult(ctx, task.ID, result, taskLog)
+	d.reportTaskResult(runCtx, task.ID, result, taskLog)
+	if result.Status == "cancelled" && detachedState.preserve() {
+		return
+	}
 
 	// Write GC metadata after the task finishes so the periodic GC loop
 	// can look up the parent record (issue / chat session / autopilot run /
@@ -6453,6 +6507,10 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		// user's successful output must remain authoritative in both cases.
 		taskLog.Error("complete task callback not acknowledged; durable report remains queued", "error", err)
 	default:
+		if result.Status == "cancelled" && detachedShutdownFromContext(ctx).preserve() {
+			taskLog.Info("leaving detached task running for recovery after daemon shutdown")
+			return
+		}
 		failureReason := result.FailureReason
 		if failureReason == "" {
 			if result.Status == "cancelled" {
@@ -7966,6 +8024,10 @@ func qualifyTaskModel(
 }
 
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot int, taskLog *slog.Logger) (taskResult TaskResult, returnErr error) {
+	detachedState := detachedShutdownFromContext(ctx)
+	preservingDetached := func() bool {
+		return detachedState.preserve() && (taskResult.Status == "cancelled" || errors.Is(returnErr, context.Canceled))
+	}
 	phaseRecorder := taskPhaseRecorderFromContext(ctx)
 	phaseRecorder.Mark(taskPhasePrepareStarted)
 	// A claim carries the task-row agent id both at the top level and inside
@@ -8639,6 +8701,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// duplicating the same path under two lifecycle meanings.
 	if env.LocalWorktree != nil {
 		defer func() {
+			if preservingDetached() {
+				return
+			}
 			if taskResult.WorkDir == "" {
 				taskResult.WorkDir = env.WorkDir
 			}
@@ -8712,6 +8777,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// in place, leave them behind in the user's tree.
 	if env.LocalDirectory || env.LocalWorktree != nil {
 		defer func() {
+			if preservingDetached() {
+				return
+			}
 			if taskResult.FailureReason == taskfailure.ReasonProcessCleanupUnconfirmed.String() {
 				return // Preserve files that an unconfirmed process may still use.
 			}
@@ -8765,6 +8833,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// fails here leaves the .task_lock marker intact — without it the next
 		// sweep could not tell this directory from a pre-lock leftover.
 		execenv.ReleaseTaskTempLock(taskTempLock)
+		if preservingDetached() {
+			return
+		}
 		if cerr := execenv.RemoveTaskTempDir(taskTempDir); cerr != nil {
 			taskLog.Warn("task temp dir cleanup failed", "path", taskTempDir, "error", cerr)
 		}
@@ -8797,6 +8868,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err != nil {
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
+	}
+	if provider == "dsh" && agent.DshDetachedAvailable() {
+		if err := d.client.PinTaskSession(prepareCtx, task.ID, "", env.WorkDir); err != nil {
+			stopPrepareLease()
+			return TaskResult{}, fmt.Errorf("pin detached task workdir: %w", err)
+		}
 	}
 	if taskSupplementNegotiated {
 		// Register before provider launch so a hint cannot arrive in the gap
@@ -9333,6 +9410,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		OpenclawModelOverride:  openclawModelOverride,
 		ClaudeSettingsPath:     env.ClaudeSettingsPath,
 		QwenpawWorkspace:       env.QwenpawWorkspace,
+	}
+	if detachedState != nil {
+		execOpts.DetachedStarted = func() { detachedState.started.Store(true) }
+		execOpts.PreserveDetached = detachedState.preserve
 	}
 	// Some providers do not reliably load the per-task runtime config files we
 	// write into the task workdir:

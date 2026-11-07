@@ -1,38 +1,46 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { projectResourcesOptions } from "../fork";
+import { PanelRight, PanelRightClose, projectResourcesOptions } from "../fork";
 import { hostShell, type ShellBridge } from "./shell-runtime";
 import {
-  FILES_TAB_KIND,
-  TERMINAL_TAB_KIND,
   boundSessionId,
+  describe,
   disabledTooltip,
   folderForSelection,
-  isNoSessionSurfaceError,
   folderOfProjectResources,
-  NO_SESSION_SURFACE_NOTE,
-  planSidebarOpen,
+  isNoSessionSurfaceError,
+  noSessionSurfaceError,
+  panelToggleTitle,
+  planSidebarToggle,
   sessionSurfaceMounted,
+  waitForMountedSession,
   workspaceForFolder,
-  describe,
-  type OpenIntent,
   type SidebarRightLike,
 } from "./shell-link";
 
 /**
- * The header's right slot buttons (M-159): **Files** and **Terminal** open the
- * dsh right sidebar beside MMX, and a sidebar toggle sits last.
+ * The header's side-panel toggle (M-159): the dsh right Sidebar, opened from
+ * MMX the way dsh's own session header opens it.
  *
- * The folder they address is the selected project's `local_directory`
- * resource; "All projects" addresses the host's `workspaceFolder`, which is
- * empty on many hosts. Nothing to address, or no dsh Workspace + Session to
- * open a tab under, disables the pair with a tooltip saying what is missing.
- * The bridge carries the dsh faces; the copy says "Project" for Multica and
- * "folder" for the path.
+ * It is one icon button, not a control per sidebar view: the column owns its
+ * tabs, its Start guide and its collapse, exactly as it does beside a
+ * Conversation, so MMX has nothing to name beyond "show it". The folder it
+ * addresses is the selected project's `local_directory` resource; "All
+ * projects" addresses the host's `workspaceFolder`, which is empty on many
+ * hosts. No folder means the button is disabled with the copy that says what
+ * is missing.
  *
- * Buttons render only when `apply` installed a bridge — the one host fact
- * this island cannot know without the shell, so their absence is exactly the
- * "no right sidebar" case.
+ * A press either flips the column on screen (`toggle`), names the project's
+ * Session for the column that is drawn beside MMX (`retarget`), or, when no
+ * Session is on screen to draw it for, brings the folder's Session on screen
+ * first (`reveal`). Card C's `hostPanel` opt-in — installed in `apply` — is what
+ * lets the first two keep MMX where it is; a host without it has to reveal the
+ * Session, which is the only place its Sidebar can be drawn.
+ *
+ * The button renders only when `apply` installed a bridge — the one host fact
+ * this island cannot know without the shell, so its absence is exactly the
+ * "no right sidebar" case. A failed press stays in the tooltip rather than in
+ * the header: shell state is not a page error, and the header is a strip.
  */
 export function ShellButtons({
   workspaceId,
@@ -47,7 +55,7 @@ export function ShellButtons({
 }) {
   const shell = hostShell();
   if (shell === null || shell.sidebarRight === null) return null;
-  return <ShellButtonsInner
+  return <SidePanelToggle
     shell={shell}
     workspaceId={workspaceId}
     projects={projects}
@@ -56,7 +64,40 @@ export function ShellButtons({
   />;
 }
 
-function ShellButtonsInner({
+/**
+ * The name last given to the hosted column, released when a press replaces it.
+ *
+ * Page-lifetime, like the rest of this bridge: one name is in force at a time,
+ * and a press on another project's folder must withdraw the old one rather
+ * than leave the column on the workspace it no longer edits.
+ */
+let releaseHostedSession: (() => void) | null = null;
+
+/**
+ * Tell the hosted column which Session's folder it edits.
+ *
+ * @param sidebarRight - the face that names the column's Session.
+ * @param sessionId - the Session bound to the project's folder.
+ */
+function nameHostedSession(sidebarRight: SidebarRightLike, sessionId: string): void {
+  const name = sidebarRight.selectHostedSession;
+  if (typeof name !== "function") {
+    throw new Error("this dsh build cannot retarget the side panel");
+  }
+  releaseHostedSession?.();
+  releaseHostedSession = name.call(sidebarRight, sessionId);
+}
+
+/** The Sidebar's shown state, read tolerantly: a face without it reads closed. */
+function readExpanded(sidebarRight: SidebarRightLike | null): boolean {
+  try {
+    return sidebarRight?.isExpanded() ?? false;
+  } catch {
+    return false;
+  }
+}
+
+function SidePanelToggle({
   shell,
   workspaceId,
   projects,
@@ -69,13 +110,18 @@ function ShellButtonsInner({
   projectId: string | null;
   workspaceFolder: string;
 }) {
-  const mountedSessionId = useMemo(() => {
-    try {
-      return shell.sidebarRight?.mounted.getSnapshot();
-    } catch {
-      return undefined;
-    }
-  }, [shell.sidebarRight]);
+  const sidebarRight = shell.sidebarRight;
+
+  // The pressed state follows the controller, not this button: the reader can
+  // collapse the column from its own header too. Card C publishes `expanded`
+  // as a subscribable; without it the button tracks its own presses only.
+  const [expanded, setExpanded] = useState<boolean>(() => readExpanded(sidebarRight));
+  useEffect(() => {
+    const observable = sidebarRight?.expanded;
+    if (observable === undefined) return;
+    setExpanded(observable.getSnapshot());
+    return observable.subscribe(() => setExpanded(observable.getSnapshot()));
+  }, [sidebarRight]);
 
   // The selected project's resources share the pages' query key, so this adds
   // no request of its own once any project surface has loaded the list.
@@ -95,41 +141,71 @@ function ShellButtonsInner({
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
 
-  async function ensureThenOpen(tabKind: string): Promise<void> {
-    const { sidebarRight, workspaces, sessions } = shell;
+  async function onToggle(): Promise<void> {
+    const { workspaces, sessions } = shell;
     if (sidebarRight === null) return;
     const folder = resolved.folder;
-    if (folder === null) {
-      setNote(disabledTooltip(resolved.reason, folder));
+    if (folder === null || workspaces === null || sessions === null) return;
+    // A press on an open column closes it where it is. Retargeting first would
+    // swap the Session under a column the reader is closing.
+    if (readExpanded(sidebarRight)) {
+      sidebarRight.toggleExpanded();
+      setExpanded(false);
+      setNote(null);
       return;
     }
-    if (workspaces === null || sessions === null) return;
     setBusy(true);
     try {
       // Match or create (never delete): dsh Workspace registration is
-      // idempotent on the path, so a repeated click converges.
+      // idempotent on the path, so a repeated press converges.
       let workspace = workspaceForFolder(workspaces.list.getSnapshot().items, folder);
       if (workspace === null) {
         workspace = await workspaces.create({ path: folder });
       }
-      let sessionId = boundSessionId(mountedSessionId, workspace);
-      if (sessionId === null) {
+      const intent = planSidebarToggle({
+        hasHostPanel: typeof sidebarRight.hostPanel === "function",
+        canNameSession: typeof sidebarRight.selectHostedSession === "function",
+        mountedSessionId: sidebarRight.mounted.getSnapshot(),
+        boundSessionId: boundSessionId(sidebarRight.mounted.getSnapshot(), workspace),
+      });
+      if (intent.kind === "toggle") {
+        sidebarRight.toggleExpanded();
+        setExpanded(readExpanded(sidebarRight));
+        setNote(null);
+        return;
+      }
+      let sessionId = intent.sessionId;
+      if (sessionId === null || sessionId === "") {
         sessionId = await sessions.create({ workspaceId: workspace.workspaceId });
       }
-      open(
-        shell,
-        sidebarRight,
-        planSidebarOpen({
-          hasHostPanel: typeof sidebarRight.hostPanel === "function",
-          boundSessionId: sessionId,
-          mountedSessionId,
-          tabKind,
-        }),
-      );
+      if (intent.kind === "retarget") {
+        // The column is drawn beside MMX: name the project's Session so Files
+        // and Terminal open on that folder, and flip the column in place. MMX
+        // keeps the main column, so the board never leaves the screen.
+        nameHostedSession(sidebarRight, sessionId);
+        if (!sessionSurfaceMounted(sidebarRight)) throw noSessionSurfaceError();
+        if (!readExpanded(sidebarRight)) sidebarRight.toggleExpanded();
+        setExpanded(readExpanded(sidebarRight));
+        setNote(null);
+        return;
+      }
+      // No Session on screen to draw the column for: bind the folder's own and
+      // reveal it. Selecting is the shell's navigation, and it puts that
+      // Session's Conversation in the main column, which is where a host
+      // without card C draws the Sidebar.
+      if (shell.selectSession === null) {
+        throw new Error(`this dsh build cannot select a session, so the side panel cannot open on ${folder}`);
+      }
+      shell.selectSession(sessionId);
+      if (!(await waitForMountedSession(sidebarRight, sessionId))) {
+        // The shell never drew the Session: the same state the face's own write
+        // rejects, so it reads with the same copy.
+        throw noSessionSurfaceError();
+      }
+      if (!readExpanded(sidebarRight)) sidebarRight.toggleExpanded();
+      setExpanded(readExpanded(sidebarRight));
       setNote(null);
     } catch (cause: unknown) {
-      // The M-159 no-session throw is a shell state, not a crash: say why like
-      // the disabled buttons do instead of erroring the page.
       setNote(
         isNoSessionSurfaceError(cause)
           ? describe("no-session")
@@ -142,124 +218,32 @@ function ShellButtonsInner({
     }
   }
 
-  const disabled = resolved.folder === null || busy;
+  const folder = resolved.folder;
+  const disabled = folder === null || busy;
   const title = disabled
-    ? disabledTooltip(resolved.reason, resolved.folder)
-    : `Files and Terminal open the dsh sidebar on ${resolved.folder}`;
+    ? disabledTooltip(resolved.reason, folder)
+    : panelToggleTitle(expanded, folder);
+  const glyph = expanded
+    ? <PanelRightClose className="size-4" />
+    : <PanelRight className="size-4" />;
 
-  return (
-    <>
-      <button
-        type="button"
-        data-shell-button="files"
-        disabled={disabled}
-        title={title}
-        className={shellButtonClassName}
-        onClick={() => void ensureThenOpen(FILES_TAB_KIND)}
-      >
-        Files
-      </button>
-      <button
-        type="button"
-        data-shell-button="terminal"
-        disabled={disabled}
-        title={title}
-        className={shellButtonClassName}
-        onClick={() => void ensureThenOpen(TERMINAL_TAB_KIND)}
-      >
-        Terminal
-      </button>
-      <SidebarToggle sidebarRight={shell.sidebarRight} notify={setNote} />
-      {note !== null && (
-        // A failed open is a shell fact the reader should see, not a dialog.
-        <span data-shell-note="" className="text-caption text-muted-foreground">
-          {note}
-        </span>
-      )}
-    </>
-  );
-}
-
-function SidebarToggle({
-  sidebarRight,
-  notify,
-}: {
-  sidebarRight: SidebarRightLike | null;
-  notify: (note: string) => void;
-}) {
-  const [expanded, setExpanded] = useState<boolean>(() => {
-    try {
-      return sidebarRight?.isExpanded() ?? false;
-    } catch {
-      return false;
-    }
-  });
-  if (sidebarRight === null) return null;
-  // The same no-session knowledge the disabled-tooltip logic already has: the
-  // face throws for every access while no session surface is mounted, so the
-  // toggle reads as a disabled button (with the explanatory title) there —
-  // MMX owning the main column is the situation it explains.
-  const surfaceMounted = sessionSurfaceMounted(sidebarRight);
-  const title = surfaceMounted
-    ? expanded
-      ? "Hide the dsh sidebar"
-      : "Show the dsh sidebar"
-    : NO_SESSION_SURFACE_NOTE;
   return (
     <button
       type="button"
       data-shell-button="toggle"
-      disabled={!surfaceMounted}
-      title={title}
-      className={shellButtonClassName}
-      onClick={() => {
-        try {
-          sidebarRight.toggleExpanded();
-          // The face has no expanded observable; the toggler's own click is
-          // the state change, and the next mount reconciles via `isExpanded()`.
-          setExpanded((current) => !current);
-        } catch (cause) {
-          if (isNoSessionSurfaceError(cause)) {
-            notify(describe("no-session"));
-            return;
-          }
-          // Anything else is a real failure: state may not have changed, so
-          // leave the optimistic flip alone and surface it like the opens do.
-          notify(cause instanceof Error ? cause.message : String(cause));
-        }
-      }}
+      data-shell-note={note ?? undefined}
+      aria-label={note ?? title}
+      aria-pressed={expanded}
+      disabled={disabled}
+      title={note ?? title}
+      className={panelButtonClassName}
+      onClick={() => void onToggle()}
     >
-      {surfaceMounted && expanded ? "Collapse" : "Expand"}
+      {glyph}
     </button>
   );
 }
 
-function open(
-  shell: ShellBridge,
-  sidebarRight: SidebarRightLike,
-  intent: OpenIntent,
-): void {
-  if (intent.kind === "fallback" && intent.selectFirst) {
-    // Without card C's `hostPanel` the sidebar only exists while the
-    // Conversation owns the main column; the island's tabs survive the drop
-    // through keep-alive.
-    shell.selectPanel?.(null);
-  }
-  if (intent.kind === "openTab") {
-    if (intent.sessionId !== undefined && typeof sidebarRight.openTabIn === "function") {
-      sidebarRight.openTabIn(intent.sessionId, intent.tabKind);
-      return;
-    }
-    sidebarRight.openTab(intent.tabKind);
-    return;
-  }
-  if (typeof sidebarRight.openTabIn === "function" && intent.sessionId !== undefined) {
-    sidebarRight.openTabIn(intent.sessionId, intent.tabKind);
-    return;
-  }
-  sidebarRight.openTab(intent.tabKind);
-}
-
-const shellButtonClassName =
-  "h-7 shrink-0 rounded-md border border-border px-2 text-caption text-foreground " +
-  "disabled:cursor-not-allowed disabled:opacity-50";
+const panelButtonClassName =
+  "h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border text-foreground " +
+  "flex disabled:cursor-not-allowed disabled:opacity-50";

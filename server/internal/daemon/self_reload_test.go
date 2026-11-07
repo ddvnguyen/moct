@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,9 @@ func newSelfReloadTestDaemon(t *testing.T, runningVersion string) (*Daemon, *ato
 		isBrewInstall = origBrew
 	})
 	binary := filepath.Join(t.TempDir(), "multica")
+	if err := os.WriteFile(binary, []byte("test executable"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	resolveSelfExecutable = func() (string, error) { return binary, nil }
 	isBrewInstall = func() bool { return false }
 
@@ -86,6 +90,96 @@ func TestTrySelfReload_RestartsOnDowngrade(t *testing.T) {
 	if restartCalls.Load() != 1 {
 		t.Fatalf("triggerRestart fired %d times, want 1 (a downgrade is still a version change)", restartCalls.Load())
 	}
+}
+
+func TestTrySelfReload_UsesCurrentInvocationAfterReleaseWasPruned(t *testing.T) {
+	cases := []struct {
+		name          string
+		onDiskVersion string
+		wantRestart   bool
+	}{
+		{name: "new release", onDiskVersion: "0.3.8", wantRestart: true},
+		{name: "same release", onDiskVersion: "0.3.7", wantRestart: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, restartCalls := newSelfReloadTestDaemon(t, "0.3.7")
+			missingBinary := filepath.Join(t.TempDir(), "pruned-release", "bin", "multica")
+			resolveSelfExecutable = func() (string, error) { return missingBinary, nil }
+			wantBinary := setInvocationBinary(t)
+			originalDetect := detectSelfVersion
+			var probedBinary string
+			detectSelfVersion = func(_ context.Context, path string) (string, error) {
+				probedBinary = path
+				return tc.onDiskVersion, nil
+			}
+			t.Cleanup(func() { detectSelfVersion = originalDetect })
+
+			d.trySelfReload(context.Background())
+			if probedBinary != wantBinary {
+				t.Fatalf("version probe binary = %q, want resolved current invocation %q", probedBinary, wantBinary)
+			}
+
+			wantCalls := int32(0)
+			if tc.wantRestart {
+				wantCalls = 1
+				if got := d.RestartBinary(); got != wantBinary {
+					t.Fatalf("restart binary = %q, want resolved current invocation %q", got, wantBinary)
+				}
+			} else if d.RestartBinary() != "" {
+				t.Fatalf("restart binary = %q, want none for matching version", d.RestartBinary())
+			}
+			if got := restartCalls.Load(); got != wantCalls {
+				t.Fatalf("restart calls = %d, want %d", got, wantCalls)
+			}
+		})
+	}
+}
+
+func TestRestartTargetBinaryDoesNotFallbackOnOtherStatErrors(t *testing.T) {
+	d, _ := newSelfReloadTestDaemon(t, "0.3.7")
+	loop := filepath.Join(t.TempDir(), "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Skipf("symlink setup unavailable: %v", err)
+	}
+	resolveSelfExecutable = func() (string, error) { return loop, nil }
+	setInvocationBinary(t)
+
+	got, err := d.restartTargetBinary()
+	if err != nil {
+		t.Fatalf("restartTargetBinary() error = %v", err)
+	}
+	if got != loop {
+		t.Fatalf("restart target = %q, want original target %q after a non-ENOENT stat error", got, loop)
+	}
+}
+
+func setInvocationBinary(t *testing.T) string {
+	t.Helper()
+	oldArgv0 := os.Args[0]
+	t.Cleanup(func() { os.Args[0] = oldArgv0 })
+
+	root := t.TempDir()
+	releaseBinary := filepath.Join(root, "releases", "new", "bin", "multica")
+	if err := os.MkdirAll(filepath.Dir(releaseBinary), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(releaseBinary, []byte("test executable"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	currentBinary := filepath.Join(root, "current", "bin", "multica")
+	if err := os.MkdirAll(filepath.Dir(currentBinary), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(releaseBinary, currentBinary); err != nil {
+		t.Fatal(err)
+	}
+	os.Args[0] = currentBinary
+	resolved, err := filepath.EvalSymlinks(currentBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
 }
 
 // TestTrySelfReload_ProbeFailureIsNotAVersionChange is the review's third
@@ -174,6 +268,9 @@ func TestTrySelfReload_DefersWhileBusy(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			d, restartCalls := newSelfReloadTestDaemon(t, "0.3.7")
+			missingBinary := filepath.Join(t.TempDir(), "pruned-release", "bin", "multica")
+			resolveSelfExecutable = func() (string, error) { return missingBinary, nil }
+			setInvocationBinary(t)
 			probes := stubSelfVersion(t, "0.3.8", nil)
 			tc.setup(d)
 

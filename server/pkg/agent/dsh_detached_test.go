@@ -305,3 +305,44 @@ func TestDshDetachedRunDirKeepsArtifacts(t *testing.T) {
 		}
 	}
 }
+
+func TestDshDetachedShutdownLeavesChildRunning(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("detached runs are Linux only")
+	}
+	dir := writeFakeSystemdRun(t, "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n")
+	marker := filepath.Join(dir, "stopped")
+	writeTestExecutable(t, filepath.Join(dir, "systemctl"), []byte("#!/bin/sh\ntouch '"+marker+"'\n"))
+	t.Setenv("PATH", dir+":/usr/bin:/bin")
+	t.Setenv("MULTICA_DETACHED_RUNTIME", "1")
+	bin := writeDshFixture(t, `
+IFS= read -r execute
+sleep 4
+printf '%s\n' '{"v":1,"type":"ready","runtime":"dsh","protocol_version":1}'
+printf '%s\n' '{"v":1,"type":"result","request_id":"task-shutdown","status":"completed","output":"done"}'
+`)
+	b, err := New("dsh", Config{ExecutablePath: bin, TaskID: "task-shutdown", Logger: slog.Default()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := false
+	s, err := b.Execute(ctx, "hello", ExecOptions{Cwd: t.TempDir(), DetachedStarted: func() { started = true }, PreserveDetached: func() bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatal("detached launch was not recorded")
+	}
+	cancel()
+	for range s.Messages {
+	}
+	result := <-s.Result
+	if result.Status != "completed" {
+		t.Fatalf("child did not finish: %+v", result)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("scope was stopped: %v", err)
+	}
+}

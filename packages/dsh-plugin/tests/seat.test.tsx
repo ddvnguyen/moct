@@ -102,9 +102,18 @@ describe("client apply", () => {
 
     // `layout` is dsh's own ui-layout service: the rail follows the active tab
     // and the sidebar collapses through it (M-197). `sidebarRight`, `workspaces`
-    // and `sessions` feed the Files/Terminal bridge (M-159); each is read
-    // tolerantly in `apply`.
-    expect(inject).toEqual(["slots", "layout", "sidebarRight", "workspaces", "sessions"]);
+    // and `sessions` feed the side-panel bridge (M-159); each is read tolerantly
+    // in `apply`. `uiWorkspace` is injected as well: `ctx.get()` answers
+    // undefined for a service the module did not declare, which is what made the
+    // toggle believe the build could not select a session.
+    expect(inject).toEqual([
+      "slots",
+      "layout",
+      "sidebarRight",
+      "workspaces",
+      "sessions",
+      "uiWorkspace",
+    ]);
     // Two contributions per entry, and each waits for its own slot. The
     // composer takeover (M-136) is the one contribution that is not a rail
     // row, so it registers first and once.

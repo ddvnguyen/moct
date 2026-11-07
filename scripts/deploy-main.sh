@@ -55,7 +55,7 @@ SWITCH_STARTED=0
 ROLLBACK_ACTIVE=0
 DAEMON_WAS_STOPPED=0
 
-for cmd in awk cat chmod cp date df grep install jq mkdir mktemp multica mv podman ps rm seq sleep systemctl; do
+for cmd in awk cat chmod cp date df find grep install jq mkdir mktemp multica mv podman ps rm seq sleep systemctl; do
   command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
 done
 command -v curl >/dev/null 2>&1 || die "required command not found: curl"
@@ -101,6 +101,31 @@ read_env_value() { # $1 = key; prints only a simple KEY=value from the stack env
 }
 free_kb() { df -Pk "$1" | awk 'NR==2 {print $4}'; }
 
+# Post-run housekeeping: empty the deploy runner's TMPDIR and report free
+# space per mount. Runs after success and after failure (from the rollback
+# trap). Refuses to empty TMPDIR when it is the workspace root itself or the
+# shared tmp root, which hold caches and scratch belonging to other processes.
+post_run() {
+  case "${TMPDIR:-}" in
+    "$WORKSPACE_ROOT" | "$WORKSPACE_ROOT"/tmp) ;;
+    *)
+      if [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ]; then
+        find "$TMPDIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+        log "emptied runner TMPDIR: $TMPDIR"
+      fi
+      ;;
+  esac
+  local path available
+  for path in "$CONTAINERS_ROOT" "$WORKSPACE_ROOT"; do
+    available="$(free_kb "$path" 2>/dev/null || true)"
+    if [[ "$available" =~ ^[0-9]+$ ]]; then
+      log "mount $path has $(awk -v kb="$available" 'BEGIN {printf "%.1f", kb / 1048576}') GiB free"
+    else
+      log "could not read free space for $path"
+    fi
+  done
+}
+
 [ -d "$STACK_DIR" ] || die "stack directory not found: $STACK_DIR"
 [ -f "$ENV_FILE" ] || die "stack environment file not found: $ENV_FILE"
 [ -x "$HOME/.local/bin/multica" ] || die "old daemon binary is missing at $HOME/.local/bin/multica"
@@ -125,7 +150,7 @@ for path in "$CONTAINERS_ROOT" "$WORKSPACE_ROOT"; do
   [ -d "$path" ] || die "required mount is missing: $path"
   available="$(free_kb "$path")"
   [[ "$available" =~ ^[0-9]+$ ]] || die "could not read free space for $path"
-  [ "$available" -ge "$MIN_FREE_KB" ] || die "$path has less than 10 GiB free"
+  [ "$available" -ge "$MIN_FREE_KB" ] || die "mount $path has only $((available / 1024 / 1024)) GiB free (needs 10 GiB)"
 done
 
 for image in "$BACKEND_IMAGE" "$WEB_IMAGE"; do
@@ -207,6 +232,7 @@ rollback() {
   elif [ "$DAEMON_WAS_STOPPED" = 1 ]; then
     systemctl --user start multica-daemon.service || log "FAILED to restart the daemon after pre-switch abort"
   fi
+  post_run || true
   exit "$rc"
 }
 trap rollback EXIT
@@ -284,6 +310,7 @@ done
 [ "$daemon_ok" = 1 ] || die "daemon status did not report version $IMAGE_TAG"
 
 trap - EXIT
+post_run
 log "deployment verified: commit=$EXPECTED_COMMIT version=$IMAGE_TAG; backup=$BACKUP_DIR"
 
 # Image retention (owner directive, 2026-11-04): keep only the two newest

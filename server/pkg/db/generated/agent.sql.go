@@ -3870,6 +3870,10 @@ WHERE (
    OR (
     status = 'running'
     AND started_at < now() - make_interval(secs => $4::double precision)
+    AND NOT EXISTS (
+      SELECT 1 FROM agent_runtime r WHERE r.id = agent_task_queue.runtime_id
+        AND r.provider = 'dsh' AND r.metadata -> 'capabilities' ? 'detached-runtime-v1'
+    )
     AND (
       runtime_id IS NULL
       OR NOT EXISTS (
@@ -3887,6 +3891,7 @@ WHERE (
     AND EXISTS (
       SELECT 1 FROM agent_runtime r
       WHERE r.id = agent_task_queue.runtime_id
+        AND r.provider = 'dsh'
         AND r.metadata -> 'capabilities' ? 'detached-runtime-v1'
         AND COALESCE(r.last_seen_at, r.updated_at) <
             now() - make_interval(secs => $3::double precision)
@@ -3946,9 +3951,9 @@ type FailStaleTasksParams struct {
 // a detached-capable runtime whose heartbeat is stale (older than the
 // reconnect grace, same predicate as the legacy running branch): a live
 // runtime's tasks are never failed by it, however long a healthy run takes.
-// Known gap until re-attach lands (S3 card G): a daemon that restarts and keeps
-// heartbeating leaves its orphaned detached row 'running' (this branch needs a
-// stale heartbeat), so MULTICA_DETACHED_RUNTIME stays off until then.
+// A restarted daemon watches and reports recoverable detached runs. A skipped
+// run remains running while its daemon heartbeats; this bound requires a stale
+// heartbeat and therefore cannot recover an unreadable run on a live daemon.
 // @detached_timeout_secs <= 0 disables the branch.
 func (q *Queries) FailStaleTasks(ctx context.Context, arg FailStaleTasksParams) ([]AgentTaskQueue, error) {
 	rows, err := q.db.Query(ctx, failStaleTasks,

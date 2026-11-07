@@ -38,6 +38,31 @@ unit_release() { # release path the installed backend unit runs, or nothing
     | sed -n 's|^ExecStart=\(.*\)/bin/server$|\1|p' | head -1
 }
 
+prune_releases() {
+  local keep="$AUTODEPLOY_KEEP_RELEASES" current daemon_pid daemon_exe daemon_release proc_root
+  current="$(readlink -f "$LANE_ROOT/multica-be/current" 2>/dev/null || true)"
+  daemon_release=""
+  proc_root="${MULTICA_LANE_PROC_ROOT:-/proc}"
+  daemon_pid="$(systemctl --user show --property=MainPID --value "$MULTICA_DAEMON_Z_UNIT" 2>/dev/null || true)"
+  if [[ "$daemon_pid" =~ ^[0-9]+$ ]] && [ "$daemon_pid" -gt 1 ] && [ -r "$proc_root/$daemon_pid/exe" ]; then
+    daemon_exe="$(readlink "$proc_root/$daemon_pid/exe" 2>/dev/null || true)"
+    daemon_exe="${daemon_exe% (deleted)}"
+    case "$daemon_exe" in
+      "$LANE_ROOT"/multica-be/releases/*/bin/multica)
+        daemon_release="${daemon_exe%/bin/multica}"
+        ;;
+    esac
+  fi
+
+  # shellcheck disable=SC2012
+  ls -1dt "$LANE_ROOT"/multica-be/releases/*/ 2>/dev/null | tail -n "+$((keep + 1))" | while read -r dir; do
+    [ "$(readlink -f "$dir")" = "$current" ] && continue
+    [ "$(readlink -f "$dir")" = "$daemon_release" ] && continue
+    log "pruning old release $(basename "$dir")"
+    rm -rf "$dir"
+  done
+}
+
 # A release built by CI and one built by deploy/dsh-z/deploy.sh stamp the same
 # commit differently: the Makefile uses `git rev-parse --short HEAD` (7 chars),
 # deploy.sh uses the full 40. Both identify the same build, so a health check

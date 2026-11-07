@@ -134,6 +134,10 @@ profile re-resolved against a store under `dsh-z/`.
   and rerun `deploy.sh`; it installs the profile with
   `dsh plugin --profile multica add` under the lane home, idempotently.
 
+## dsh-z and team-room
+
+dsh-z does not carry `@ddvnguyen/moct-dsh-team-room` (removed per M-201 Option A). That package overrode `storage-domain` to `routes: {agent_team: sqlite}`, and only its own `storage-sqlite` row registered the `sqlite` backend, so toggling it off stranded `storageDomain` and left `workspace`, `workspaceRegistry`, `sessionController` and the michengai endpoints waiting forever (404). The Agent Teams feature is unused on this lane; `agent_team.sqlite` (25 rows) is retained on disk for one week before deletion. `deploy/dsh-z/deploy.sh`, `deploy/dsh-z/dsh-z.env` and `scripts/lane-z/autodeploy.sh` do not re-add the package.
+
 ## Operations
 
 ```bash

@@ -21,7 +21,9 @@ printf '1 %s\n' "${PARENT_ARGS:-init}"
 EOF
 cat > "$STUB_BIN/df" <<'EOF'
 #!/usr/bin/env bash
-printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 20000000 1 20000000 1%% /fake\n'
+free_kb=20000000
+if [[ -n "${LOW_SPACE_PATH:-}" && "${LOW_SPACE_PATH}" == "$2" ]]; then free_kb="${LOW_FREE_KB:-10000000}"; fi
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fake 20000000 1 %s 1%% /fake\n' "$free_kb"
 EOF
 cat > "$STUB_BIN/podman" <<'EOF'
 #!/usr/bin/env bash
@@ -90,7 +92,7 @@ export MULTICA_MAIN_STACK_DIR="$STACK_DIR"
 export MULTICA_MAIN_WORKSPACE_ROOT="$WORKSPACE_ROOT"
 export MULTICA_MAIN_CONTAINERS_ROOT="$CONTAINERS_ROOT"
 export MULTICA_MAIN_BACKUP_ROOT="$WORKSPACE_ROOT/backups"
-export MULTICA_MAIN_TMPDIR="$WORKSPACE_ROOT/tmp"
+export MULTICA_MAIN_TMPDIR="$WORKSPACE_ROOT/tmp/multica-main-deploy"
 export MULTICA_MAIN_PROC_ROOT="$SANDBOX/proc"
 export STUB_LOG="$SANDBOX/commands.log"
 export IMAGE_TAG=test-deploy
@@ -178,5 +180,26 @@ PODMAN_IMAGES_LINES="$(printf '%s\n' \
 assert grep -q '^rmi:localhost/multica-web:drop-old$' "$STUB_LOG"
 assert grep -q '^rmi:localhost/multica-backend:drop-b-old$' "$STUB_LOG"
 assert test "$(grep -c '^rmi:' "$STUB_LOG")" -eq "$((before_rmis + 2))"
+# The successful deploy above rewrote MULTICA_IMAGE_TAG; restore it so later
+# failure-path assertions see the original stack state.
+printf 'MULTICA_IMAGE_TAG=old-tag\nPOSTGRES_DB=multica\nBACKEND_PORT=4802\nFRONTEND_PORT=4180\n' > "$STACK_DIR/.env"
+
+# A low-space preflight failure names the mount and its free GiB, for both
+# mounts, and leaves the stack untouched.
+err="$(LOW_SPACE_PATH="$WORKSPACE_ROOT" LOW_FREE_KB=9700000 run --dry-run 2>&1 || true)"
+[[ "$err" == *"mount $WORKSPACE_ROOT has only 9 GiB free (needs 10 GiB)"* ]]
+err="$(LOW_SPACE_PATH="$CONTAINERS_ROOT" LOW_FREE_KB=5242879 run --dry-run 2>&1 || true)"
+[[ "$err" == *"mount $CONTAINERS_ROOT has only 4 GiB free (needs 10 GiB)"* ]]
+assert grep -q '^MULTICA_IMAGE_TAG=old-tag$' "$STACK_DIR/.env"
+
+# A successful deploy empties the runner TMPDIR and reports free space per
+# mount after the run.
+mkdir -p "$MULTICA_MAIN_TMPDIR"
+printf 'stale\n' > "$MULTICA_MAIN_TMPDIR/stale.bin"
+output="$(run)"
+[[ "$output" == *"emptied runner TMPDIR: $MULTICA_MAIN_TMPDIR"* ]]
+[[ "$output" == *"mount $WORKSPACE_ROOT has "*' GiB free'* ]]
+[[ "$output" == *"mount $CONTAINERS_ROOT has "*' GiB free'* ]]
+assert test -z "$(ls -A "$MULTICA_MAIN_TMPDIR")"
 
 printf 'deploy-main stub tests passed\n'

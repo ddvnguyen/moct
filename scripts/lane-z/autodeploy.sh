@@ -287,17 +287,6 @@ report() { # $1 = green|red
   return 0
 }
 
-prune_releases() {
-  local keep="$AUTODEPLOY_KEEP_RELEASES" protected dir
-  protected="$(readlink -f "$LANE_ROOT/multica-be/current" 2>/dev/null || true)"
-  # shellcheck disable=SC2012
-  ls -1dt "$LANE_ROOT"/multica-be/releases/*/ 2>/dev/null | tail -n +"$((keep + 1))" | while read -r dir; do
-    [ "$(readlink -f "$dir")" = "$protected" ] && continue
-    log "pruning old release $(basename "$dir")"
-    rm -rf "$dir"
-  done
-}
-
 prune_backups() {
   find "$AUTODEPLOY_BACKUP_DIR" -maxdepth 1 -type f \
     \( -name 'multica_z-pre-*.dump' -o -name 'multica_z-pre-*-migrations-*.txt' \) \

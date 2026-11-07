@@ -127,6 +127,24 @@ tooltip; while the issue is still loading the name falls back to the URL's own
 segment, which the issue route rewrites to the identifier once it resolves.
 Every other tab keeps the name the fork resolves for it.
 
+### The dsh side panel
+
+The header carries one more control than the strip: dsh's own right-Sidebar
+toggle, next to the tabs. It is the shell's column, not a Multica view — a press
+flips the panel dsh draws, with its own tabs, Start guide and collapse — and it
+addresses the selected project's `local_directory` resource ("All projects"
+uses the host's `workspaceFolder`). A project with no folder disables it with
+the copy that says what is missing.
+
+Which Session the column edits is the project's, not whatever the Conversation
+last selected: on a host that can host the column beside MMX (card C's
+`hostPanel` and `selectHostedSession`), a press names the folder's Session and
+flips the column in place, so the board never leaves the main column. A host
+without that opt-in puts the folder's Session on screen first and opens the
+column there, which is the only place its Sidebar can be drawn. An open column
+is closed where it is, and a press that cannot proceed reports why in the
+tooltip.
+
 ## Keeping the shell in step
 
 The rail and the strip are two views of one state, so the island tells the

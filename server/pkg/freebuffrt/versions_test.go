@@ -294,3 +294,24 @@ func TestCompareVersions(t *testing.T) {
 		}
 	}
 }
+
+// A bundle installed before commitSha was read has a manifest without a
+// commit. The listing and Version() still report it from build-info.json.
+func TestCommitFallsBackToBuildInfoWhenManifestHasNone(t *testing.T) {
+	const commit = "7807c228ed488496a7bc468aace868368fd605fa"
+
+	dst := t.TempDir()
+	dir := filepath.Join(dst, "versions", "0.0.196")
+	makeBundle(t, dir, BundleManifest{Version: "0.0.196"})
+	if err := os.WriteFile(filepath.Join(dir, "orchestrator", "build-info.json"), []byte(`{"commitSha":"`+commit+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := InstalledVersions(dst)
+	if len(got) != 1 || got[0].Version != "0.0.196" || got[0].Commit != commit {
+		t.Fatalf("installed versions = %+v", got)
+	}
+	if version, build := (Bundle{ResourcesDir: dir}).Version(); version != "0.0.196" || build != commit {
+		t.Fatalf("version/commit = %q/%q", version, build)
+	}
+}

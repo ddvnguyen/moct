@@ -65,15 +65,16 @@ func TestFailStaleTasksDetachedTimeoutIsBounded(t *testing.T) {
 
 			var previousMetadata *string
 			var previousLastSeen *time.Time
+			var previousProvider string
 			if err := testPool.QueryRow(ctx, `
-				SELECT metadata::text, last_seen_at FROM agent_runtime WHERE id = $1
-			`, runtimeID).Scan(&previousMetadata, &previousLastSeen); err != nil {
+				SELECT metadata::text, last_seen_at, provider FROM agent_runtime WHERE id = $1
+			`, runtimeID).Scan(&previousMetadata, &previousLastSeen, &previousProvider); err != nil {
 				t.Fatalf("load runtime state: %v", err)
 			}
 			t.Cleanup(func() {
 				_, _ = testPool.Exec(context.Background(), `
-					UPDATE agent_runtime SET metadata = $2::jsonb, last_seen_at = $3 WHERE id = $1
-				`, runtimeID, previousMetadata, previousLastSeen)
+					UPDATE agent_runtime SET metadata = $2::jsonb, last_seen_at = $3, provider = $4 WHERE id = $1
+				`, runtimeID, previousMetadata, previousLastSeen, previousProvider)
 			})
 
 			capabilities := `[]`
@@ -83,7 +84,7 @@ func TestFailStaleTasksDetachedTimeoutIsBounded(t *testing.T) {
 			if _, err := testPool.Exec(ctx, `
 				UPDATE agent_runtime
 				SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{capabilities}', $2::jsonb),
-				    last_seen_at = now() - $3::interval, status = 'online'
+				    last_seen_at = now() - $3::interval, status = 'online', provider = 'dsh'
 				WHERE id = $1
 			`, runtimeID, capabilities, tc.heartbeatAge); err != nil {
 				t.Fatalf("configure runtime: %v", err)
@@ -141,4 +142,56 @@ func TestDetachedTaskTimeoutFromEnv(t *testing.T) {
 			t.Errorf("detachedTaskTimeoutFromEnv(%q) = %v, want %v", tc.raw, got, tc.want)
 		}
 	}
+}
+
+func TestDetachedOfflineTaskUsesDetachedTimeout(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	issueID, agentID, taskID := setupSweeperTestFixture(t, "running")
+	defer cleanupSweeperFixture(t, issueID, agentID)
+	var runtimeID, provider, status string
+	var metadata *string
+	var lastSeen *time.Time
+	if err := testPool.QueryRow(ctx, `SELECT r.id, r.provider, r.status, r.metadata::text, r.last_seen_at FROM agent_runtime r JOIN agent a ON a.runtime_id=r.id WHERE a.id=$1`, agentID).Scan(&runtimeID, &provider, &status, &metadata, &lastSeen); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `UPDATE agent_runtime SET provider=$2,status=$3,metadata=$4::jsonb,last_seen_at=$5 WHERE id=$1`, runtimeID, provider, status, metadata, lastSeen)
+	})
+	if _, err := testPool.Exec(ctx, `UPDATE agent_runtime SET provider='dsh',status='offline',metadata=jsonb_set(COALESCE(metadata,'{}'::jsonb),'{capabilities}','["detached-runtime-v1"]'::jsonb),last_seen_at=now()-interval '1 hour' WHERE id=$1`, runtimeID); err != nil {
+		t.Fatal(err)
+	}
+	q := db.New(testPool)
+	failed, err := q.FailTasksForOfflineRuntimes(ctx, db.FailTasksForOfflineRuntimesParams{ReconnectGraceSecs: 600, MaxPerTick: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range failed {
+		if row.ID.Bytes == parseUUIDBytes(taskID) {
+			t.Fatal("offline sweeper failed detached task within bound")
+		}
+	}
+	params := db.FailStaleTasksParams{DispatchTimeoutSecs: 300, RunningTimeoutSecs: 3600, RuntimeStaleSecs: staleThresholdSeconds, RuntimeReconnectGraceSecs: 600, DetachedTimeoutSecs: 4 * 3600}
+	failed, err = q.FailStaleTasks(ctx, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range failed {
+		if row.ID.Bytes == parseUUIDBytes(taskID) {
+			t.Fatal("ordinary timeout failed detached task within bound")
+		}
+	}
+	params.DetachedTimeoutSecs = 2 * 3600
+	failed, err = q.FailStaleTasks(ctx, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range failed {
+		if row.ID.Bytes == parseUUIDBytes(taskID) {
+			return
+		}
+	}
+	t.Fatal("detached timeout did not fail the stale task")
 }
