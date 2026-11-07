@@ -264,3 +264,14 @@ func TestWatchDshDetachedRunMissingDir(t *testing.T) {
 		t.Fatal("want an error for a missing run dir")
 	}
 }
+
+func TestRecoverDshDetachedRunNonzeroOverridesResultFrame(t *testing.T) {
+	workDir, _ := writeDshDetachedRunDir(t, "task-r", recoverReadyFrame+recoverSessionFrame+recoverResultFrame, "boom", "2\n")
+	out, err := RecoverDshDetachedRun(workDir, "task-r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Finished || out.Result.Status != "failed" || !strings.Contains(out.Result.Error, "exit status 2") {
+		t.Fatalf("unexpected outcome: %+v", out)
+	}
+}

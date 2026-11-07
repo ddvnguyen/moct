@@ -642,9 +642,8 @@ func sweepStaleTasks(ctx context.Context, queries *db.Queries, taskSvc *service.
 		// exactly matches what sweepStaleRuntimes considers "not alive".
 		RuntimeStaleSecs:          staleThresholdSeconds,
 		RuntimeReconnectGraceSecs: reconnectGrace.Seconds(),
-		// S3-C (M-139): the detached-runtime backstop ignores the heartbeat,
-		// because a restarted daemon heartbeats while the orphaned row it can
-		// no longer observe keeps its status. Zero would disable it.
+		// The detached backstop applies only after heartbeat freshness expires.
+		// Zero disables this bound.
 		DetachedTimeoutSecs: detachedTaskTimeout.Seconds(),
 	})
 	if err != nil {

@@ -24,6 +24,10 @@ type Backend interface {
 
 // ExecOptions configures a single execution.
 type ExecOptions struct {
+	// DetachedStarted is called after a dsh scope launcher starts successfully.
+	DetachedStarted func()
+	// PreserveDetached reports whether cancellation is a daemon shutdown.
+	PreserveDetached func() bool
 	// EnableTaskSupplement installs provider hooks only for runs whose daemon/server
 	// capability handshake enabled additional messages.
 	EnableTaskSupplement bool

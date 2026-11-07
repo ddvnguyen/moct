@@ -138,6 +138,14 @@ func RecoverDshDetachedRun(workDir, taskID string) (DshDetachedOutcome, error) {
 func finishedDshDetachedResult(run *dshDetachedRun, taskID string, exitCode int) Result {
 	state := replayDshDetachedStdout(run.stdoutPath, taskID)
 	result := state.result
+	if exitCode != 0 {
+		sessionID := state.sessionID
+		if result != nil && result.SessionID != "" {
+			sessionID = result.SessionID
+		}
+		return Result{Status: "failed", Error: withAgentStderr(fmt.Sprintf("dsh exited with error: exit status %d", exitCode), "dsh", run.stderrTail()), SessionID: sessionID, Usage: state.usage,
+			FirstPromptTokens: state.firstPromptTokens, LastPromptTokens: state.lastPromptTokens}
+	}
 	if result == nil {
 		result = &Result{Status: "failed", SessionID: state.sessionID, Usage: state.usage,
 			FirstPromptTokens: state.firstPromptTokens, LastPromptTokens: state.lastPromptTokens}

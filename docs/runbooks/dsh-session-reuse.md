@@ -198,12 +198,14 @@ Notes:
 
 Why:
 
-- No re-attach exists. The code says live re-attach across restarts is out of scope (`server/pkg/agent/dsh_detached.go:74-77`). The SQL comment says "Known gap until re-attach lands (S3 card G)" and that the flag stays off until then (`server/pkg/db/generated/agent.sql.go:3949-3951`).
+- During daemon shutdown, a launched detached dsh scope is left running and its work directory is preserved. Explicit task cancellation still stops the scope. The daemon pins the work directory before launch so recovery can locate it even before the first session frame.
 - On restart the daemon only recovers tasks the server lists as running for a detached runtime (`server/internal/daemon/detached_recover.go:67-69`). For each it does one of:
   - no pinned `work_dir`: skipped (`server/internal/daemon/detached_recover.go:33-36`);
   - run directory unreadable: skipped (`:38-42`);
   - finished (exit file) or lost (scope gone, no exit file): reported (`:44-48`, `server/pkg/agent/dsh_detached_recover.go:106-134`);
   - still running: polled every 2 s until it ends, then reported (`:49-60`, `server/pkg/agent/dsh_detached_recover.go:27`, `:162`).
+- A zero exit requires a terminal result frame; a nonzero exit fails even if a result frame exists. The restarted daemon reports through its own credentials and skips tasks already terminal on the server.
+- The ordinary offline and running timeouts exclude detached dsh runs; the detached timeout remains the backstop when the daemon stays offline beyond reconnect grace.
 - A recovered run is reported with status, output and session id only. Session-start verdict, init context and usage stay empty (`server/internal/daemon/detached_recover.go:86-92`). The summary clock is armed only in the normal run path (`server/internal/daemon/daemon.go:9362`, the only non-test call of `armDshSummaryClock`), so a recovered run gets no summary clock (inference from that call site).
 - A restarted daemon that keeps heartbeating leaves a skipped row `running`; the server bound needs a stale heartbeat (`server/pkg/db/generated/agent.sql.go:3949-3951`).
 - Review F11 also says a server-side cancel during the outage cannot stop the scope (review F11; not re-verified against the current code, so treat as unverified).
@@ -292,11 +294,11 @@ Add `AND issue_id = '<issue uuid>'` to follow one issue. To see where a seed cam
 | Review F5 | Cap "only logs"; no budget field on the command. | The cap rejects (`server/internal/daemon/dsh_summary.go:544-552`) and `max_tokens` exists (`server/pkg/agent/dsh.go:129-132`). Stale. |
 | Review F12 | `stdin.jsonl` kept after the run. | Removed after start (`server/pkg/agent/dsh_detached.go:196-208`). Stale. |
 | `CLI_AND_DAEMON.md` | Has no entry for `MULTICA_DETACHED_RUNTIME` or `MESSAGE_SINK` (grep found neither). | Both are read by the daemon (`server/pkg/agent/dsh_detached.go:90`, `server/internal/daemon/config.go:651`). |
-| `server/pkg/db/generated/agent.sql.go:3949-3951` | "Known gap until re-attach lands." | Restart recovery now exists (`server/internal/daemon/detached_recover.go:23-62`), but not live re-attach. Comment is partly stale. |
+| Detached recovery | A restarted daemon watches a surviving scope and reports its recorded outcome. | It does not restore the original live stream or input channel. |
 
 Open items:
 
 - **F9**: in-place compaction of the parent. Owner decision (review F9; section 6).
-- **F11**: detached re-attach. Not built; the flag stays off on lane z (review F11; section 5).
+- **F11**: detached restart recovery uses polling; live input re-attachment is not built. The flag stays off on lane z pending the approved live check (section 5).
 - **S3-fix H** (ddvnguyen/multica-x#111): pending PR; until merged, row 2 of 2.2 applies.
 

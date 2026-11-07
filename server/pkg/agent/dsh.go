@@ -460,6 +460,9 @@ func (b *dshBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		return nil, fmt.Errorf("start dsh: %w", err)
 	}
 	if detached != nil {
+		if opts.DetachedStarted != nil {
+			opts.DetachedStarted()
+		}
 		// The child now holds its own descriptor on the frame file.
 		detached.releaseStdin(b.cfg.Logger)
 	}
@@ -502,6 +505,9 @@ func (b *dshBackend) Execute(ctx context.Context, prompt string, opts ExecOption
 		case <-procDone:
 			return
 		case <-runCtx.Done():
+		}
+		if detached != nil && opts.PreserveDetached != nil && opts.PreserveDetached() {
+			return
 		}
 		_ = writeFrame(dshCancelCommand{Version: DshProtocolVersion, Type: "cancel", RequestID: requestID})
 		timer := time.NewTimer(dshCancelGrace)

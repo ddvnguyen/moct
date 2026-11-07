@@ -76,12 +76,24 @@ func (d *Daemon) recoverDetachedRunningTasks(runtimeID string, res RecoverOrphan
 			return agent.WatchDshDetachedRun(ctx, workDir, taskID, 0)
 		},
 		func(ctx context.Context, taskID string, result agent.Result) {
-			d.reportTaskResult(ctx, taskID, detachedTaskResult(result), d.logger.With("task_id", taskID))
+			d.reportRecoveredDetachedTask(ctx, taskID, result)
 		},
 		d.logger.With("runtime_id", runtimeID),
 	)
 	d.logger.Info("detached run recovery", "runtime_id", runtimeID,
 		"reported", reported, "watching", watching, "skipped", skipped)
+}
+
+func (d *Daemon) reportRecoveredDetachedTask(ctx context.Context, taskID string, result agent.Result) {
+	status, err := d.client.GetTaskStatus(ctx, taskID)
+	if shouldInterruptAgent(status, err) {
+		d.logger.Info("detached recovery skipped terminal task", "task_id", taskID, "status", status)
+		return
+	}
+	if err != nil {
+		d.logger.Warn("detached recovery could not check task status; attempting durable report", "task_id", taskID, "error", err)
+	}
+	d.reportTaskResult(ctx, taskID, detachedTaskResult(result), d.logger.With("task_id", taskID))
 }
 
 // detachedTaskResult maps a recovered run's Result onto the TaskResult that
