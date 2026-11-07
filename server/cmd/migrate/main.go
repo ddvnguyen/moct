@@ -140,13 +140,19 @@ var pgBigmOperatorClass = extensionOperatorClass{
 // they are still pending: a fresh self-hosted install, which is exactly where an
 // interrupted build would otherwise leave a permanently unusable index.
 var concurrentIndexCleanups = map[string]string{
-	"611_issue_decision_response_request_index":                 "issue_decision_response_request_idx",
-	"612_issue_decision_response_id_index":                      "issue_decision_response_id_idx",
-	"606_decision_delivered_supplement_index":                   "idx_decision_delivered_supplement",
-	"608_native_question_answer_seq_index":                      "uq_native_question_answer_task_seq",
-	"609_native_question_answer_request_index":                  "idx_native_question_answer_request",
-	"604_workspace_account_runtime_index":                       "workspace_account_runtime_id_idx",
-	"605_workspace_account_daemon_id_index":                     "workspace_account_daemon_account_id_uq",
+	"633_issue_decision_response_request_index":                 "issue_decision_response_request_idx",
+	"634_issue_decision_response_id_index":                      "issue_decision_response_id_idx",
+	"628_decision_delivered_supplement_index":                   "idx_decision_delivered_supplement",
+	"630_native_question_answer_seq_index":                      "uq_native_question_answer_task_seq",
+	"631_native_question_answer_request_index":                  "idx_native_question_answer_request",
+	"626_workspace_account_runtime_index":                       "workspace_account_runtime_id_idx",
+	"627_workspace_account_daemon_id_index":                     "workspace_account_daemon_account_id_uq",
+	"613_skill_version_index":                                   "idx_skill_version_skill_version",
+	"606_agent_task_queue_runtime_active_index":                 "idx_agent_task_queue_runtime_active",
+	"604_wecom_install_session_begin_rate_idx":                  "idx_wecom_install_session_begin_rate",
+	"603_wecom_install_session_agent_pending_idx":               "idx_wecom_install_session_agent_pending",
+	"602_wecom_install_session_request_idx":                     "idx_wecom_install_session_request",
+	"601_wecom_install_session_due_idx":                         "idx_wecom_install_session_due",
 	"594_agent_task_process_cleanup_index":                      "idx_agent_task_queue_process_cleanup",
 	"563_search_index_change_changed_at_index":                  "idx_search_index_change_changed_at",
 	"562_search_index_change_workspace_index":                   "idx_search_index_change_workspace_xid",
@@ -197,6 +203,7 @@ var concurrentIndexCleanups = map[string]string{
 	"488_maintenance_job_active_index":                          "idx_maintenance_job_active",
 	"587_cloud_agent_connection_provider_index":                 "cloud_agent_connection_provider_index",
 	"590_member_delegation_day_unique_index":                    "member_delegation_day_user_date_uidx",
+	"598_issue_unread_unique_index":                             "issue_unread_workspace_user_issue_uidx",
 	"035_task_queue_issue_id_index":                             "idx_agent_task_queue_issue_id",
 	"067_task_queue_claim_candidate_index":                      "idx_agent_task_queue_claim_candidates",
 	"074_task_usage_updated_at_index":                           "idx_task_usage_updated_at",
@@ -491,16 +498,16 @@ var upMigrationConditions = map[string]migrationCondition{
 	"446_issue_properties_bigm_index": whenOperatorClassAvailable(pgBigmOperatorClass),
 	// Fork-rename gates (M-167, M-165 deploy): the v0.7.1 sync renumbered
 	// migrations previously applied to fork lanes under other numbers, so
-	// their SQL ships again under 596–600/601/602. A database that ran the
+	// their SQL ships again under 618–622/623/624. A database that ran the
 	// old numbers has the objects and must record these versions without
 	// re-running; a fresh database applies them. See
 	// migrate_fork_rename_conditions.go.
-	"596_agent_question_card":  whenRenamedObjectsAllPresent(objects596AgentQuestionCard),
-	"597_agent_plan":           whenRenamedObjectsAllPresent(objects597AgentPlan),
-	"598_agent_plan_review":    whenRenamedObjectsAllPresent(objects598AgentPlanReview),
-	"600_project_settings":     whenRenamedObjectsAllPresent(objects600ProjectSettings),
-	"601_workspace_account":    whenRenamedObjectsAllPresent(objects601WorkspaceAccount),
-	"602_task_supplement_mode": whenRenamedObjectsAllPresent(objects602TaskSupplementMode),
+	"618_agent_question_card":  whenRenamedObjectsAllPresent(objects618AgentQuestionCard),
+	"619_agent_plan":           whenRenamedObjectsAllPresent(objects619AgentPlan),
+	"620_agent_plan_review":    whenRenamedObjectsAllPresent(objects620AgentPlanReview),
+	"622_project_settings":     whenRenamedObjectsAllPresent(objects622ProjectSettings),
+	"623_workspace_account":    whenRenamedObjectsAllPresent(objects623WorkspaceAccount),
+	"624_task_supplement_mode": whenRenamedObjectsAllPresent(objects624TaskSupplementMode),
 }
 
 // Migrations 454 and 455 restore the mutually exclusive comment search index
@@ -1000,6 +1007,18 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 		)
 	`, tableIdent)); err != nil {
 		return fmt.Errorf("create migrations table: %w", err)
+	}
+
+	// Fork renumbering (v0.8.1 sync): the fork's 595–614 moved to 617–636 so
+	// upstream could keep 595–616. A lane database recorded those stems under
+	// their old numbers, so rename those rows once, before the apply loop
+	// judges anything — otherwise every renumbered migration looks unapplied and
+	// re-runs its (partly non-idempotent) SQL. Idempotent and a no-op on a fresh
+	// database, which has none of the old rows.
+	if opts.Direction == "up" {
+		if err := renameRenumberedForkMigrations(ctx, conn, tableIdent); err != nil {
+			return err
+		}
 	}
 
 	existsSQL := fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE version = $1)", tableIdent)

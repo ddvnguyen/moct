@@ -8,7 +8,13 @@
     "of_total": "{{total}} 件中 {{visible}} 件",
     "list_load_failed": "エージェントを読み込めませんでした",
     "list_load_failed_default": "エージェント一覧の取得中に問題が発生しました。",
-    "try_again": "再試行"
+    "try_again": "再試行",
+    "search": "エージェントを検索",
+    "scope_title": {
+      "mine": "自分のエージェント",
+      "all": "すべてのエージェント",
+      "archived": "アーカイブ済みのエージェント"
+    }
   },
   "scope": {
     "mine": "自分のもの",
@@ -43,7 +49,15 @@
   },
   "empty": {
     "title": "まだエージェントがいません",
-    "description": "エージェントを作成してタスクを割り当てましょう。"
+    "description": "エージェントを作成してタスクを割り当てましょう。",
+    "setup": {
+      "label": "セットアップ手順",
+      "runtime": "ランタイムを接続する",
+      "agent": "エージェントを作成する",
+      "issue": "タスクを割り当てる",
+      "done": "（完了）",
+      "connect_runtime": "接続"
+    }
   },
   "no_matches": {
     "title": "一致する結果なし",
@@ -148,7 +162,12 @@
     "runtime_required_toast": "このエージェントを実行する前にランタイムを設定してください。",
     "assign_work": "作業を割り当てる",
     "more_actions_aria": "エージェントの操作",
-    "updated": "{{when}}に更新"
+    "updated": "{{when}}に更新",
+    "settings": "設定",
+    "copy_link": "リンクをコピー",
+    "copy_id": "エージェント ID をコピー",
+    "link_copied_toast": "リンクをコピーしました",
+    "id_copied_toast": "エージェント ID をコピーしました"
   },
   "inspector": {
     "section_profile": "プロフィール",
@@ -536,7 +555,8 @@
       "redacted_title": "設定済み — あなたには非表示",
       "redacted_hint": "この agent が使用できるアプリを閲覧・変更できるのは作成者のみです。",
       "shared_warning": "このエージェントは共有されています。このエージェントを実行できる人は、ここで有効化した Composio アプリを利用できます。これらのアプリが機微なデータを扱う場合は、Private にするかアクセス範囲を絞ってください。",
-      "workspace_warning": "ワークスペースに公開：ワークスペースの全メンバーがこのエージェントを通じてこれらの Composio アプリを利用できます。"
+      "workspace_warning": "ワークスペースに公開：ワークスペースの全メンバーがこのエージェントを通じてこれらの Composio アプリを利用できます。",
+      "open_settings": "設定を開く"
     },
     "runtime_config": {
       "mode_label": "ルーティングモード",
@@ -945,7 +965,8 @@
       "prompt_assistant": "チームのプロジェクト計画と文章作成を支援",
       "thinking": "下書きを更新中…",
       "placeholder": "必要なエージェントを説明…",
-      "send": "メッセージを送信"
+      "send": "メッセージを送信",
+      "conversation_tab": "会話"
     },
     "live_draft": "エージェント設定",
     "live_draft_hint": "下書きは直接編集できます。",
@@ -971,7 +992,8 @@
       "runtime": "ランタイムを選択",
       "configure": "設定",
       "done": "完了",
-      "aria": "エージェント作成の手順"
+      "aria": "エージェント作成の手順",
+      "progress": "ステップ {{current}}/{{total}}"
     },
     "configure_title": "エージェントを設定",
     "ask_ai": "AI に書いてもらう",
@@ -1046,5 +1068,45 @@
     "label": "アカウント",
     "runtime_default": "ランタイムの既定",
     "hint": "このエージェントを実行する Freebuff-CLI アカウント。"
+  },
+  "sections": {
+    "runs_count_other": "{{count}} 件の実行",
+    "recent_this_week_other": "今週 {{count}} 件",
+    "view_all": "すべて表示",
+    "open": "開く",
+    "edit": "編集",
+    "add": "追加",
+    "manage": "管理",
+    "instructions_empty": "まだ指示はありません。"
+  },
+  "panel": {
+    "status": "ステータス",
+    "runs_7d": "実行 (7日)",
+    "edit_access_aria": "アクセス: {{value}}。アクセスを変更",
+    "all_settings": "すべての設定"
+  },
+  "intro": {
+    "title": "最初の AI チームメイトを迎える",
+    "description": "エージェントはチームメンバーと同じようにタスクを引き受けます。ランタイム上で Claude Code や Codex などを使って作業し、終わったらコメントで成果を渡します。",
+    "slides": {
+      "describe": {
+        "title": "やることを一文で伝える",
+        "description": "役割を書き、ランタイムとモデルを選べば作成できます。指示の変更や skill の追加はいつでもできます。"
+      },
+      "assign": {
+        "title": "同僚と同じように任せる",
+        "description": "どのタスクでも担当者に選ぶだけ。自分で作業を始めるので、見張る必要はありません。"
+      },
+      "deliver": {
+        "title": "作業を見守り、コメントで受け取る",
+        "description": "実行の様子はリアルタイムで見えます。完了すると、結果と PR をタスクのコメントで渡します。"
+      }
+    },
+    "art": {
+      "prompt": "フロントエンドの PR をレビューし、アクセシビリティとパフォーマンスを重点的に見て、結論を PR コメントに書く。",
+      "issue_title": "料金ページのモバイル表示が崩れる",
+      "comment": "修正しました。375px 以下では料金カードを 1 列にしています。PR を作成し、テストも通っています。",
+      "step_read": "{{file}} を読む"
+    }
   }
 }

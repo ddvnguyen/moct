@@ -55,6 +55,8 @@ import {
   type IconComponent,
 } from "@multica/ui/icons";
 import type { Attachment } from "@multica/core/types";
+import { attachmentIdFromStorageURL } from "@multica/core/types/attachment-url";
+import { useConfigStore } from "@multica/core/config";
 import { paths, useWorkspaceSlug } from "@multica/core/paths";
 import { createShortcutChord } from "@multica/core/shortcuts";
 import { cn } from "@multica/ui/lib/utils";
@@ -86,6 +88,7 @@ import { parseStructured } from "./utils/parse-structured";
 import { formatBytes } from "../common/format-bytes";
 import { ShortcutKeycaps } from "../common/shortcut-keycaps";
 import { useDownloadAttachment } from "./use-download-attachment";
+import { useAttachmentDownloadState } from "./hooks/use-attachment-download-state";
 import { useAttachmentHtmlText } from "./hooks/use-attachment-html-text";
 import { useResignedInlineMedia } from "./hooks/use-inline-media-url";
 import { useZoomCanvas, type ZoomCanvasApi } from "./hooks/use-zoom-canvas";
@@ -105,6 +108,7 @@ import {
   HtmlViewportFrame,
   type HtmlViewport,
 } from "./html-viewport-frame";
+import { withWidthBridge } from "./utils/iframe-width-bridge";
 
 // Preview source — full attachment, or URL-only (media types only)
 //
@@ -418,6 +422,7 @@ export function AttachmentPreviewModal({
 }: AttachmentPreviewModalProps & { onExitComplete?: () => void }) {
   const portalContainer = usePortalContainer();
   const download = useDownloadAttachment();
+  const cdnDomain = useConfigStore((s) => s.cdnDomain);
   const shouldReduceMotion = useReducedMotion() ?? false;
   const state = normalize(source);
   // useWorkspaceSlug (not useWorkspacePaths) — returns null outside a
@@ -491,14 +496,17 @@ export function AttachmentPreviewModal({
   const kind = state.kind;
 
   // Download dispatcher: re-sign through `getAttachment` when an id is
-  // available; otherwise fall back to opening the (possibly stale) URL
-  // externally — same tradeoff as the file-card NodeView's download path.
+  // available (from the record, or parsed out of a CDN storage URL that
+  // didn't resolve to a record); otherwise fall back to opening the
+  // (possibly stale) URL externally — same tradeoff as the file-card
+  // NodeView's download path.
   const handleDownload = () => {
-    if (state.attachmentId) {
-      download(state.attachmentId);
-    } else {
-      openExternal(state.mediaUrl);
+    const attachmentId =
+      state.attachmentId ?? attachmentIdFromStorageURL(state.mediaUrl, cdnDomain);
+    if (attachmentId) {
+      return download(attachmentId);
     }
+    return openExternal(state.mediaUrl);
   };
 
   // Open-in-new-tab: the full-page route (/attachments/{id}/preview) shows
@@ -686,7 +694,7 @@ function PreviewPanel({
   source: PreviewSource;
   state: PreviewState;
   onClose?: () => void;
-  onDownload: () => void;
+  onDownload: () => void | Promise<unknown>;
   onOpenInNewTab?: () => void;
   sequence?: PreviewSequence;
   onImageError?: () => void;
@@ -702,6 +710,11 @@ function PreviewPanel({
   onHtmlAddressChange?: (attachmentId: string, address: string) => void;
 }) {
   const { t } = useT("editor");
+
+  const { downloading, handleDownload } = useAttachmentDownloadState(
+    onDownload,
+    state.attachmentId ?? state.mediaUrl,
+  );
 
   // How the file is shown. Held here rather than in the stage so a choice
   // carries over as the reader pages through the sequence: the next HTML
@@ -838,10 +851,8 @@ function PreviewPanel({
 
   return (
     <>
-      {/* Three columns so the counter stays centered on the window while a
-          long filename truncates before reaching it. */}
       <header
-        className="dark @container grid h-14 shrink-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-4 pl-3 pr-2 text-foreground"
+        className="dark @container grid h-14 shrink-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-4 pl-3 pr-2 text-foreground"
         style={surface === "viewer" ? DRAG : undefined}
       >
         <div className="flex min-w-0 items-center gap-2.5">
@@ -869,17 +880,6 @@ function PreviewPanel({
             )}
           </div>
         </div>
-        <span
-          className="select-none text-label tabular-nums text-muted-foreground"
-          aria-live="polite"
-        >
-          {sequence
-            ? t(($) => $.attachment.sequence_position, {
-                index: sequence.index + 1,
-                total: sequence.total,
-              })
-            : null}
-        </span>
         <div
           className="flex items-center justify-self-end gap-0.5"
           style={NO_DRAG}
@@ -981,8 +981,17 @@ function PreviewPanel({
               <Copy className="size-4" />
             </ChromeButton>
           )}
-          <ChromeButton label={t(($) => $.image.download)} onClick={onDownload}>
-            <Download className="size-4" />
+          <ChromeButton
+            label={t(($) => $.image.download)}
+            onClick={handleDownload}
+            disabled={downloading}
+            busy={downloading}
+          >
+            {downloading ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Download className="size-4" />
+            )}
           </ChromeButton>
           {(onOpenOverview || info) && <ChromeDivider />}
           {onOpenOverview && (
@@ -1015,58 +1024,42 @@ function PreviewPanel({
         </div>
       </header>
       <div className="flex min-h-0 flex-1">
-        {/* The stage. In a sequence its sides are 64px gutters holding the
-            prev / next buttons, so a fitted image or a page never runs under
-            them. */}
-        <motion.div
-          className={cn(
-            "relative min-h-0 min-w-0 flex-1",
-            sequence ? "px-16" : "px-4",
-          )}
-          onClick={closeOnBackdrop}
-          initial={{ transform: reduceMotion ? "scale(1)" : "scale(0.97)" }}
-          animate={{
-            transform: "scale(1)",
-            transition: {
-              duration: UI_MOTION_DURATION.standard,
-              ease: UI_EASE_OUT,
-            },
-          }}
-        >
-          {kind === "image" ? (
-            <ImagePreview
-              state={state}
-              mediaUrl={mediaUrl}
-              canvas={canvas}
-              natural={natural}
-              onNaturalSize={handleNaturalSize}
-              onError={imageLoadError}
-            />
-          ) : (
-            <PreviewContent
-              kind={kind}
-              source={source}
-              state={state}
-              view={view}
-              onDownload={onDownload}
-              onBackdropClick={closeOnBackdrop}
-            />
-          )}
-          {sequence && (
-            <>
-              <SequenceButton
-                side="prev"
-                label={t(($) => $.attachment.previous)}
-                onClick={sequence.onPrev}
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <motion.div
+            className="min-h-0 flex-1 px-4"
+            onClick={closeOnBackdrop}
+            initial={{ transform: reduceMotion ? "scale(1)" : "scale(0.97)" }}
+            animate={{
+              transform: "scale(1)",
+              transition: {
+                duration: UI_MOTION_DURATION.standard,
+                ease: UI_EASE_OUT,
+              },
+            }}
+          >
+            {kind === "image" ? (
+              <ImagePreview
+                state={state}
+                mediaUrl={mediaUrl}
+                canvas={canvas}
+                natural={natural}
+                onNaturalSize={handleNaturalSize}
+                onError={imageLoadError}
               />
-              <SequenceButton
-                side="next"
-                label={t(($) => $.attachment.next)}
-                onClick={sequence.onNext}
+            ) : (
+              <PreviewContent
+                kind={kind}
+                source={source}
+                state={state}
+                view={view}
+                onDownload={handleDownload}
+                downloading={downloading}
+                onBackdropClick={closeOnBackdrop}
               />
-            </>
-          )}
-        </motion.div>
+            )}
+          </motion.div>
+          {sequence && <SequencePager sequence={sequence} />}
+        </div>
         {info?.open && (
           // A column beside the stage rather than a layer over it: the file
           // re-fits into what is left instead of hiding under the panel.
@@ -1091,6 +1084,7 @@ function ChromeButton({
   shortcut,
   pressed,
   disabled,
+  busy,
   onClick,
   children,
 }: {
@@ -1100,6 +1094,7 @@ function ChromeButton({
   /** Toggle buttons pass their state; plain actions leave it unset. */
   pressed?: boolean;
   disabled?: boolean;
+  busy?: boolean;
   onClick: () => void;
   children: ReactNode;
 }) {
@@ -1122,6 +1117,7 @@ function ChromeButton({
         aria-label={label}
         aria-keyshortcuts={shortcut}
         aria-pressed={pressed}
+        aria-busy={busy}
         disabled={disabled}
         onClick={onClick}
       >
@@ -1181,11 +1177,44 @@ function ChromeDivider() {
   return <span className="mx-1.5 h-4 w-px bg-input" aria-hidden />;
 }
 
-// Prev / next in the stage gutters, vertically centered — next to the
-// content, never on it. `onClick` undefined means "boundary reached": the
-// button stays mounted but disabled, so the reader can see they are at one
-// end instead of the control vanishing. `enabled:hover` so the disabled state
-// gets no hover feedback.
+// Prev / next with the position between them, centered under the stage. The
+// strip is not backdrop: a click that misses a button must not close the
+// viewer. The counter's min width keeps the buttons still as digits change.
+function SequencePager({ sequence }: { sequence: PreviewSequence }) {
+  const { t } = useT("editor");
+  return (
+    <div className="dark flex h-12 shrink-0 items-center justify-center gap-1 text-foreground">
+      <SequenceButton
+        side="prev"
+        label={t(($) => $.attachment.previous)}
+        onClick={sequence.onPrev}
+      />
+      <span
+        className="min-w-16 select-none text-center text-label tabular-nums text-muted-foreground"
+        aria-live="polite"
+      >
+        {t(($) => $.attachment.sequence_position, {
+          index: sequence.index + 1,
+          total: sequence.total,
+        })}
+      </span>
+      <SequenceButton
+        side="next"
+        label={t(($) => $.attachment.next)}
+        onClick={sequence.onNext}
+      />
+    </div>
+  );
+}
+
+const SEQUENCE_KEYS = {
+  prev: { chord: createShortcutChord("Left"), aria: "ArrowLeft", Icon: ChevronLeft },
+  next: { chord: createShortcutChord("Right"), aria: "ArrowRight", Icon: ChevronRight },
+} as const;
+
+// `onClick` undefined means "boundary reached": the button stays mounted but
+// disabled, so the reader can see they are at one end instead of the control
+// vanishing. `enabled:hover` so the disabled state gets no hover feedback.
 function SequenceButton({
   side,
   label,
@@ -1195,20 +1224,21 @@ function SequenceButton({
   label: string;
   onClick?: () => void;
 }) {
-  const Icon = side === "prev" ? ChevronLeft : ChevronRight;
+  const { chord, aria, Icon } = SEQUENCE_KEYS[side];
   return (
-    <TooltipHint label={label}>
+    <TooltipHint
+      label={label}
+      shortcut={<ShortcutKeycaps shortcut={chord} decorative className="ml-1.5" />}
+    >
       <button
         type="button"
-        className={cn(
-          "dark absolute top-1/2 flex size-10 -translate-y-1/2 items-center justify-center rounded-full bg-secondary/80 text-foreground transition-colors enabled:hover:bg-secondary disabled:opacity-30",
-          side === "prev" ? "left-3" : "right-3",
-        )}
+        className="flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors enabled:hover:bg-secondary enabled:hover:text-foreground disabled:opacity-40"
         aria-label={label}
+        aria-keyshortcuts={aria}
         disabled={!onClick}
         onClick={onClick}
       >
-        <Icon className="size-5" />
+        <Icon className="size-4" />
       </button>
     </TooltipHint>
   );
@@ -1328,6 +1358,7 @@ function PreviewContent({
   state,
   view,
   onDownload,
+  downloading,
   onBackdropClick,
 }: {
   kind: Exclude<PreviewKind, "image"> | null;
@@ -1335,6 +1366,7 @@ function PreviewContent({
   state: PreviewState;
   view: StageView;
   onDownload: () => void;
+  downloading: boolean;
   onBackdropClick: (e: React.MouseEvent) => void;
 }) {
   const { t } = useT("editor");
@@ -1344,6 +1376,7 @@ function PreviewContent({
       <UnsupportedFallback
         message={t(($) => $.attachment.preview_unsupported)}
         onDownload={onDownload}
+        downloading={downloading}
       />
     );
   }
@@ -1358,6 +1391,7 @@ function PreviewContent({
       <UnsupportedFallback
         message={t(($) => $.attachment.preview_unsupported)}
         onDownload={onDownload}
+        downloading={downloading}
       />
     );
   }
@@ -1406,6 +1440,7 @@ function PreviewContent({
         <TextBackedPreview
           attachmentId={state.attachmentId!}
           onDownload={onDownload}
+          downloading={downloading}
           render={(text) => (
             <DocumentSheet width="prose" onBackdropClick={onBackdropClick}>
               <ReadonlyContent
@@ -1422,13 +1457,14 @@ function PreviewContent({
         <TextBackedPreview
           attachmentId={state.attachmentId!}
           onDownload={onDownload}
+          downloading={downloading}
           render={(text) =>
             view.htmlSource ? (
               code(text, "xml")
             ) : (
               <HtmlViewportFrame viewport={view.htmlViewport}>
                 {view.renderHtmlFrame({
-                  html: text,
+                  html: withWidthBridge(text),
                   title: state.filename,
                   location: view.htmlLocation,
                 })}
@@ -1442,6 +1478,7 @@ function PreviewContent({
         <TextBackedPreview
           attachmentId={state.attachmentId!}
           onDownload={onDownload}
+          downloading={downloading}
           render={(text) => (
             // Keyed on the file: sort order and column widths belong to it.
             <TablePreview
@@ -1457,6 +1494,7 @@ function PreviewContent({
         <TextBackedPreview
           attachmentId={state.attachmentId!}
           onDownload={onDownload}
+          downloading={downloading}
           render={(text) => {
             const parse = view.structuredParse;
             if (parse?.ok && view.structuredView === "tree") {
@@ -1492,6 +1530,7 @@ function PreviewContent({
         <TextBackedPreview
           attachmentId={state.attachmentId!}
           onDownload={onDownload}
+          downloading={downloading}
           render={(text) => code(text, extensionToLanguage(state.filename))}
         />
       );
@@ -1534,10 +1573,12 @@ function DocumentSheet({
 function TextBackedPreview({
   attachmentId,
   onDownload,
+  downloading,
   render,
 }: {
   attachmentId: string;
   onDownload: () => void;
+  downloading: boolean;
   render: (text: string) => ReactNode;
 }) {
   const { t } = useT("editor");
@@ -1557,6 +1598,7 @@ function TextBackedPreview({
         <UnsupportedFallback
           message={t(($) => $.attachment.preview_too_large)}
           onDownload={onDownload}
+          downloading={downloading}
         />
       );
     }
@@ -1565,6 +1607,7 @@ function TextBackedPreview({
         <UnsupportedFallback
           message={t(($) => $.attachment.preview_unsupported)}
           onDownload={onDownload}
+          downloading={downloading}
         />
       );
     }
@@ -1572,6 +1615,7 @@ function TextBackedPreview({
       <UnsupportedFallback
         message={t(($) => $.attachment.preview_failed)}
         onDownload={onDownload}
+        downloading={downloading}
       />
     );
   }
@@ -1584,9 +1628,11 @@ function TextBackedPreview({
 function UnsupportedFallback({
   message,
   onDownload,
+  downloading,
 }: {
   message: string;
   onDownload: () => void;
+  downloading: boolean;
 }) {
   const { t } = useT("editor");
   return (
@@ -1597,8 +1643,14 @@ function UnsupportedFallback({
         type="button"
         className="inline-flex items-center gap-2 rounded-md border border-input bg-secondary px-3 py-1.5 text-body text-foreground transition-colors hover:bg-muted"
         onClick={onDownload}
+        disabled={downloading}
+        aria-busy={downloading}
       >
-        <Download className="size-4" />
+        {downloading ? (
+          <Loader2 className="size-4 animate-spin" />
+        ) : (
+          <Download className="size-4" />
+        )}
         {t(($) => $.image.download)}
       </button>
     </div>

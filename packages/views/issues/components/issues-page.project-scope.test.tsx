@@ -23,6 +23,18 @@ vi.mock("@multica/core/issues/stores/issues-scope-store", () => ({
 // The surface is the boundary under test's edge: record what the page handed
 // it instead of rendering a board that needs a query client, an API and a
 // virtualizer to say the same thing.
+// The page's header is upstream's IssueViewHeader, which owns its own query
+// client and view bar; this test is about the scope handed to the surface.
+vi.mock("../../issue-views/view-header", () => ({
+  IssueViewHeader: () => null,
+}));
+
+// Chat creation reads the workspace through react-query; the empty-state action
+// it powers is not what this test is about.
+vi.mock("../../chat/use-start-chat-with-draft", () => ({
+  useStartChatWithDraft: () => null,
+}));
+
 vi.mock("../surface/issue-surface", () => ({
   IssueSurface: ({
     scope,

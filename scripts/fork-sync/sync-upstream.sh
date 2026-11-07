@@ -22,8 +22,9 @@ usage() {
 Usage: scripts/fork-sync/sync-upstream.sh [--check] [--base <ref>] [--upstream <remote>] [--no-fetch]
 
   --check              Report only: newest upstream release tag, commits behind,
-                       conflicting files, fork-owned flags and the migration
-                       numbers on both sides. Creates no branch.
+                       conflicting files, fork-owned flags, the migration
+                       numbers on both sides and the MMX version string the
+                       merged tree would stamp. Creates no branch.
   --base <ref>         Branch to sync into (default: origin/multica-moct).
   --upstream <remote>  Remote holding upstream (default: upstream).
   --no-fetch           Use the refs already in the repository.
@@ -110,6 +111,18 @@ printf 'repository : %s (%s)\n' "$(git rev-parse --show-toplevel)" "$current_bra
 printf 'base       : %s @ %s\n' "$base_ref" "$base_sha"
 printf 'upstream   : %s @ %s\n' "$tag" "$tag_sha"
 
+# MMX stamp: scripts/mmx-version.mjs reads the version from apps/web/package.json
+# and stamps it with the build time; the merged tree takes that version from the
+# upstream tag. Show the deterministic stamp at the tag's commit time — the real
+# stamp is build-time (CI asserts `node scripts/mmx-version.mjs --from-git`).
+tag_time=$(git show -s --format=%cI "$tag^{commit}")
+tag_version=$(git show "$tag:apps/web/package.json" | node -e \
+  'let s = ""; process.stdin.on("data", (d) => { s += d; }); process.stdin.on("end", () => { console.log(JSON.parse(s).version ?? "unknown"); });')
+if [ -n "$tag_version" ]; then
+  tag_stamp=$(LC_ALL=C TZ='Asia/Ho_Chi_Minh' date -d "$tag_time" +%y%b%d.%H.%M | tr a-z A-Z)
+  printf 'mmx-version : %s-%s (version from apps/web/package.json @ %s; stamp at tag time)\n' "$tag_version" "$tag_stamp" "$tag"
+fi
+
 if [ "$behind" -eq 0 ]; then
   printf 'behind     : 0 commits — %s already contains %s\n' "$base_ref" "$tag"
   exit 0
@@ -130,7 +143,7 @@ case "$merge_status" in
 esac
 
 # Layout: tree OID, the conflicting files, a blank line, then auto-merge notes.
-conflicts=$(printf '%s\n' "$merge_tree" | awk 'NR == 1 { next } /^$/ { exit } NF { print }')
+conflicts=$(printf '%s\n' "$merge_tree" | awk 'NR == 1 { next } /^$/ { files_done = 1 } !files_done && NF { print }')
 conflict_count=$(count_lines <<<"$conflicts")
 
 # A file is fork-owned when our branch changed it since the merge base: those
@@ -185,7 +198,9 @@ fi
 
 if [ "$collision_count" -gt 0 ]; then
   printf '\nmigration number collisions:\n%s' "$collisions"
-  printf 'Renumber the fork migration(s) before merging; schema_migrations keys on the number.\n'
+  printf 'Renumber the fork migration(s) before merging, and extend forkMigrationRenames in\n'
+  printf 'server/cmd/migrate so rows recorded under the old stem move to the new one: the\n'
+  printf 'schema_migrations version key is the full file stem, not the number.\n'
 fi
 
 if [ "$mode" = check ]; then
