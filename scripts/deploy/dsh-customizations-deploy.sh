@@ -210,7 +210,7 @@ install_deps() {
 # again. Dropping the importer's entry instead leaves its `specifier:` and
 # `version:` lines orphaned under `dependencies:`, which is a lockfile pnpm
 # cannot read (pnpm 11 fails on it with "Cannot read properties of undefined").
-strip_lock_entries() { # $1 = lockfile path
+strip_lock_entries() { # $1 = lockfile path; $2 = optional extra package names (JSON array) to strip as well
   node -e '
     const fs = require("node:fs");
     const [lockPath, namesJson] = process.argv.slice(1);
@@ -229,7 +229,10 @@ strip_lock_entries() { # $1 = lockfile path
       }
       const trimmed = line.trim();
       // A top-level section header: "packages:", "snapshots:", "importers:".
-      if (/^[A-Za-z][A-Za-z0-9_-]*:\s*$/.test(trimmed)) {
+      // Top-level means flush left: a nested "peerDependencies:" value line
+      // inside an entry must not flip the section, or every entry after it is
+      // silently skipped (that is what happened to the dshmarket entries).
+      if (/^[A-Za-z][A-Za-z0-9_-]*:\s*$/.test(line)) {
         section = trimmed.slice(0, -1);
         out.push(line);
         continue;
@@ -243,11 +246,18 @@ strip_lock_entries() { # $1 = lockfile path
         const first = trimmed.indexOf("'"'"'");
         const last = trimmed.lastIndexOf("'"'"'");
         if (last > first) key = trimmed.slice(first + 1, last);
-      } else if (trimmed.startsWith("@ddvnguyen/")) {
+      } else if (trimmed.startsWith("@ddvnguyen/") || /^[A-Za-z@][^:@\s]*@\d/.test(trimmed)) {
         key = trimmed.replace(/:$/, "");
       }
       if (key !== null) {
-        const base = key.split("@file:")[0];
+        let base = key.split("@file:")[0];
+        // npm entries key as name@version, optionally followed by a peer
+        // group (name@version(peer@1.0)) - drop that suffix to get the name
+        // the caller asked for. The names-set check below is the real guard
+        // against matching anything else in these sections.
+        const paren = base.indexOf("(");
+        if (paren !== -1) base = base.slice(0, paren);
+        if (!base.includes("@file:")) base = base.replace(/@\d[^:]*$/, "");
         if (names.has(base)) {
           const indent = line.length - line.trimStart().length;
           dropIndent = indent;
@@ -261,15 +271,16 @@ strip_lock_entries() { # $1 = lockfile path
     fs.writeFileSync(lockPath, out.join("\n"));
     console.log("removed " + removed + " stale lockfile entries");
   ' "$1" "$(printf '%s\n' "$PACKED" | node -e '
+    const extra = process.argv[1] ? JSON.parse(process.argv[1]) : [];
+    const out = new Set(extra);
     let s = "";
     process.stdin.on("data", d => s += d).on("end", () => {
-      const out = [];
       for (const line of s.trim().split("\n")) {
         const [name] = line.split("\t");
-        if (name) out.push(name);
+        if (name) out.add(name);
       }
-      process.stdout.write(JSON.stringify(out));
-    });')"
+      process.stdout.write(JSON.stringify([...out]));
+    });' "${2:-}")"
 }
 
 # The plugins repo compiles against a sibling `deepseek-harness` checkout: its
@@ -395,6 +406,8 @@ if [ "$DRY_RUN" = "1" ]; then
   log "would REMOVE the obsolete @ddvnguyen/* profile dependencies that the manifest does not list"
   log "would REMOVE the installed copies of the manifest's packages so pnpm re-links this build"
   log "would run pnpm install in $PROFILE_DIR"
+  log "would re-float every exact DSH-plugin specifier the market re-pinned back to a range (M-60), then re-resolve so the lockfile agrees"
+  log "would FAIL (FATAL, naming the plugin) if a DSH plugin still carries an exact pin after the re-float"
   log "would compare every installed package with the artifact it was installed from"
   while IFS=$'\t' read -r target applier; do
     [ -n "${target:-}" ] || continue
@@ -566,28 +579,36 @@ process.stdout.write(deps[name] ? "1" : "");
       RESTORE_OK=0
     fi
   done <<< "$PACKED"
-  # dshmarket is pinned exactly by the restored package.json, so the restored
-  # version is a string compare against that pin. A pin that is not an exact
-  # version (a range) cannot be compared with a string, and the check is
-  # skipped for it rather than reporting a mismatch it cannot judge.
+  # dshmarket's version is decided by the RESTORED LOCKFILE, not by the
+  # manifest spec: under the unpin (M-60) the manifest carries a range, which
+  # a string compare cannot judge an installed version against, and the old
+  # check degraded to a warning. The lockfile entry is the witness that
+  # resolved the version and stays exact under a floating manifest, so the
+  # expected version is read from it and the assertion still fires.
   WANT_DSHMARKET="$(node -e '
-const p = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
-const spec = (p.dependencies && p.dependencies.dshmarket) || (p.devDependencies && p.devDependencies.dshmarket) || "";
-process.stdout.write(spec);
-' "$PROFILE_DIR/package.json" 2>/dev/null || true)"
-  if [ -n "$WANT_DSHMARKET" ] && ! printf '%s' "$WANT_DSHMARKET" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
-    warn "the profile pins dshmarket as '$WANT_DSHMARKET' - not an exact version, so the restored version is not compared"
-    WANT_DSHMARKET=""
-  fi
+const fs = require("node:fs");
+const lockPath = process.argv[1];
+let want = "";
+if (fs.existsSync(lockPath)) {
+  // packages:/snapshots: entry "<name>@<version>:" - its first hit records
+  // the single resolved version. The importers: section names the spec
+  // ("dshmarket:" with a specifier line), never the name@version form.
+  const m = /dshmarket@(\d+\.\d+\.\d+[^\s:]*)/.exec(fs.readFileSync(lockPath, "utf8"));
+  if (m) want = m[1];
+}
+process.stdout.write(want);
+' "$PROFILE_DIR/pnpm-lock.yaml" 2>/dev/null || true)"
   if [ -n "$WANT_DSHMARKET" ]; then
     GOT_DSHMARKET="$(node -e '
 const p = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
 process.stdout.write(p.version || "");
 ' "$PROFILE_DIR/node_modules/dshmarket/package.json" 2>/dev/null || true)"
     if [ "$GOT_DSHMARKET" != "$WANT_DSHMARKET" ]; then
-      log "FATAL: rollback restored dshmarket ${GOT_DSHMARKET:-<missing>}, package.json pins $WANT_DSHMARKET"
+      log "FATAL: rollback restored dshmarket ${GOT_DSHMARKET:-<missing>}, the restored lockfile pins $WANT_DSHMARKET"
       RESTORE_OK=0
     fi
+  else
+    warn "the restored lockfile carries no dshmarket version - the restored dshmarket version is not compared"
   fi
   if [ "$RESTORE_OK" = "1" ]; then
     log "rollback done: the profile is back at the state of $BACKUP_DIR"
@@ -713,6 +734,85 @@ while IFS=$'\t' read -r name _rest; do
 done <<< "$PACKED"
 log "installing the profile"
 ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) || die "pnpm install failed in $PROFILE_DIR"
+
+# --- 3b. re-float the market's pins (M-60) ------------------------------------
+# The market's install/update path always asks pnpm for an exact version
+# (pnpm add <name>@<exact>), and pnpm writes that exact specifier into the
+# profile manifest: one market click re-pins a plugin on the lane, silently.
+# So after the install, every exact DSH-plugin specifier is written back as a
+# range - the same rule as the unpin (M-59): ^ on 1.x and above (minor and
+# patch float), >= on 0.x (a ^ there would freeze the minor line, which is
+# a pin in everything but the name). The train's own packages are exempt:
+# they are file: records, rewritten above, and stay exact.
+refloat_deps() {
+  node -e '
+    const fs = require("node:fs");
+    const [pkgPath] = process.argv.slice(1);
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    const EXACT = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/;
+    const rewritten = [];
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
+      const deps = pkg[field];
+      if (!deps) continue;
+      for (const [name, spec] of Object.entries(deps)) {
+        if (typeof spec !== "string") continue;
+        if (name.startsWith("@ddvnguyen/")) continue;
+        if (spec.startsWith("file:") || spec.startsWith("github:")) continue;
+        const m = EXACT.exec(spec);
+        if (!m) continue; // already a range
+        const base = m[1] + "." + m[2] + "." + m[3];
+        const range = Number(m[1]) >= 1 ? "^" + base : ">=" + base;
+        deps[name] = range;
+        rewritten.push(name);
+        console.log("re-floated " + name + ": " + spec + " -> " + range);
+      }
+    }
+    if (rewritten.length) fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+    process.stdout.write(JSON.stringify(rewritten));
+  ' "$PROFILE_DIR/package.json"
+}
+
+# The profile's manifest and lockfile must agree after the rewrite: a changed
+# spec makes pnpm resolve the dependency again (the importers: section keeps
+# the spec it was asked for, and pnpm compares it with package.json - the same
+# mechanism the manifest strip above relies on), so the floated names' lockfile
+# entries are dropped and the profile is installed once more against the
+# ranges. Unlike the manifest's file: tarballs, the floated packages need no
+# node_modules removal: the spec change alone makes pnpm re-link them.
+log "re-floating every exact DSH-plugin specifier the market re-pinned"
+REFLOATED="$(refloat_deps)" || die "could not re-float the profile dependencies"
+if [ "$REFLOATED" != "[]" ] && [ -n "$REFLOATED" ]; then
+  if [ -f "$PROFILE_DIR/pnpm-lock.yaml" ]; then
+    log "dropping the lockfile entries of the re-floated packages"
+    strip_lock_entries "$PROFILE_DIR/pnpm-lock.yaml" "$REFLOATED" || die "could not strip the re-floated lockfile entries"
+  fi
+  log "re-installing the profile against the ranges"
+  ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) || die "pnpm install failed in $PROFILE_DIR after the re-float"
+fi
+
+# A deploy that leaves an exact pin behind must fail loudly, naming the plugin:
+# a pin that survives a deploy silently is the failure this step exists to end.
+log "checking that no DSH plugin is still exactly pinned"
+STILL_PINNED=""
+if ! STILL_PINNED="$(node -e '
+    const fs = require("node:fs");
+    const [pkgPath] = process.argv.slice(1);
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    const EXACT = /^\d+\.\d+\.\d+(?:[-+].*)?$/;
+    const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies);
+    const pinned = [];
+    for (const [name, spec] of Object.entries(deps)) {
+      if (typeof spec !== "string") continue;
+      if (name.startsWith("@ddvnguyen/")) continue;
+      if (spec.startsWith("file:") || spec.startsWith("github:")) continue;
+      if (EXACT.test(spec)) pinned.push(name + "@" + spec);
+    }
+    for (const p of pinned) console.log("STILL PINNED  " + p);
+    process.exit(pinned.length ? 1 : 0);
+  ' "$PROFILE_DIR/package.json")"; then
+  die "the profile still carries exact DSH-plugin pins after the re-float: ${STILL_PINNED}"
+fi
+log "every DSH plugin specifier in the profile is a range"
 
 # The proof that the lane runs the build this deploy produced is the
 # CONTENT: the installed package must carry the bytes of the artifact it was
