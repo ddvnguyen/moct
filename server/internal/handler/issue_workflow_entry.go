@@ -47,7 +47,7 @@ type workflowHandoff struct {
 // triggers, or nil.
 func (h *Handler) applyIssueWorkflow(ctx context.Context, q *db.Queries, prev db.Issue, params *db.UpdateIssueParams, statusExplicit, assigneeTouched, enterOnMove bool, run *db.AgentTaskQueue) (*workflowHandoff, error) {
 	def, project, err := issueworkflow.ForProject(ctx, q, prev.WorkspaceID, params.ProjectID)
-	if err != nil || def == nil {
+	if err != nil {
 		return nil, err
 	}
 	// Keeping the current status is never a rejected write, even when the

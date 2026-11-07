@@ -8,10 +8,7 @@ export const filters = JSON.parse(
 );
 
 export function decideScopes(event, filtered) {
-  // The schedule trigger lives in nightly.yml now (M-161), which has no path
-  // filter and never calls decide — a schedule event here is a wiring bug and
-  // must fail closed rather than silently run a full PR-path suite.
-  const full = event === "workflow_dispatch";
+  const full = event === "schedule" || event === "workflow_dispatch";
   if (!full && event !== "push" && event !== "pull_request") {
     throw new Error(`Unsupported CI event: ${event}`);
   }

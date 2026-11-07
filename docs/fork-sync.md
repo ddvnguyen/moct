@@ -64,3 +64,8 @@ Computed per run; the table maps where conflicts land, not a substitute for it.
 - The sync runs on the Freebuff Desktop lane via the Orchestrator (Owner
   decision), not from a free-runtime run.
 - Do not force-push `multica-moct`; the sync lands as a merge commit.
+- The sync must keep MMX working: `--check` prints the `scripts/mmx-version.mjs`
+  version string the merged tree would stamp (version from `apps/web/package.json`
+  at the tag, stamp at the tag's commit time). After the merge, `node
+  scripts/mmx-version.mjs --from-git` must succeed and MMX/bootstrap CI jobs
+  stay untouched.

@@ -58,9 +58,14 @@ for (const [name, files, selected] of [
     for (const event of ["pull_request", "push"]) {
       const outputs = decideScopes(event, filterFiles(files));
       assert.equal(outputs.full, "false");
+      // Fork policy (M-151/M-161): a push is a merged SHA the deploy pulls
+      // artifacts from, so both product scopes are forced on push.
+      const expected = event === "push"
+        ? [...new Set([...selected, "frontend", "backend"])]
+        : selected;
       assert.deepEqual(Object.keys(filters).filter((scope) => outputs[scope] === "true").sort(),
-        [...selected].sort());
-      assert.equal(outputs.quality_only, String(selected.includes("quality") && !selected.includes("frontend")));
+        [...expected].sort());
+      assert.equal(outputs.quality_only, String(expected.includes("quality") && !expected.includes("frontend")));
     }
   });
 }
@@ -204,17 +209,17 @@ test("the CLI writes real Actions outputs and exits nonzero on a failed gate", (
   const output = join(dir, "output");
   const script = fileURLToPath(new URL("./ci-scope.mjs", import.meta.url));
   const run = spawnSync(process.execPath, [script, "decide"], {
-    env: { ...process.env, EVENT_NAME: "push", FILTER_RESULTS: JSON.stringify(filterFiles(["README.md"])), GITHUB_OUTPUT: output },
+    env: { ...process.env, EVENT_NAME: "pull_request", FILTER_RESULTS: JSON.stringify(filterFiles(["README.md"])), GITHUB_OUTPUT: output },
     encoding: "utf8",
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(readFileSync(output, "utf8"), /^backend=false$/m);
   const failed = productionNeeds("backend", decideScopes("workflow_dispatch", {}));
-  failed["backend-tests"].result = "failure";
+  failed["backend-test-db"].result = "failure";
   const gate = spawnSync(process.execPath, [script, "gate"], {
     env: { ...process.env, NEEDS_JSON: JSON.stringify(failed), JOB_SCOPES: JSON.stringify(productionMapping("backend")) },
     encoding: "utf8",
   });
   assert.equal(gate.status, 1);
-  assert.match(gate.stderr, /backend-tests/);
+  assert.match(gate.stderr, /backend-test-db/);
 });
