@@ -1827,6 +1827,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/plans/{planId}/submit", h.SubmitPlan)
 					r.With(handler.RequireHumanActor).Post("/question-cards/{cardId}/answer", h.AnswerQuestionCard)
 					r.With(handler.RequireHumanActor).Post("/plans/{planId}/verdict", h.ReviewPlan)
+					// M-275: the plan page's review threads and section history.
+					// Commenting, resolving and editing a section are the human's
+					// alone (RequireHumanActor); reading a section's history is
+					// member-visible like the rest of the plan read.
+					r.With(handler.RequireHumanActor).Post("/plans/{planId}/comments", h.CreatePlanComment)
+					r.With(handler.RequireHumanActor).Post("/plans/{planId}/comments/{commentId}/resolve", h.ResolvePlanComment)
+					r.With(handler.RequireHumanActor).Put("/plans/{planId}/sections/{sectionId}", h.UpdatePlanSection)
+					r.Get("/plans/{planId}/sections/{sectionId}/history", h.ListPlanSectionHistory)
 					r.Get("/issues/{issueId}/ask-plan", h.GetIssueAskPlan)
 					r.With(handler.RequireHumanActor).Post("/issues/{issueId}/decision-response", h.DecisionResponse)
 					r.Get("/decisions", h.ListDecisions)

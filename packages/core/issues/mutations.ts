@@ -11,7 +11,11 @@ import { api } from "../api";
 import { decisionKeys } from "../decisions/queries";
 import { issueKeys } from "./queries";
 import type { AgentAnswerDraft } from "./agent-question";
-import type { PlanVerdictBody } from "./ask-plan";
+import type {
+  PlanCommentBody,
+  PlanSectionWriteBody,
+  PlanVerdictBody,
+} from "./ask-plan";
 import { projectKeys } from "../projects/queries";
 import { inboxKeys, type ArchivedInboxCache } from "../inbox/queries";
 import {
@@ -1085,6 +1089,80 @@ export function useReviewPlan(issueId: string) {
       if (variables.verdict.verdict === "approve") {
         void qc.invalidateQueries({ queryKey: issueKeys.detail(wsId, issueId) });
       }
+    },
+  });
+}
+
+// M-275: the plan page's writes. Every one of them changes what the Decisions
+// queue shows (a comment is not a verdict, but a resolve/delivered badge is),
+// so all of them invalidate the decision queue beside the ask-plan read the
+// page renders from. A section write also invalidates its own history, which
+// is the ledger the history panel reads.
+
+/** Comment on a passage of one section, or reply to an existing comment. */
+export function useAddPlanComment(issueId: string) {
+  const qc = useQueryClient();
+  const wsId = useWorkspaceId();
+  return useMutation({
+    mutationFn: ({
+      planId,
+      comment,
+    }: {
+      planId: string;
+      comment: PlanCommentBody;
+    }) => api.addPlanComment(wsId, planId, comment),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: issueKeys.askPlan(wsId, issueId) });
+      void qc.invalidateQueries({ queryKey: decisionKeys.all(wsId) });
+    },
+  });
+}
+
+/** Resolve one comment thread. Idempotent in the server's CAS: a second
+ *  resolve answers 409 `comment_resolved`, which the panel reports. */
+export function useResolvePlanComment(issueId: string) {
+  const qc = useQueryClient();
+  const wsId = useWorkspaceId();
+  return useMutation({
+    mutationFn: ({
+      planId,
+      commentId,
+    }: {
+      planId: string;
+      commentId: string;
+    }) => api.resolvePlanComment(wsId, planId, commentId),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: issueKeys.askPlan(wsId, issueId) });
+      void qc.invalidateQueries({ queryKey: decisionKeys.all(wsId) });
+    },
+  });
+}
+
+/**
+ * The human's edit of one section (or a restore from its history, which is the
+ * same write of an older version). Fenced on `base_revision`; a 409
+ * `stale_plan_revision` throws through so the panel can say the plan moved.
+ */
+export function useWritePlanSection(issueId: string) {
+  const qc = useQueryClient();
+  const wsId = useWorkspaceId();
+  return useMutation({
+    mutationFn: ({
+      planId,
+      sectionId,
+      body,
+    }: {
+      planId: string;
+      sectionId: string;
+      body: PlanSectionWriteBody;
+    }) => api.writePlanSection(wsId, planId, sectionId, body),
+    onSuccess: (_plan, variables) => {
+      void qc.invalidateQueries({ queryKey: issueKeys.askPlan(wsId, issueId) });
+      void qc.invalidateQueries({ queryKey: issueKeys.planHistoryAll(wsId) });
+      void qc.invalidateQueries({ queryKey: decisionKeys.all(wsId) });
+      void qc.invalidateQueries({
+        queryKey: issueKeys.planHistory(wsId, variables.planId, variables.sectionId),
+      });
     },
   });
 }

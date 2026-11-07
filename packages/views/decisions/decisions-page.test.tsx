@@ -70,6 +70,11 @@ vi.mock("@multica/core/issues/mutations", () => ({
     mutateAsync: transports.fenced,
     isPending: false,
   }),
+  // The plan panel mounts inside the detail pane; these tests never write a
+  // plan, they only need the hooks to exist so the pane can render.
+  useAddPlanComment: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useResolvePlanComment: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useWritePlanSection: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 
 vi.mock("@multica/core/hooks", () => ({

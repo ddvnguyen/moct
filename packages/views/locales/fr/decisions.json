@@ -54,6 +54,8 @@
     "status_hint": "Cette passation se répond pour l'instant depuis le ticket ; cette liste lit l'état du ticket.",
     "unknown_title": "Cette version ne peut pas y répondre",
     "unknown_hint": "Elle attend toujours. Ouvrez le ticket pour en lire le contexte.",
-    "answered_hint": "Les réponses enregistrées sont en lecture seule. Une nouvelle demande arrive sur sa propre ligne."
+    "answered_hint": "Les réponses enregistrées sont en lecture seule. Une nouvelle demande arrive sur sa propre ligne.",
+    "plan_comments": "Passages commentés",
+    "plan_comment_resolved": "Résolu"
   }
 }

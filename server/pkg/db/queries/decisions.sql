@@ -47,12 +47,11 @@ WITH scoped_issues AS MATERIALIZED (
     UNION ALL
     SELECT 'native', n.task_id::text || ':' || n.seq::text, n.issue_id, n.agent_id, n.created_at, n.task_id, n.seq, n.answer_state, n.answer_comment_id, NULL::uuid, n.created_at, n.answer_failure_reason
     FROM native n
-    UNION ALL
-    SELECT 'status', i.id::text, i.id, NULL::uuid, i.updated_at, NULL::uuid, NULL::integer, i.status, NULL::uuid, NULL::uuid, i.updated_at, NULL::text
-    FROM scoped_issues i WHERE i.status = 'wait_for_decision'
-      AND NOT EXISTS (SELECT 1 FROM agent_question_card c WHERE c.issue_id = i.id AND c.workspace_id = i.workspace_id AND c.status = 'open')
-      AND NOT EXISTS (SELECT 1 FROM agent_plan p WHERE p.issue_id = i.id AND p.workspace_id = i.workspace_id AND p.status = 'in_review')
-      AND NOT EXISTS (SELECT 1 FROM native n WHERE n.issue_id = i.id)
+    -- M-275: no 'status' branch. `wait_for_decision` is the Owner's temporary
+    -- workaround until ask/plan is used everywhere (Owner on M-97), so a
+    -- handoff by status is not a decision waiting on a human: it must not
+    -- take a slot in Pending or in the sidebar badge count. The status rows
+    -- stay in `history` below, so answered receipts still render.
 ), visible_pending AS MATERIALIZED (
     SELECT * FROM pending WHERE agent_id IS NULL OR agent_id = ANY(sqlc.arg(visible_agents)::uuid[])
 ), history AS (
@@ -104,7 +103,9 @@ SELECT payload FROM (
   WHERE sqlc.arg(kind)::text = 'question' AND c.workspace_id = sqlc.arg(workspace_id)::uuid
     AND c.id = sqlc.arg(source_id)::uuid AND c.agent_id = ANY(sqlc.arg(visible_agents)::uuid[])
   UNION ALL
-  SELECT jsonb_build_object('plan', to_jsonb(p), 'review', to_jsonb(r))
+  SELECT jsonb_build_object('plan', to_jsonb(p), 'review', to_jsonb(r),
+         'comments', COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY c.created_at ASC)
+             FROM agent_plan_comment c WHERE c.plan_id = p.id), '[]'::jsonb))
   FROM agent_plan p LEFT JOIN agent_plan_review r ON r.plan_id = p.id AND r.id = sqlc.narg(response_id)::uuid
   WHERE sqlc.arg(kind)::text = 'plan' AND p.workspace_id = sqlc.arg(workspace_id)::uuid
     AND p.id = sqlc.arg(source_id)::uuid AND p.agent_id = ANY(sqlc.arg(visible_agents)::uuid[])

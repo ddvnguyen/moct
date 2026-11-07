@@ -145,6 +145,12 @@ export const issueKeys = {
     [...issueKeys.all(wsId), "ask-plan"] as const,
   askPlan: (wsId: string, id: string) =>
     [...issueKeys.askPlanAll(wsId), id] as const,
+  /** M-275: one section's write history, keyed per plan + section. The plan
+   *  id is in the key because a revised plan is a different ledger. */
+  planHistory: (wsId: string, planId: string, sectionId: string) =>
+    [...issueKeys.all(wsId), "plan-history", planId, sectionId] as const,
+  planHistoryAll: (wsId: string) =>
+    [...issueKeys.all(wsId), "plan-history"] as const,
   /** Resolve a bare issue identifier (e.g. "MUL-123") to an issue. */
   identifier: (wsId: string, identifier: string) =>
     [...issueKeys.all(wsId), "identifier", identifier] as const,
@@ -542,6 +548,28 @@ export function issueAskPlanOptions(wsId: string, issueId: string) {
     queryKey: issueKeys.askPlan(wsId, issueId),
     queryFn: () => api.getIssueAskPlan(wsId, issueId),
     enabled: !!wsId && !!issueId,
+  });
+}
+
+/**
+ * One plan section's history (M-275), newest version first.
+ *
+ * The server seeds the current text as a version on the first read of a
+ * section that predates the ledger, so an empty list here means the section
+ * itself is gone, never that it was never written. Keyed on the plan and the
+ * section: a revision bump is not a key change — the caller refetches, which
+ * is what makes a save show up in its own history.
+ */
+export function planSectionHistoryOptions(
+  wsId: string,
+  planId: string,
+  sectionId: string,
+  revision: number,
+) {
+  return queryOptions({
+    queryKey: [...issueKeys.planHistory(wsId, planId, sectionId), revision] as const,
+    queryFn: () => api.listPlanSectionVersions(wsId, planId, sectionId),
+    enabled: !!wsId && !!planId && sectionId !== "",
   });
 }
 

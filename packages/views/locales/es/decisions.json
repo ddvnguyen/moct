@@ -54,6 +54,8 @@
     "status_hint": "Por ahora este traspaso se responde en la página de la tarea; esta lista lo lee desde la propia tarea.",
     "unknown_title": "Esta compilación no puede responder a esta solicitud",
     "unknown_hint": "Sigue en espera. Abre la tarea para leer su contexto.",
-    "answered_hint": "Las respuestas registradas son de solo lectura. Una nueva solicitud llega como su propia fila."
+    "answered_hint": "Las respuestas registradas son de solo lectura. Una nueva solicitud llega como su propia fila.",
+    "plan_comments": "Pasajes comentados",
+    "plan_comment_resolved": "Resuelto"
   }
 }

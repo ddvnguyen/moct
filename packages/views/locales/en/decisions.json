@@ -54,6 +54,8 @@
     "status_hint": "This handoff is answered on the issue page for now; this list reads it from the issue itself.",
     "unknown_title": "This build cannot answer this request",
     "unknown_hint": "It is still waiting. Open the issue to read its context.",
-    "answered_hint": "Recorded answers are read-only. A new request arrives as its own row."
+    "answered_hint": "Recorded answers are read-only. A new request arrives as its own row.",
+    "plan_comments": "Commented passages",
+    "plan_comment_resolved": "Resolved"
   }
 }

@@ -150,7 +150,10 @@ func TestDecisionProjectionScopeAndPages(t *testing.T) {
 		return out
 	}
 	first := get()
-	if first.PendingCount != 4 || len(first.Items) != 2 {
+	// M-275: the `wait_for_decision` issue (`waiting`) no longer takes a pending
+	// slot — a handoff by status is not a decision waiting on a human. The two
+	// open cards and the in_review plan on `structured` still do.
+	if first.PendingCount != 3 || len(first.Items) != 2 {
 		t.Fatalf("first page: %+v", first)
 	}
 	last := first.Items[1]
@@ -158,7 +161,7 @@ func TestDecisionProjectionScopeAndPages(t *testing.T) {
 	p.CursorKind = last.Kind
 	p.CursorID = last.SourceID
 	second := get()
-	if len(second.Items) != 2 || second.PendingCount != 4 {
+	if len(second.Items) != 1 || second.PendingCount != 3 {
 		t.Fatalf("second page: %+v", second)
 	}
 	seen := map[string]bool{}
@@ -167,8 +170,10 @@ func TestDecisionProjectionScopeAndPages(t *testing.T) {
 			t.Fatal("duplicate page item")
 		}
 		seen[item.SourceID] = true
-		if item.Kind == "status" && item.IssueID == issue {
-			t.Fatal("structured issue duplicated by fallback")
+		// M-275: no status handoff is pending, whether or not the issue also
+		// carries a structured card or plan.
+		if item.Kind == "status" {
+			t.Fatalf("status handoff reached pending: %+v", item)
 		}
 	}
 	p.State = "answered"
@@ -195,12 +200,14 @@ func TestDecisionProjectionScopeAndPages(t *testing.T) {
 	p.ProjectID = pgtype.UUID{}
 	p.State = "pending"
 	all := get()
-	if all.PendingCount != 5 {
+	if all.PendingCount != 3 {
 		t.Fatalf("all projects: %+v", all)
 	}
+	// Every remaining pending source belongs to an agent; the status rows that
+	// used to survive this scope had no agent at all.
 	p.VisibleAgents = []pgtype.UUID{}
 	restricted := get()
-	if restricted.PendingCount != 2 {
+	if restricted.PendingCount != 0 {
 		t.Fatalf("permission scope: %+v", restricted)
 	}
 }
@@ -271,7 +278,7 @@ func TestDecisionDetailDecodesCompositeSourceID(t *testing.T) {
 		"comments": testutil.Raw(`'["Ship it"]'::jsonb`), "reviewed_by": testUserID,
 	})
 	receipt := dbfx.Insert(t, "issue_decision_response", testutil.Cols{
-		"id": testutil.Raw("gen_random_uuid()"),
+		"id":           testutil.Raw("gen_random_uuid()"),
 		"workspace_id": testWorkspaceID, "issue_id": issue, "actor_id": testUserID,
 		"client_request_id": testutil.Raw("gen_random_uuid()"), "source_revision": 1,
 		"decision": "Approve", "rationale": "Reviewed", "next_status": "in_progress",
@@ -400,5 +407,54 @@ func TestDeleteIssueRemovesOnlyItsDecisionReceipts(t *testing.T) {
 	}
 	if rowExists(t, "issue_decision_response", receipt) || !rowExists(t, "issue_decision_response", otherReceipt) {
 		t.Fatal("issue deletion did not remove only the target's receipt")
+	}
+}
+
+// TestStatusHandoffLeavesPendingKeepsAnswered pins M-275 scope item 3: a
+// `wait_for_decision` issue is the Owner's temporary workaround until ask/plan
+// is used everywhere, so it must not occupy Pending or the sidebar badge — but
+// once a verdict was recorded, its receipt belongs in Answered.
+func TestStatusHandoffLeavesPendingKeepsAnswered(t *testing.T) {
+	project := dbfx.Project(t, "status handoff project")
+	issue := dbfx.Issue(t, "status handoff", testutil.Cols{
+		"project_id": project,
+		"status":     "wait_for_decision",
+	})
+	read := func(state string) decisionsResult {
+		t.Helper()
+		req := withURLParam(newRequest("GET", "/decisions?state="+state+"&project_id="+project, nil), "id", testWorkspaceID)
+		var page decisionsResult
+		testutil.Call(t, testHandler.ListDecisions, req).Want(200).JSON(&page)
+		return page
+	}
+
+	pending := read("pending")
+	if pending.PendingCount != 0 || len(pending.Items) != 0 {
+		t.Fatalf("wait_for_decision reached pending: %+v", pending)
+	}
+	if answered := read("answered"); len(answered.Items) != 0 {
+		t.Fatalf("unanswered handoff reached answered: %+v", answered)
+	}
+
+	// A recorded verdict is a receipt: it still reads back in Answered, which
+	// is the history the handoff form leaves behind.
+	receipt := dbfx.Insert(t, "issue_decision_response", testutil.Cols{
+		"id":                testutil.Raw("gen_random_uuid()"),
+		"workspace_id":      testWorkspaceID,
+		"issue_id":          issue,
+		"actor_id":          testUserID,
+		"client_request_id": testutil.Raw("gen_random_uuid()"),
+		"source_revision":   1,
+		"decision":          "Approve",
+		"rationale":         "Ship it",
+		"next_status":       "in_progress",
+		"comment_id":        testutil.Raw("gen_random_uuid()"),
+	})
+	if pending := read("pending"); pending.PendingCount != 0 {
+		t.Fatalf("answered handoff returned to pending: %+v", pending)
+	}
+	answered := read("answered")
+	if len(answered.Items) != 1 || answered.Items[0].Kind != "status" || answered.Items[0].SourceID != issue+":"+receipt {
+		t.Fatalf("handoff receipt not in answered: %+v", answered)
 	}
 }

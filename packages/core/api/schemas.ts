@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { normalizeIssueStatusCategory } from "../issues/config/status";
-import type { IssueAskPlan } from "../issues/ask-plan";
+import type { IssueAskPlan, PlanSectionVersion } from "../issues/ask-plan";
 import type {
   WorkflowHandoffPreview,
   IssueWorkflow,
@@ -3012,6 +3012,27 @@ export const AskPlanQuestionCardSchema = z
   })
   .loose();
 
+// M-275: one anchored comment on a plan. Every anchor field defaults instead
+// of failing the parse: a plan page that lost its comments would hide a review
+// that is still waiting, which is worse than a comment rendered without its
+// quote.
+export const PlanCommentSchema = z
+  .object({
+    id: z.string(),
+    plan_id: z.string(),
+    section_id: z.string().catch(""),
+    quote: z.string().catch(""),
+    body: z.string(),
+    parent_comment_id: z.string().nullish(),
+    author_user_id: z.string().catch(""),
+    resolved_at: z.string().nullish(),
+    resolved_by: z.string().nullish(),
+    delivered_at: z.string().nullish(),
+    delivered_verdict: z.string().nullish(),
+    created_at: z.string().catch(""),
+  })
+  .loose();
+
 export const AgentPlanSchema = z
   .object({
     id: z.string(),
@@ -3023,6 +3044,33 @@ export const AgentPlanSchema = z
     submitted_revision: z.number().optional(),
     sections: z.array(AskPlanSectionSchema),
     approved_by: z.string().nullish(),
+    comments: z.array(PlanCommentSchema).optional(),
+  })
+  .loose();
+
+// M-275: one row of a section's history (`GET .../sections/{id}/history`).
+export const PlanSectionVersionSchema = z
+  .object({
+    id: z.string(),
+    section_id: z.string(),
+    revision: z.number(),
+    heading: z.string().catch(""),
+    markdown: z.string().catch(""),
+    writer_type: z.string().catch("agent"),
+    writer_id: z.string().nullish(),
+    created_at: z.string().catch(""),
+  })
+  .loose();
+
+export const PlanSectionHistorySchema: z.ZodType<{
+  section_id: string;
+  revision: number;
+  versions: PlanSectionVersion[];
+}> = z
+  .object({
+    section_id: z.string(),
+    revision: z.number().catch(0),
+    versions: z.array(PlanSectionVersionSchema).catch([]),
   })
   .loose();
 

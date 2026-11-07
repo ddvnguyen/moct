@@ -29,7 +29,8 @@ import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import { Flag, Loader2, RefreshCw } from "@multica/ui/icons";
 import { ReadonlyContent } from "../editor";
 import { AgentQuestionCard } from "../issues/components/agent-question-card";
-import { PlanVerdictForm } from "../issues/components/ask-plan-panel";
+import { PlanReviewPanel } from "../issues/components/plan-review-panel";
+import { commentThreads, isPlanCommentResolved } from "../issues/utils/plan-doc";
 import { AppLink } from "../navigation";
 import { useTimeAgo, useT } from "../i18n";
 import { decisionKind, type DecisionState } from "./decision-presentation";
@@ -262,7 +263,7 @@ function SourceBody({
         );
       }
       return (
-        <PlanVerdictForm
+        <PlanReviewPanel
           plan={parsed.plan}
           issueId={parsed.plan.issue_id}
           onRecorded={onChanged}
@@ -445,6 +446,9 @@ function ReadOnlyPlan({
   children?: React.ReactNode;
 }) {
   const { t } = useT("decisions");
+  // M-275: the commented passages a verdict sent travel with the plan, so the
+  // answered receipt shows what the human actually said about which text.
+  const threads = commentThreads(plan.comments ?? []);
   return (
     <section aria-label={plan.title} data-agent-plan={plan.status}>
       <p className="text-body font-medium text-foreground">{plan.title}</p>
@@ -464,6 +468,47 @@ function ReadOnlyPlan({
           </div>
         ))}
       </div>
+      {threads.length > 0 && (
+        <section className="mt-4 rounded-md border px-3 py-2.5">
+          <p className="text-caption font-medium text-foreground">
+            {t(($) => $.detail.plan_comments)}
+          </p>
+          <ul className="mt-1 space-y-2">
+            {threads.map(({ root, replies }) => (
+              <li
+                key={root.id}
+                className={isPlanCommentResolved(root) ? "opacity-60" : undefined}
+              >
+                <p className="text-caption text-muted-foreground">
+                  {plan.sections.find((section) => section.sectionId === root.section_id)
+                    ?.heading ?? root.section_id}
+                  {root.resolved_at ? ` · ${t(($) => $.detail.plan_comment_resolved)}` : ""}
+                </p>
+                {root.quote !== "" && (
+                  <blockquote className="my-1 border-l-2 border-border pl-2 text-caption text-muted-foreground">
+                    {root.quote}
+                  </blockquote>
+                )}
+                <p className="whitespace-pre-wrap text-caption text-foreground">
+                  {root.body}
+                </p>
+                {replies.length > 0 && (
+                  <ul className="mt-1 space-y-1 border-l-2 border-border pl-2">
+                    {replies.map((reply) => (
+                      <li
+                        key={reply.id}
+                        className="whitespace-pre-wrap text-caption text-foreground"
+                      >
+                        {reply.body}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
       {children}
     </section>
   );

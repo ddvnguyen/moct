@@ -509,3 +509,11 @@ html[data-sidebar-resizing="true"] {
   background-color: var(--find-match-active);
   color: var(--find-match-foreground);
 }
+
+/* A commented plan passage (M-275). Painted over the rendered Markdown with
+ * the CSS Custom Highlight API, so the Markdown DOM is never rewritten and the
+ * tint layers under find matches. Browsers without the API skip the paint; the
+ * plan page's comment rail still shows every quote. */
+::highlight(plan-comment) {
+  background-color: var(--plan-comment-highlight);
+}

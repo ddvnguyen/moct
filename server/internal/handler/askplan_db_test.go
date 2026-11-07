@@ -38,6 +38,10 @@ func newAskPlanFixture(t *testing.T) askPlanFixture {
 		"status":     "running",
 	})
 	dbfx.Cleanup(t, `DELETE FROM agent_question_card WHERE task_id = $1`, taskID)
+	// Plan review threads and section history reference the plan, so they go
+	// first (cleanups run last-registered-first).
+	dbfx.Cleanup(t, `DELETE FROM agent_plan_comment WHERE plan_id IN (SELECT id FROM agent_plan WHERE task_id = $1)`, taskID)
+	dbfx.Cleanup(t, `DELETE FROM agent_plan_section_version WHERE plan_id IN (SELECT id FROM agent_plan WHERE task_id = $1)`, taskID)
 	dbfx.Cleanup(t, `DELETE FROM agent_plan WHERE task_id = $1`, taskID)
 	dbfx.Cleanup(t, `DELETE FROM agent_plan_review WHERE plan_id IN (SELECT id FROM agent_plan WHERE issue_id = $1)`, issueID)
 	dbfx.Cleanup(t, `DELETE FROM inbox_item WHERE issue_id = $1 AND type IN ('agent_question','plan_review')`, issueID)

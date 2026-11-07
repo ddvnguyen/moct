@@ -356,6 +356,14 @@ deleted_draft_restores AS (
 deleted_agent_builder_drafts AS (
     DELETE FROM agent_builder_draft WHERE workspace_id = $1
 ),
+-- M-275: plan review threads and section history carry workspace_id and no FK
+-- to agent_plan (additive-only house style), so no cascade reaches them.
+deleted_agent_plan_comments AS (
+    DELETE FROM agent_plan_comment WHERE workspace_id = $1
+),
+deleted_agent_plan_section_versions AS (
+    DELETE FROM agent_plan_section_version WHERE workspace_id = $1
+),
 deleted_comment_reactions AS (
     DELETE FROM comment_reaction WHERE workspace_id = $1
 ),

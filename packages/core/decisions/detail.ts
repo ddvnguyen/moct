@@ -8,6 +8,7 @@ import {
   type AgentPlan,
   type AskPlanQuestion,
   type AskPlanQuestionCard,
+  type PlanComment,
 } from "../issues/ask-plan";
 
 /**
@@ -198,7 +199,34 @@ function readPlanSections(value: unknown): AgentPlan["sections"] {
   });
 }
 
-/** `{plan, review}` from the plan detail query, or null. */
+/** The plan's passage comments, as `GetDecisionDetail` now selects them. */
+function readPlanComments(value: unknown): PlanComment[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const record = asRecord(entry);
+    const id = asText(record?.id);
+    const body = asText(record?.body);
+    if (record === null || id === "" || body === "") return [];
+    return [
+      {
+        id,
+        plan_id: asText(record.plan_id),
+        section_id: asText(record.section_id),
+        quote: asText(record.quote),
+        body,
+        parent_comment_id: asNullableText(record.parent_comment_id),
+        author_user_id: asText(record.author_user_id),
+        resolved_at: asNullableText(record.resolved_at),
+        resolved_by: asNullableText(record.resolved_by),
+        delivered_at: asNullableText(record.delivered_at),
+        delivered_verdict: asNullableText(record.delivered_verdict),
+        created_at: asText(record.created_at),
+      },
+    ];
+  });
+}
+
+/** `{plan, review, comments}` from the plan detail query, or null. */
 export function parseDecisionPlan(
   detail: Record<string, unknown>,
 ): DecisionPlanDetail | null {
@@ -218,8 +246,8 @@ export function parseDecisionPlan(
       title: asText(plan.title),
       status: asText(plan.status),
       revision,
-      ...(submitted === null ? {} : { submitted_revision: submitted }),
-      sections: readPlanSections(plan.sections),
+      ...(submitted === null ? {} : { submitted_revision: submitted }),		sections: readPlanSections(plan.sections),
+      comments: readPlanComments(detail.comments),
       ...(asNullableText(plan.approved_by) === null
         ? {}
         : { approved_by: asNullableText(plan.approved_by) }),

@@ -100,6 +100,22 @@ type AgentPlan struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
+type AgentPlanComment struct {
+	ID               pgtype.UUID        `json:"id"`
+	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
+	PlanID           pgtype.UUID        `json:"plan_id"`
+	SectionID        string             `json:"section_id"`
+	Quote            string             `json:"quote"`
+	Body             string             `json:"body"`
+	ParentCommentID  pgtype.UUID        `json:"parent_comment_id"`
+	AuthorUserID     pgtype.UUID        `json:"author_user_id"`
+	ResolvedAt       pgtype.Timestamptz `json:"resolved_at"`
+	ResolvedBy       pgtype.UUID        `json:"resolved_by"`
+	DeliveredAt      pgtype.Timestamptz `json:"delivered_at"`
+	DeliveredVerdict pgtype.Text        `json:"delivered_verdict"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type AgentPlanReview struct {
 	ID           pgtype.UUID        `json:"id"`
 	PlanID       pgtype.UUID        `json:"plan_id"`
@@ -109,6 +125,19 @@ type AgentPlanReview struct {
 	Note         pgtype.Text        `json:"note"`
 	ReviewedBy   pgtype.UUID        `json:"reviewed_by"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type AgentPlanSectionVersion struct {
+	ID          pgtype.UUID        `json:"id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	PlanID      pgtype.UUID        `json:"plan_id"`
+	SectionID   string             `json:"section_id"`
+	Revision    int32              `json:"revision"`
+	Heading     string             `json:"heading"`
+	Markdown    string             `json:"markdown"`
+	WriterType  string             `json:"writer_type"`
+	WriterID    pgtype.UUID        `json:"writer_id"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
 type AgentQuestionCard struct {

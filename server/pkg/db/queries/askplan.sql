@@ -200,3 +200,91 @@ SELECT * FROM agent_question_card WHERE id = $1 FOR UPDATE;
 -- the sweep's plan-row lock fails its own status/revision CAS against the plan
 -- this transaction already cancelled.
 SELECT * FROM agent_plan WHERE id = $1 FOR UPDATE;
+
+-- M-275: the plan page's review threads and section history.
+--
+-- A comment is anchored to a passage of one section (section_id + quote) and
+-- may be a reply (parent_comment_id); it stays pending until a verdict sends
+-- it, which stamps delivered_at/delivered_verdict once. The flat
+-- agent_plan_review.comments list keeps its contract: the plan page's
+-- comments are appended to it as their bodies.
+
+-- name: CreateAgentPlanComment :one
+INSERT INTO agent_plan_comment (
+    id, workspace_id, plan_id, section_id, quote, body,
+    parent_comment_id, author_user_id
+) VALUES (
+    @id, @workspace_id, @plan_id, @section_id, @quote, @body,
+    sqlc.narg('parent_comment_id'), @author_user_id
+)
+RETURNING *;
+
+-- name: GetAgentPlanComment :one
+-- A reply is validated against the plan it lands on before it is written.
+SELECT * FROM agent_plan_comment WHERE id = $1;
+
+-- name: ListAgentPlanComments :many
+-- The plan page and the decision detail read a plan's whole thread set. Its
+-- index is (plan_id, created_at), so this is the index order.
+SELECT * FROM agent_plan_comment
+WHERE plan_id = $1
+ORDER BY created_at ASC;
+
+-- name: ListUndeliveredAgentPlanComments :many
+-- The verdict settles exactly the comments still waiting; idx_apc_pending
+-- keeps this to the rows that are actually pending.
+SELECT * FROM agent_plan_comment
+WHERE plan_id = $1 AND delivered_at IS NULL
+ORDER BY created_at ASC;
+
+-- name: DeliverAgentPlanComments :exec
+-- Stamped by the verdict that sends them, so a comment reaches the resumed
+-- run exactly once and a replayed verdict re-sends nothing.
+UPDATE agent_plan_comment
+SET delivered_at = now(),
+    delivered_verdict = @verdict
+WHERE id = ANY(@ids::uuid[]) AND delivered_at IS NULL;
+
+-- name: ResolveAgentPlanComment :one
+-- Human-only, and a CAS on resolved_at IS NULL: resolving twice matches no row
+-- (handler → 409), and the agent's text is never rewritten by a resolve.
+UPDATE agent_plan_comment
+SET resolved_at = now(),
+    resolved_by = @resolved_by
+WHERE id = $1 AND plan_id = $2 AND resolved_at IS NULL
+RETURNING *;
+
+-- name: CreateAgentPlanSectionVersion :exec
+-- One row per accepted section write, by the agent or by a Human. ON CONFLICT
+-- DO NOTHING makes a replay (the same plan revision writing the same section
+-- twice) a no-op instead of a duplicate, and lets the lazy seed probe without
+-- a read-then-write race.
+INSERT INTO agent_plan_section_version (
+    id, workspace_id, plan_id, section_id, revision, heading, markdown,
+    writer_type, writer_id
+) VALUES (
+    @id, @workspace_id, @plan_id, @section_id, @revision, @heading, @markdown,
+    @writer_type, sqlc.narg('writer_id')
+)
+ON CONFLICT (plan_id, section_id, revision) DO NOTHING;
+
+-- name: ListAgentPlanSectionVersions :many
+-- Newest first: the section history panel and the lazy seed's existence check.
+SELECT * FROM agent_plan_section_version
+WHERE plan_id = $1 AND section_id = $2
+ORDER BY revision DESC;
+
+-- name: UpdateAgentPlanSection :one
+-- The Human's edit: rewrite the whole sections array and bump the revision,
+-- fenced on base_revision AND on the statuses an edit is allowed in. When the
+-- plan is in review the submitted_revision advances with the edit (M-275
+-- decision 1), so the reviewer's own verdict rides their edit instead of
+-- 409-ing against a revision their save produced.
+UPDATE agent_plan
+SET sections = @sections,
+    submitted_revision = CASE WHEN status = 'in_review' THEN revision + 1 ELSE submitted_revision END,
+    revision = revision + 1,
+    updated_at = now()
+WHERE id = $1 AND revision = @base_revision
+  AND status IN ('draft', 'in_review', 'changes_requested')
+RETURNING *;

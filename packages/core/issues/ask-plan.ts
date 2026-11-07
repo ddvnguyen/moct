@@ -46,6 +46,42 @@ export interface AskPlanSection {
   markdown: string;
 }
 
+/**
+ * One comment on a plan, anchored to a passage of one section (M-275).
+ *
+ * `section_id` is `""` for a note with no anchor and `quote` is `""` when
+ * nothing was selected. `parent_comment_id` makes it a reply; `resolved_at` is
+ * the human's resolve, which never rewrites the agent's text; `delivered_at` is
+ * the verdict that sent it to the agent, stamped once.
+ */
+export interface PlanComment {
+  id: string;
+  plan_id: string;
+  section_id: string;
+  quote: string;
+  body: string;
+  parent_comment_id?: string | null;
+  author_user_id: string;
+  resolved_at?: string | null;
+  resolved_by?: string | null;
+  delivered_at?: string | null;
+  delivered_verdict?: string | null;
+  created_at: string;
+}
+
+/** One accepted write to a plan section, newest first in the history read. */
+export interface PlanSectionVersion {
+  id: string;
+  section_id: string;
+  revision: number;
+  heading: string;
+  markdown: string;
+  /** `agent | member` — whoever's write produced this version. */
+  writer_type: string;
+  writer_id?: string | null;
+  created_at: string;
+}
+
 /** The plan currently open on an issue. `status` is the 586 CHECK constraint. */
 export interface AgentPlan {
   id: string;
@@ -59,6 +95,24 @@ export interface AgentPlan {
   submitted_revision?: number;
   sections: AskPlanSection[];
   approved_by?: string | null;
+  /** The plan page's passage comments, oldest first (M-275). */
+  comments?: PlanComment[];
+}
+
+/** A comment as the plan page writes it. `base_revision` fences the anchor. */
+export interface PlanCommentBody {
+  base_revision: number;
+  section_id: string;
+  quote: string;
+  body: string;
+  parent_comment_id?: string;
+}
+
+/** A human's edit of one section; `base_revision` fences the write. */
+export interface PlanSectionWriteBody {
+  base_revision: number;
+  heading: string;
+  markdown: string;
 }
 
 /**
@@ -75,6 +129,24 @@ export interface IssueAskPlan {
 }
 
 export const EMPTY_ISSUE_ASK_PLAN: IssueAskPlan = { question_cards: [] };
+
+/**
+ * The fallback a section write parses into when its response is unreadable.
+ *
+ * A failed plan write is already a failed request — an `ApiError` — so this
+ * value only has to keep `parseWithFallback`'s types honest, never to be
+ * rendered as a plan. The caller re-reads the plan on success anyway.
+ */
+export const EMPTY_AGENT_PLAN: AgentPlan = {
+  id: "",
+  issue_id: "",
+  task_id: "",
+  title: "",
+  status: "",
+  revision: 0,
+  sections: [],
+  comments: [],
+};
 
 /** The verdicts `POST /plans/{planId}/verdict` accepts, in panel order. */
 export type PlanVerdict = "approve" | "changes_requested" | "cancel";

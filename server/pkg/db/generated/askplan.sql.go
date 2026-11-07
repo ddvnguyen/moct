@@ -217,6 +217,108 @@ func (q *Queries) CreateAgentPlan(ctx context.Context, arg CreateAgentPlanParams
 	return i, err
 }
 
+const createAgentPlanComment = `-- name: CreateAgentPlanComment :one
+
+INSERT INTO agent_plan_comment (
+    id, workspace_id, plan_id, section_id, quote, body,
+    parent_comment_id, author_user_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8
+)
+RETURNING id, workspace_id, plan_id, section_id, quote, body, parent_comment_id, author_user_id, resolved_at, resolved_by, delivered_at, delivered_verdict, created_at
+`
+
+type CreateAgentPlanCommentParams struct {
+	ID              pgtype.UUID `json:"id"`
+	WorkspaceID     pgtype.UUID `json:"workspace_id"`
+	PlanID          pgtype.UUID `json:"plan_id"`
+	SectionID       string      `json:"section_id"`
+	Quote           string      `json:"quote"`
+	Body            string      `json:"body"`
+	ParentCommentID pgtype.UUID `json:"parent_comment_id"`
+	AuthorUserID    pgtype.UUID `json:"author_user_id"`
+}
+
+// M-275: the plan page's review threads and section history.
+//
+// A comment is anchored to a passage of one section (section_id + quote) and
+// may be a reply (parent_comment_id); it stays pending until a verdict sends
+// it, which stamps delivered_at/delivered_verdict once. The flat
+// agent_plan_review.comments list keeps its contract: the plan page's
+// comments are appended to it as their bodies.
+func (q *Queries) CreateAgentPlanComment(ctx context.Context, arg CreateAgentPlanCommentParams) (AgentPlanComment, error) {
+	row := q.db.QueryRow(ctx, createAgentPlanComment,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.PlanID,
+		arg.SectionID,
+		arg.Quote,
+		arg.Body,
+		arg.ParentCommentID,
+		arg.AuthorUserID,
+	)
+	var i AgentPlanComment
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.PlanID,
+		&i.SectionID,
+		&i.Quote,
+		&i.Body,
+		&i.ParentCommentID,
+		&i.AuthorUserID,
+		&i.ResolvedAt,
+		&i.ResolvedBy,
+		&i.DeliveredAt,
+		&i.DeliveredVerdict,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createAgentPlanSectionVersion = `-- name: CreateAgentPlanSectionVersion :exec
+INSERT INTO agent_plan_section_version (
+    id, workspace_id, plan_id, section_id, revision, heading, markdown,
+    writer_type, writer_id
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7,
+    $8, $9
+)
+ON CONFLICT (plan_id, section_id, revision) DO NOTHING
+`
+
+type CreateAgentPlanSectionVersionParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	PlanID      pgtype.UUID `json:"plan_id"`
+	SectionID   string      `json:"section_id"`
+	Revision    int32       `json:"revision"`
+	Heading     string      `json:"heading"`
+	Markdown    string      `json:"markdown"`
+	WriterType  string      `json:"writer_type"`
+	WriterID    pgtype.UUID `json:"writer_id"`
+}
+
+// One row per accepted section write, by the agent or by a Human. ON CONFLICT
+// DO NOTHING makes a replay (the same plan revision writing the same section
+// twice) a no-op instead of a duplicate, and lets the lazy seed probe without
+// a read-then-write race.
+func (q *Queries) CreateAgentPlanSectionVersion(ctx context.Context, arg CreateAgentPlanSectionVersionParams) error {
+	_, err := q.db.Exec(ctx, createAgentPlanSectionVersion,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.PlanID,
+		arg.SectionID,
+		arg.Revision,
+		arg.Heading,
+		arg.Markdown,
+		arg.WriterType,
+		arg.WriterID,
+	)
+	return err
+}
+
 const createAgentQuestionCard = `-- name: CreateAgentQuestionCard :one
 
 INSERT INTO agent_question_card (
@@ -275,6 +377,25 @@ func (q *Queries) CreateAgentQuestionCard(ctx context.Context, arg CreateAgentQu
 	return i, err
 }
 
+const deliverAgentPlanComments = `-- name: DeliverAgentPlanComments :exec
+UPDATE agent_plan_comment
+SET delivered_at = now(),
+    delivered_verdict = $1
+WHERE id = ANY($2::uuid[]) AND delivered_at IS NULL
+`
+
+type DeliverAgentPlanCommentsParams struct {
+	Verdict pgtype.Text   `json:"verdict"`
+	Ids     []pgtype.UUID `json:"ids"`
+}
+
+// Stamped by the verdict that sends them, so a comment reaches the resumed
+// run exactly once and a replayed verdict re-sends nothing.
+func (q *Queries) DeliverAgentPlanComments(ctx context.Context, arg DeliverAgentPlanCommentsParams) error {
+	_, err := q.db.Exec(ctx, deliverAgentPlanComments, arg.Verdict, arg.Ids)
+	return err
+}
+
 const getAgentPlan = `-- name: GetAgentPlan :one
 SELECT id, workspace_id, issue_id, task_id, agent_id, title, status, revision, submitted_revision, sections, approved_by, approved_at, cancelled_at, created_at, updated_at FROM agent_plan WHERE id = $1
 `
@@ -298,6 +419,32 @@ func (q *Queries) GetAgentPlan(ctx context.Context, id pgtype.UUID) (AgentPlan, 
 		&i.CancelledAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getAgentPlanComment = `-- name: GetAgentPlanComment :one
+SELECT id, workspace_id, plan_id, section_id, quote, body, parent_comment_id, author_user_id, resolved_at, resolved_by, delivered_at, delivered_verdict, created_at FROM agent_plan_comment WHERE id = $1
+`
+
+// A reply is validated against the plan it lands on before it is written.
+func (q *Queries) GetAgentPlanComment(ctx context.Context, id pgtype.UUID) (AgentPlanComment, error) {
+	row := q.db.QueryRow(ctx, getAgentPlanComment, id)
+	var i AgentPlanComment
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.PlanID,
+		&i.SectionID,
+		&i.Quote,
+		&i.Body,
+		&i.ParentCommentID,
+		&i.AuthorUserID,
+		&i.ResolvedAt,
+		&i.ResolvedBy,
+		&i.DeliveredAt,
+		&i.DeliveredVerdict,
+		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -418,6 +565,91 @@ func (q *Queries) GetOpenAgentPlanByIssue(ctx context.Context, issueID pgtype.UU
 	return i, err
 }
 
+const listAgentPlanComments = `-- name: ListAgentPlanComments :many
+SELECT id, workspace_id, plan_id, section_id, quote, body, parent_comment_id, author_user_id, resolved_at, resolved_by, delivered_at, delivered_verdict, created_at FROM agent_plan_comment
+WHERE plan_id = $1
+ORDER BY created_at ASC
+`
+
+// The plan page and the decision detail read a plan's whole thread set. Its
+// index is (plan_id, created_at), so this is the index order.
+func (q *Queries) ListAgentPlanComments(ctx context.Context, planID pgtype.UUID) ([]AgentPlanComment, error) {
+	rows, err := q.db.Query(ctx, listAgentPlanComments, planID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentPlanComment{}
+	for rows.Next() {
+		var i AgentPlanComment
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.PlanID,
+			&i.SectionID,
+			&i.Quote,
+			&i.Body,
+			&i.ParentCommentID,
+			&i.AuthorUserID,
+			&i.ResolvedAt,
+			&i.ResolvedBy,
+			&i.DeliveredAt,
+			&i.DeliveredVerdict,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAgentPlanSectionVersions = `-- name: ListAgentPlanSectionVersions :many
+SELECT id, workspace_id, plan_id, section_id, revision, heading, markdown, writer_type, writer_id, created_at FROM agent_plan_section_version
+WHERE plan_id = $1 AND section_id = $2
+ORDER BY revision DESC
+`
+
+type ListAgentPlanSectionVersionsParams struct {
+	PlanID    pgtype.UUID `json:"plan_id"`
+	SectionID string      `json:"section_id"`
+}
+
+// Newest first: the section history panel and the lazy seed's existence check.
+func (q *Queries) ListAgentPlanSectionVersions(ctx context.Context, arg ListAgentPlanSectionVersionsParams) ([]AgentPlanSectionVersion, error) {
+	rows, err := q.db.Query(ctx, listAgentPlanSectionVersions, arg.PlanID, arg.SectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentPlanSectionVersion{}
+	for rows.Next() {
+		var i AgentPlanSectionVersion
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.PlanID,
+			&i.SectionID,
+			&i.Revision,
+			&i.Heading,
+			&i.Markdown,
+			&i.WriterType,
+			&i.WriterID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listOpenQuestionCardsByIssue = `-- name: ListOpenQuestionCardsByIssue :many
 SELECT id, workspace_id, issue_id, task_id, agent_id, status, context, questions, answers, answered_by, answered_at, withdrawn_at, created_at, updated_at FROM agent_question_card
 WHERE issue_id = $1 AND status = 'open'
@@ -530,6 +762,48 @@ func (q *Queries) ListParkedAskPlanSweepCandidates(ctx context.Context, limit in
 	return items, nil
 }
 
+const listUndeliveredAgentPlanComments = `-- name: ListUndeliveredAgentPlanComments :many
+SELECT id, workspace_id, plan_id, section_id, quote, body, parent_comment_id, author_user_id, resolved_at, resolved_by, delivered_at, delivered_verdict, created_at FROM agent_plan_comment
+WHERE plan_id = $1 AND delivered_at IS NULL
+ORDER BY created_at ASC
+`
+
+// The verdict settles exactly the comments still waiting; idx_apc_pending
+// keeps this to the rows that are actually pending.
+func (q *Queries) ListUndeliveredAgentPlanComments(ctx context.Context, planID pgtype.UUID) ([]AgentPlanComment, error) {
+	rows, err := q.db.Query(ctx, listUndeliveredAgentPlanComments, planID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentPlanComment{}
+	for rows.Next() {
+		var i AgentPlanComment
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.PlanID,
+			&i.SectionID,
+			&i.Quote,
+			&i.Body,
+			&i.ParentCommentID,
+			&i.AuthorUserID,
+			&i.ResolvedAt,
+			&i.ResolvedBy,
+			&i.DeliveredAt,
+			&i.DeliveredVerdict,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recordAgentPlanReview = `-- name: RecordAgentPlanReview :one
 INSERT INTO agent_plan_review (
     id, plan_id, plan_revision, verdict, comments, note, reviewed_by
@@ -613,6 +887,43 @@ func (q *Queries) RequestAgentPlanChanges(ctx context.Context, arg RequestAgentP
 	return i, err
 }
 
+const resolveAgentPlanComment = `-- name: ResolveAgentPlanComment :one
+UPDATE agent_plan_comment
+SET resolved_at = now(),
+    resolved_by = $3
+WHERE id = $1 AND plan_id = $2 AND resolved_at IS NULL
+RETURNING id, workspace_id, plan_id, section_id, quote, body, parent_comment_id, author_user_id, resolved_at, resolved_by, delivered_at, delivered_verdict, created_at
+`
+
+type ResolveAgentPlanCommentParams struct {
+	ID         pgtype.UUID `json:"id"`
+	PlanID     pgtype.UUID `json:"plan_id"`
+	ResolvedBy pgtype.UUID `json:"resolved_by"`
+}
+
+// Human-only, and a CAS on resolved_at IS NULL: resolving twice matches no row
+// (handler → 409), and the agent's text is never rewritten by a resolve.
+func (q *Queries) ResolveAgentPlanComment(ctx context.Context, arg ResolveAgentPlanCommentParams) (AgentPlanComment, error) {
+	row := q.db.QueryRow(ctx, resolveAgentPlanComment, arg.ID, arg.PlanID, arg.ResolvedBy)
+	var i AgentPlanComment
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.PlanID,
+		&i.SectionID,
+		&i.Quote,
+		&i.Body,
+		&i.ParentCommentID,
+		&i.AuthorUserID,
+		&i.ResolvedAt,
+		&i.ResolvedBy,
+		&i.DeliveredAt,
+		&i.DeliveredVerdict,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const submitAgentPlan = `-- name: SubmitAgentPlan :one
 UPDATE agent_plan
 SET status = 'in_review',
@@ -640,6 +951,51 @@ type SubmitAgentPlanParams struct {
 // that is parking NOW, not the original proposer.
 func (q *Queries) SubmitAgentPlan(ctx context.Context, arg SubmitAgentPlanParams) (AgentPlan, error) {
 	row := q.db.QueryRow(ctx, submitAgentPlan, arg.ID, arg.Revision, arg.TaskID)
+	var i AgentPlan
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.TaskID,
+		&i.AgentID,
+		&i.Title,
+		&i.Status,
+		&i.Revision,
+		&i.SubmittedRevision,
+		&i.Sections,
+		&i.ApprovedBy,
+		&i.ApprovedAt,
+		&i.CancelledAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateAgentPlanSection = `-- name: UpdateAgentPlanSection :one
+UPDATE agent_plan
+SET sections = $2,
+    submitted_revision = CASE WHEN status = 'in_review' THEN revision + 1 ELSE submitted_revision END,
+    revision = revision + 1,
+    updated_at = now()
+WHERE id = $1 AND revision = $3
+  AND status IN ('draft', 'in_review', 'changes_requested')
+RETURNING id, workspace_id, issue_id, task_id, agent_id, title, status, revision, submitted_revision, sections, approved_by, approved_at, cancelled_at, created_at, updated_at
+`
+
+type UpdateAgentPlanSectionParams struct {
+	ID           pgtype.UUID `json:"id"`
+	Sections     []byte      `json:"sections"`
+	BaseRevision int32       `json:"base_revision"`
+}
+
+// The Human's edit: rewrite the whole sections array and bump the revision,
+// fenced on base_revision AND on the statuses an edit is allowed in. When the
+// plan is in review the submitted_revision advances with the edit (M-275
+// decision 1), so the reviewer's own verdict rides their edit instead of
+// 409-ing against a revision their save produced.
+func (q *Queries) UpdateAgentPlanSection(ctx context.Context, arg UpdateAgentPlanSectionParams) (AgentPlan, error) {
+	row := q.db.QueryRow(ctx, updateAgentPlanSection, arg.ID, arg.Sections, arg.BaseRevision)
 	var i AgentPlan
 	err := row.Scan(
 		&i.ID,

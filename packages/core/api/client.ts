@@ -256,9 +256,14 @@ import type { OnboardingCompletionPath } from "../onboarding/types";
 import type { AgentAnswerDraft } from "../issues/agent-question";
 import {
   EMPTY_ISSUE_ASK_PLAN,
+  EMPTY_AGENT_PLAN,
   type AgentPlan,
   type AskPlanQuestionCard,
   type IssueAskPlan,
+  type PlanComment,
+  type PlanCommentBody,
+  type PlanSectionVersion,
+  type PlanSectionWriteBody,
   type PlanVerdictBody,
 } from "../issues/ask-plan";
 import type {
@@ -531,7 +536,9 @@ import {
   EMPTY_SHARE_LINK,
   EMPTY_SHARE_LINK_INFO,
   EMPTY_JOIN_SHARE_LINK_RESPONSE,
+  AgentPlanSchema,
   IssueAskPlanSchema,
+  PlanSectionHistorySchema,
   WorkspaceListItemSchema,
   WorkspacePinnedSchema,
   type IssueView,
@@ -3361,18 +3368,74 @@ export class ApiClient {
       method: "POST",
       body: JSON.stringify({ answers }),
     });
-  }
+  }	async reviewPlan(
+		workspaceId: string,
+		planId: string,
+		verdict: PlanVerdictBody,
+	): Promise<{ plan: AgentPlan; resume_task: string }> {
+		return this.fetch(`/api/workspaces/${workspaceId}/plans/${planId}/verdict`, {
+			method: "POST",
+			body: JSON.stringify(verdict),
+		});
+	}
 
-  async reviewPlan(
-    workspaceId: string,
-    planId: string,
-    verdict: PlanVerdictBody,
-  ): Promise<{ plan: AgentPlan; resume_task: string }> {
-    return this.fetch(`/api/workspaces/${workspaceId}/plans/${planId}/verdict`, {
-      method: "POST",
-      body: JSON.stringify(verdict),
-    });
-  }
+	// M-275: the plan page's passage comments, resolve, section edit and
+	// section history. Commenting, resolving and editing are human-only on the
+	// server (RequireHumanActor); every write is fenced by the plan revision the
+	// page rendered, and a stale fence answers 409 `stale_plan_revision` with
+	// the current revision so the caller can re-read instead of retrying blind.
+	async addPlanComment(
+		workspaceId: string,
+		planId: string,
+		comment: PlanCommentBody,
+	): Promise<{ comment: PlanComment }> {
+		return this.fetch(`/api/workspaces/${workspaceId}/plans/${planId}/comments`, {
+			method: "POST",
+			body: JSON.stringify(comment),
+		});
+	}
+
+	async resolvePlanComment(
+		workspaceId: string,
+		planId: string,
+		commentId: string,
+	): Promise<{ comment: PlanComment }> {
+		return this.fetch(
+			`/api/workspaces/${workspaceId}/plans/${planId}/comments/${commentId}/resolve`,
+			{ method: "POST" },
+		);
+	}
+
+	async writePlanSection(
+		workspaceId: string,
+		planId: string,
+		sectionId: string,
+		body: PlanSectionWriteBody,
+	): Promise<AgentPlan> {
+		const raw = await this.fetch<unknown>(
+			`/api/workspaces/${workspaceId}/plans/${planId}/sections/${encodeURIComponent(sectionId)}`,
+			{ method: "PUT", body: JSON.stringify(body) },
+		);
+		return parseWithFallback(raw, AgentPlanSchema, EMPTY_AGENT_PLAN, {
+			endpoint: "PUT /api/workspaces/{id}/plans/{id}/sections/{id}",
+		});
+	}
+
+	async listPlanSectionVersions(
+		workspaceId: string,
+		planId: string,
+		sectionId: string,
+	): Promise<{ section_id: string; revision: number; versions: PlanSectionVersion[] }> {
+		const raw = await this.fetch<unknown>(
+			`/api/workspaces/${workspaceId}/plans/${planId}/sections/${encodeURIComponent(sectionId)}/history`,
+		);
+		return parseWithFallback(
+			raw,
+			PlanSectionHistorySchema,
+			{ section_id: sectionId, revision: 0, versions: [] },
+			{ endpoint: "GET /api/workspaces/{id}/plans/{id}/sections/{id}/history" },
+		);
+	}
 
   // Notification preferences
   //

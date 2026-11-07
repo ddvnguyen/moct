@@ -269,8 +269,33 @@ func (s *TaskService) ReviewPlan(ctx context.Context, planID, workspaceID, revie
 		if !current.SubmittedRevision.Valid || current.SubmittedRevision.Int32 != planRevision {
 			return ErrPlanStaleRevision
 		}
+
+		// M-275: every verdict sends the plan page's pending comments. They are
+		// settled here, in the verdict's own transaction, and their bodies ride
+		// the flat list agent_plan_review.comments still stores — the Answered
+		// view and the S1-A1 Go tests keep their contract.
+		pending, err := qtx.ListUndeliveredAgentPlanComments(ctx, planID)
+		if err != nil {
+			return fmt.Errorf("load pending plan comments: %w", err)
+		}
+		comments, err = mergeDeliveredPlanComments(comments, pending)
+		if err != nil {
+			return err
+		}
 		if verdict == "changes_requested" && !hasReviewComment(comments, note) {
 			return ErrPlanNeedsComment
+		}
+		if len(pending) > 0 {
+			ids := make([]pgtype.UUID, 0, len(pending))
+			for _, comment := range pending {
+				ids = append(ids, comment.ID)
+			}
+			if err := qtx.DeliverAgentPlanComments(ctx, db.DeliverAgentPlanCommentsParams{
+				Ids:     ids,
+				Verdict: pgtype.Text{String: verdict, Valid: true},
+			}); err != nil {
+				return fmt.Errorf("deliver plan comments: %w", err)
+			}
 		}
 
 		if _, err := qtx.RecordAgentPlanReview(ctx, db.RecordAgentPlanReviewParams{
@@ -357,7 +382,7 @@ func (s *TaskService) ReviewPlan(ctx context.Context, planID, workspaceID, revie
 		if err != nil {
 			return fmt.Errorf("load issue: %w", err)
 		}
-		handoff := renderPlanVerdictHandoff(plan, verdict, comments, note)
+		handoff := renderPlanVerdictHandoffWithComments(plan, verdict, comments, note, pending)
 		txService := &TaskService{Queries: qtx}
 		task, err := txService.enqueueAskPlanResumeTask(ctx, issue, parked, EvidencePlanVerdict, plan.ID, handoff, reviewedBy)
 		if err != nil {
@@ -515,8 +540,50 @@ func renderQuestionAnswerHandoff(card db.AgentQuestionCard, answers json.RawMess
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// mergeDeliveredPlanComments folds the plan page's pending comment bodies into
+// the verdict's flat comment list, so agent_plan_review.comments keeps meaning
+// "what the human sent" for callers on either shape. The request's own list
+// stays first: it is the legacy note box, and a body already present is not
+// written twice.
+func mergeDeliveredPlanComments(comments json.RawMessage, pending []db.AgentPlanComment) (json.RawMessage, error) {
+	var list []string
+	if len(comments) > 0 {
+		_ = json.Unmarshal(comments, &list)
+	}
+	seen := make(map[string]bool, len(list))
+	for _, c := range list {
+		seen[strings.TrimSpace(c)] = true
+	}
+	for _, comment := range pending {
+		body := strings.TrimSpace(comment.Body)
+		if body == "" || seen[body] {
+			continue
+		}
+		seen[body] = true
+		list = append(list, body)
+	}
+	if list == nil {
+		list = []string{}
+	}
+	merged, err := json.Marshal(list)
+	if err != nil {
+		return nil, fmt.Errorf("encode plan comments: %w", err)
+	}
+	return merged, nil
+}
+
 // renderPlanVerdictHandoff is the resumed run's instruction for a plan verdict.
+//
+// M-275: the plan page's comments carry an anchor, so they are rendered the way
+// the human wrote them — the section heading, the quoted passage, the body, and
+// its replies indented under the root — instead of a flat bullet list.
+// renderPlanVerdictHandoff is the flat-list form every pre-M-275 caller and
+// test still uses: no anchored comments to render.
 func renderPlanVerdictHandoff(plan db.AgentPlan, verdict string, comments json.RawMessage, note string) string {
+	return renderPlanVerdictHandoffWithComments(plan, verdict, comments, note, nil)
+}
+
+func renderPlanVerdictHandoffWithComments(plan db.AgentPlan, verdict string, comments json.RawMessage, note string, planComments []db.AgentPlanComment) string {
 	var b strings.Builder
 	revision := int32(0)
 	if plan.SubmittedRevision.Valid {
@@ -527,18 +594,90 @@ func renderPlanVerdictHandoff(plan db.AgentPlan, verdict string, comments json.R
 		fmt.Fprintf(&b, "Your plan %q (revision %d) was APPROVED by a human. The plan has been written into the issue description — go ahead with it.\n", plan.Title, revision)
 	case "changes_requested":
 		fmt.Fprintf(&b, "Your plan %q (revision %d) was sent back with CHANGES REQUESTED. Read the comments below, revise the plan sections, and submit it again.\n", plan.Title, revision)
-		var list []string
-		_ = json.Unmarshal(comments, &list)
-		for _, c := range list {
-			if t := strings.TrimSpace(c); t != "" {
-				fmt.Fprintf(&b, "  - %s\n", t)
-			}
-		}
 	case "cancel":
 		fmt.Fprintf(&b, "Your plan %q was CANCELLED by a human. Do not act on it; stop planning and await further instruction.\n", plan.Title)
 	}
+	if block := renderPlanComments(plan, planComments); block != "" {
+		b.WriteString("\n")
+		b.WriteString(block)
+		b.WriteString("\n")
+	}
+	var list []string
+	_ = json.Unmarshal(comments, &list)
+	// The verdict's own note box list, minus the bodies already rendered above
+	// with their anchors.
+	anchored := make(map[string]bool, len(planComments))
+	for _, comment := range planComments {
+		anchored[strings.TrimSpace(comment.Body)] = true
+	}
+	var flat []string
+	for _, c := range list {
+		if t := strings.TrimSpace(c); t != "" && !anchored[t] {
+			flat = append(flat, t)
+		}
+	}
+	if len(flat) > 0 {
+		b.WriteString("\nAlso noted:\n")
+		for _, c := range flat {
+			fmt.Fprintf(&b, "  - %s\n", c)
+		}
+	}
 	if t := strings.TrimSpace(note); t != "" {
-		fmt.Fprintf(&b, "Note: %s\n", t)
+		fmt.Fprintf(&b, "\nNote: %s\n", t)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderPlanComments writes the plan page's threads: each root under its
+// section heading and quoted passage, its replies indented beneath it. A
+// comment whose section no longer exists keeps its quote and says so, which is
+// the same fallback the plan page renders (M-275 risk a).
+func renderPlanComments(plan db.AgentPlan, comments []db.AgentPlanComment) string {
+	if len(comments) == 0 {
+		return ""
+	}
+	headings := make(map[string]string)
+	var sections []planSection
+	if err := json.Unmarshal(plan.Sections, &sections); err == nil {
+		for _, section := range sections {
+			headings[section.SectionID] = section.Heading
+		}
+	}
+	roots := make(map[pgtype.UUID]bool, len(comments))
+	for _, comment := range comments {
+		if !comment.ParentCommentID.Valid {
+			roots[comment.ID] = true
+		}
+	}
+	var b strings.Builder
+	for _, comment := range comments {
+		body := strings.TrimSpace(comment.Body)
+		if body == "" {
+			continue
+		}
+		reply := comment.ParentCommentID.Valid
+		if !reply {
+			switch {
+			case comment.SectionID == "":
+				b.WriteString("### General\n")
+			case headings[comment.SectionID] != "":
+				fmt.Fprintf(&b, "### %s\n", headings[comment.SectionID])
+			default:
+				fmt.Fprintf(&b, "### (section %s, since rewritten)\n", comment.SectionID)
+			}
+			if quote := strings.TrimSpace(comment.Quote); quote != "" {
+				fmt.Fprintf(&b, "> %s\n", quote)
+			}
+			fmt.Fprintf(&b, "%s\n", body)
+			continue
+		}
+		if !roots[comment.ParentCommentID] {
+			// A reply whose root is outside this batch (already delivered): keep
+			// its text rather than dropping it.
+			fmt.Fprintf(&b, "  - reply: %s\n", body)
+			continue
+		}
+		fmt.Fprintf(&b, "  - reply: %s\n", body)
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
