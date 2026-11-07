@@ -98,6 +98,7 @@
     "work": "作業",
     "team": "チーム",
     "chat": "チャット",
+    "decisions": "意思決定",
     "autopilots": "自動化",
     "switch_workspace": "ワークスペースを切り替え",
     "invitation_from": "{{name}} さんから招待されています",

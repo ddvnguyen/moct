@@ -11,6 +11,7 @@ const state = vi.hoisted(() => ({
   pathname: "/acme/issues",
   appForeground: true,
   inboxUnread: 0,
+  decisionsPending: 0,
   chatSessions: [] as { id: string; unread_count?: number }[],
   chat: { activeSessionId: null as string | null, isOpen: false },
   stuck: [] as unknown[],
@@ -39,6 +40,14 @@ vi.mock("@multica/core/paths", async (importOriginal) => {
 });
 vi.mock("@multica/core/inbox/queries", () => ({
   useInboxUnreadCount: () => state.inboxUnread,
+}));
+vi.mock("@multica/core/decisions", () => ({
+  decisionsOptions: (wsId: string, params?: unknown) => ({
+    queryKey: ["decisions", wsId, params],
+    queryFn: async () => ({ items: [], pending_count: state.decisionsPending, next_cursor: null }),
+    getNextPageParam: () => undefined,
+    initialPageParam: undefined,
+  }),
 }));
 vi.mock("@multica/core/chat/queries", () => ({
   chatSessionsOptions: (wsId: string) => ({
@@ -81,6 +90,10 @@ function renderRail(children?: ReactNode, rail: ReactNode = <AppRail />) {
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   });
   client.setQueryData(["chat", "ws-1", "sessions"], state.chatSessions);
+  client.setQueryData(["decisions", "ws-1", { state: "pending" }], {
+    pages: [{ items: [], pending_count: state.decisionsPending, next_cursor: null }],
+    pageParams: [undefined],
+  });
   return renderWithI18n(
     <QueryClientProvider client={client}>
       <SidebarProvider>
@@ -101,6 +114,7 @@ beforeEach(() => {
   state.pathname = "/acme/issues";
   state.appForeground = true;
   state.inboxUnread = 0;
+  state.decisionsPending = 0;
   state.chatSessions = [];
   state.chat = { activeSessionId: null, isOpen: false };
   state.stuck = [];
@@ -125,12 +139,19 @@ describe("AppRail spaces", () => {
     state.pathname = "/acme/projects/p-1";
     renderRail();
 
-    for (const href of ["/acme/inbox", "/acme/issues", "/acme/agents", "/acme/chat", "/acme/autopilots"]) {
+    for (const href of ["/acme/inbox", "/acme/issues", "/acme/agents", "/acme/chat", "/acme/decisions", "/acme/autopilots"]) {
       expect(link(href)).not.toBeNull();
     }
     // Projects belong to the work space, which links to Issues.
     expect(link("/acme/issues")).toHaveAttribute("aria-current", "page");
     expect(link("/acme/agents")).not.toHaveAttribute("aria-current");
+  });
+
+  it("marks Decisions while on the decisions route", () => {
+    state.pathname = "/acme/decisions";
+    renderRail();
+    expect(link("/acme/decisions")).toHaveAttribute("aria-current", "page");
+    expect(link("/acme/issues")).not.toHaveAttribute("aria-current");
   });
 
   it("marks Settings in the footer while on a settings route", () => {
@@ -166,6 +187,21 @@ describe("AppRail badges", () => {
     expect(link("/acme/agents")?.querySelector(".bg-warning")).not.toBeNull();
   });
 });
+
+describe("AppRail decisions badge", () => {
+
+  it("counts pending decisions", async () => {
+    state.decisionsPending = 3;
+    renderRail();
+    expect(await screen.findByLabelText("3")).toBeInTheDocument();
+  });
+
+  it("shows nothing when no decision awaits an answer", () => {
+    renderRail();
+    expect(countBadge("/acme/decisions")).toBeNull();
+  });
+});
+
 
 describe("AppRail chat badge", () => {
   const chatBadge = () => countBadge("/acme/chat");

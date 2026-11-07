@@ -98,6 +98,7 @@
     "work": "작업",
     "team": "팀",
     "chat": "채팅",
+    "decisions": "결정",
     "autopilots": "자동화",
     "switch_workspace": "워크스페이스 전환",
     "invitation_from": "{{name}} 님이 초대했습니다",

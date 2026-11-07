@@ -76,6 +76,7 @@ describe("AppShellProvider", () => {
       ["/acme/autopilots", "autopilots", true],
       ["/acme/inbox", "inbox", false],
       ["/acme/chat", "chat", false],
+      ["/acme/decisions", "decisions", false],
       ["/acme/settings", "settings", false],
       ["/acme/attachments/a-1", null, false],
     ];

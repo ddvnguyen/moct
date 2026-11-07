@@ -48,6 +48,7 @@ Computed per run; the table maps where conflicts land, not a substitute for it.
 | Tab header, sidebar, dsh island | `packages/dsh-plugin/**` |
 | Fork UI primitives and copy | `packages/ui/components/ui/*`, `packages/views/locales/*/issues.json` |
 | Migrations we own | `server/migrations/617+` (upstream reached 616 on v0.8.1; the v0.8.1 sync moved our 595–614 to 617–636) |
+| Decisions rail space (M-253) | `packages/core/paths/spaces.ts` (`decisions` space), `packages/views/layout/app-rail.tsx` (item + pending badge), `packages/views/locales/*/layout.json` (`rail.decisions`) |
 
 ## Rules
 

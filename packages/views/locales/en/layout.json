@@ -98,6 +98,7 @@
     "work": "Work",
     "team": "Team",
     "chat": "Chat",
+    "decisions": "Decisions",
     "autopilots": "Auto",
     "switch_workspace": "Switch workspace",
     "invitation_from": "{{name}} invited you",
