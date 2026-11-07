@@ -98,6 +98,7 @@
     "work": "Travail",
     "team": "Équipe",
     "chat": "Chat",
+    "decisions": "Décisions",
     "autopilots": "Auto",
     "switch_workspace": "Changer d'espace de travail",
     "invitation_from": "{{name}} vous a invité",

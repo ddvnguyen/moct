@@ -1,12 +1,13 @@
 "use client";
 
 import { useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Settings, Users, type IconComponent } from "@multica/ui/icons";
 import { useChatStore } from "@multica/core/chat";
 import { chatSessionsOptions } from "@multica/core/chat/queries";
 import { countUnreadChatMessages } from "@multica/core/chat/unread";
 import { useInboxUnreadCount } from "@multica/core/inbox/queries";
+import { decisionsOptions } from "@multica/core/decisions";
 import {
   RAIL_SPACES,
   useCurrentWorkspace,
@@ -35,9 +36,10 @@ type RailBadge =
   | { kind: "dot" };
 
 /**
- * Rail badges. Inbox and Chat count unread; Team only flags that something
- * needs a look — the panel says what. A dot must be something the user can
- * clear, so a failed autopilot run is shown in the Autopilots panel only.
+ * Rail badges. Inbox counts unread, Decisions counts awaiting answers, Chat
+ * counts unread; Team only flags that something needs a look — the panel says
+ * what. A dot must be something the user can clear, so a failed autopilot run
+ * is shown in the Autopilots panel only.
  */
 function useRailBadges(): Partial<Record<RailSpaceId, RailBadge>> {
   const wsId = useCurrentWorkspace()?.id;
@@ -69,10 +71,17 @@ function useRailBadges(): Partial<Record<RailSpaceId, RailBadge>> {
 
   const { stuck } = useTeamAgentStatus(wsId);
 
+  const { data: decisionPages } = useInfiniteQuery({
+    ...decisionsOptions(wsId ?? "", { state: "pending" }),
+    enabled: !!wsId,
+  });
+  const decisionsPending = decisionPages?.pages[0]?.pending_count ?? 0;
+
   const badges: Partial<Record<RailSpaceId, RailBadge>> = {};
   if (inboxUnread > 0) badges.inbox = { kind: "count", value: inboxUnread, tone: "brand" };
   if (chatUnread > 0) badges.chat = { kind: "count", value: chatUnread, tone: "neutral" };
   if (stuck.length > 0) badges.team = { kind: "dot" };
+  if (decisionsPending > 0) badges.decisions = { kind: "count", value: decisionsPending, tone: "neutral" };
   return badges;
 }
 
@@ -202,6 +211,12 @@ export function AppRail({
       icon: routeIconForPath(p.chat()),
       label: t(($) => $.rail.chat),
       fullLabel: t(($) => $.nav.chat),
+    },
+    decisions: {
+      href: p.decisions(),
+      icon: routeIconForPath(p.decisions()),
+      label: t(($) => $.rail.decisions),
+      fullLabel: t(($) => $.nav.decisions),
     },
     autopilots: {
       href: p.autopilots(),
