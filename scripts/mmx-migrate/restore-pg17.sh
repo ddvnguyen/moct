@@ -76,13 +76,22 @@ for f in database.dump uploads.tar sha256sums.txt; do
 done
 DUMP_DIR="$(cd "$DUMP_DIR" && pwd)"
 
-# Read main's DB name for the target-vs-main sanity comparison (read-only).
-read_main_db() {
-  awk -F= '$1 == "POSTGRES_DB" { sub(/^[^=]*=/, ""); print; found++ } END { if (found > 1) exit 2 }' "$STACK_DIR/.env" 2>/dev/null || true
+read_main_env_value() { # $1 = key; prints only a simple KEY=value from the stack env
+  awk -F= -v key="$1" '
+    $1 == key {
+      sub(/^[^=]*=/, "")
+      print
+      found++
+    }
+    END {if (found > 1) exit 2}
+  ' "$STACK_DIR/.env" 2>/dev/null || true
 }
-SOURCE_DB="$(read_main_db)"
+SOURCE_DB="$(read_main_env_value POSTGRES_DB)"
 SOURCE_DB="${SOURCE_DB:-multica}"
 [[ "$SOURCE_DB" =~ ^[A-Za-z0-9_]+$ ]] || die "invalid main POSTGRES_DB in $STACK_DIR/.env"
+SOURCE_USER="$(read_main_env_value POSTGRES_USER)"
+SOURCE_USER="${SOURCE_USER:-multica}"
+[[ "$SOURCE_USER" =~ ^[A-Za-z0-9_]+$ ]] || die "invalid main POSTGRES_USER in $STACK_DIR/.env"
 [ "$TARGET_DB" != "$SOURCE_DB" ] || die "refusing: target DB equals main's DB ($SOURCE_DB)"
 
 # Checksums (read-only, so checks run even in --dry-run).
@@ -155,10 +164,10 @@ reported=0
 live_counts=""
 if [ -n "$MAIN_PG_CONTAINER" ] && podman inspect "$MAIN_PG_CONTAINER" --format '{{.State.Status}}' 2>/dev/null | grep -qx running; then
   for table in issue comment attachment agent agent_runtime user workspace schema_migrations; do
-    count="$(podman exec "$MAIN_PG_CONTAINER" psql -U "$PG_USER" -d "$SOURCE_DB" -tAc "SELECT count(*) FROM \"$table\";" 2>/dev/null || true)"
+    count="$(podman exec "$MAIN_PG_CONTAINER" psql -U "$SOURCE_USER" -d "$SOURCE_DB" -tAc "SELECT count(*) FROM \"$table\";" 2>/dev/null || true)"
     [[ "$count" =~ ^[0-9]+$ ]] || count=""
     live_counts="$live_counts
-$table	$count"
+:$table	$count"
   done
 fi
 for table in issue comment attachment agent agent_runtime user workspace schema_migrations; do
