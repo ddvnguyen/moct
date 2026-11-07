@@ -32,12 +32,14 @@
  * file outside the guarded directories and follows imports inward, so a pair
  * of dead components importing only each other stays dead.
  *
- * Test files are outside both roles. `*.test.tsx`/`*.spec.tsx` are vitest entry
- * points found by the runner's own glob, so "nothing imports it" is what a
- * colocated test looks like on a healthy tree — guarding them made every test
- * added beside a components/ui primitive fail CI. They are not roots either: a
- * component imported only by its own test is dead, for the same reason a
- * `vi.mock("...")` is not an edge.
+ * Test files are outside both roles. `*.test.*` are vitest entry points found
+ * by the runner's own glob, so "nothing imports it" is what a colocated test
+ * looks like on a healthy tree — guarding them made every test added beside a
+ * components/ui primitive fail CI. They are not roots either: a component
+ * imported only by its own test is dead, for the same reason a `vi.mock("...")`
+ * is not an edge. `*.spec.*` are not runner-discovered; only contract specs
+ * named by a non-wildcard export are exempt, and every other spec file stays
+ * guarded so an unreferenced one keeps failing this check.
  *
  * Edges come from real syntax nodes via the TypeScript parser, not from a
  * regex over source text. Text matching counts a commented-out import as a
@@ -102,9 +104,12 @@ function importedSpecifiers(sourceText, filePath) {
   return specifiers;
 }
 
-/** Runner entry points, not library modules: vitest discovers them by glob. */
+/** Runner entry points, not library modules: vitest discovers `.test` files by
+ * glob. `.spec` files stay guarded: only the contract specs named by a
+ * non-wildcard export are entry points, and non-contract ones must keep
+ * failing this check when nothing imports them. */
 function isTestFile(file) {
-  return /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(file);
+  return /\.test\.[cm]?[jt]sx?$/.test(file);
 }
 
 function walk(dir, out = []) {
