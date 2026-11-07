@@ -2,8 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -17,19 +15,22 @@ import (
 //     which the backend already sets (together with PWD).
 //   - `--variant` was removed. A model variant now rides along inside the model
 //     string as `provider/model#variant`.
-//   - OPENCODE_CONFIG_CONTENT is no longer honoured, and the only channel left
-//     for MCP puts credentials somewhere the agent can commit them. Such runs
-//     are refused — see ErrOpenCodeV2MCPUnsupported.
 //   - `opencode run` became a thin client in front of a resident background
 //     service, so signalling the client's process group no longer stops the
-//     work that run started.
+//     work that run started. The daemon therefore passes `--standalone` on
+//     every 2.x run: the run owns a private server that inherits the daemon's
+//     environment, which is also what makes OPENCODE_CONFIG_CONTENT reach the
+//     session with the managed MCP servers.
+//   - 1.x merged OPENCODE_CONFIG_CONTENT at "local" scope; 2.x honours it on
+//     a `--standalone` run as well, so the run transport projects MCP through
+//     the same env channel on both majors and never writes to the workdir.
 //
 // The two removed flags fail loudly — `Unrecognized flag: --dir`, exit 1 within
 // ~130ms (GH #8586), and the same for `--variant` on any agent with a thinking
-// level. The other two do not announce themselves at all: before this file, a
-// run that merely dropped `--dir` started fine and then executed without its MCP
-// servers and without a working cancel. Handling them together is what keeps
-// fixing the loud failure from exposing the quiet ones.
+// level. The connection change does not announce itself at all: a run without
+// `--standalone` starts fine and then executes without its MCP servers and
+// without a working cancel. Handling them together is what keeps fixing the
+// loud failure from exposing the quiet ones.
 //
 // Everything else the backend relies on was checked against 2.0.10 and is
 // unchanged across the two majors — the `--format json` event vocabulary,
@@ -92,73 +93,6 @@ func opencodeModelArg(model, thinkingLevel string) (string, bool) {
 		return model, true
 	}
 	return model + "#" + thinkingLevel, true
-}
-
-// ErrOpenCodeV2MCPUnsupported reports that the MCP servers Multica manages for
-// a task cannot be delivered to an OpenCode 2.x runtime yet.
-//
-// This applies to the `opencode run` transport only. The ACP transport, which
-// built-in 2.x runtimes use by default (opencode_acp.go), passes MCP servers in
-// ACP session/new and never needs the workdir file.
-//
-// The message deliberately does not name agent.mcp_config. ExecOptions.McpConfig
-// is the *composed* set, and only one of its sources is the agent's own column:
-// the daemon also folds in the workspace MCP servers bound to the agent (at
-// claim), the task's integration/Composio servers and the plugin-hook tool
-// server (at run), and the runtime's own servers on top of those. A task whose
-// agent has no MCP configuration at all still arrives here with a non-empty
-// config, so an error telling the operator to edit agent.mcp_config would point
-// at a field that may be empty already and would not release the task.
-//
-// 2.x honours no environment channel for config — OPENCODE_CONFIG_CONTENT (the
-// 1.x channel), OPENCODE_CLI_CONFIG_CONTENT, OPENCODE_CONFIG and
-// OPENCODE_CONFIG_DIR were each checked against 2.0.10, with and without
-// --standalone, and none of them reach the session. The only channel that works
-// is <workdir>/opencode.json, and MCP entries carry bearer headers, OAuth client
-// secrets and environment values.
-//
-// Writing them there is not safe today. The workdir is the agent's own working
-// tree, and in local-directory mode it is the user's checkout: the agent can
-// commit that file mid-run with an ordinary `git add -A`, which puts the
-// credential in Git history where no end-of-task cleanup can reach it. File
-// permissions do not help, because the committing process is the same user.
-//
-// Failing here is deliberate. Running the task anyway would silently drop every
-// MCP server the agent was configured with, which is harder to diagnose than a
-// refusal naming the cause.
-//
-// The way out is known and measured, and wants its own change (MUL-7523):
-// `--standalone` gives the run a private server that inherits the daemon's
-// environment, and 2.x then resolves `{env:NAME}` placeholders inside the
-// config, so the file can carry references while the secrets stay in the
-// process environment. That costs a server start per run and changes the
-// process topology cancellation depends on, so it is not something to fold into
-// a compatibility fix.
-var ErrOpenCodeV2MCPUnsupported = errors.New(
-	"opencode: Multica-managed MCP servers cannot be delivered to an OpenCode 2.x runtime yet. " +
-		"2.x accepts MCP configuration only through a file in the task working directory, where " +
-		"the agent's own commits would capture the servers' credentials. " +
-		"To run this task: point the agent at an OpenCode 1.x runtime, or remove the MCP servers " +
-		"Multica supplies it — these can come from the agent's MCP configuration, workspace MCP " +
-		"servers bound to the agent, the workspace's integration tools, or an installed plugin's " +
-		"hook tools")
-
-// opencodeCheckMCPSupport fails a 2.x run that carries MCP configuration, rather
-// than starting it without the servers it was supposed to get.
-func opencodeCheckMCPSupport(raw json.RawMessage) error {
-	if len(raw) == 0 {
-		return nil
-	}
-	// An mcp_config that translates to no servers asks for nothing, so there is
-	// nothing to refuse.
-	servers, err := translateMCPConfigForOpenCode(raw)
-	if err != nil {
-		return err
-	}
-	if len(servers) == 0 {
-		return nil
-	}
-	return ErrOpenCodeV2MCPUnsupported
 }
 
 // opencodeSessionTracker carries the session id observed on a run's event
@@ -236,15 +170,19 @@ func opencodeConnectionFromArgs(args []string) (server string, standalone bool) 
 	return server, standalone
 }
 
-// opencodeInterruptSession asks the OpenCode 2.x service to stop a session. On
-// 2.x this is the only thing that actually stops a run.
+// opencodeInterruptSession asks the OpenCode 2.x shared service to stop a
+// session. Every daemon-launched run carries `--standalone` (Execute above),
+// so this path only fires for runs that reached a different service anyway —
+// a `--server` the operator set through agent.custom_args, which used to
+// route every 2.x run at the resident background service.
 //
-// `opencode run` is a thin client: the work happens inside a background service
-// that outlives it, so the SIGTERM→SIGKILL the backend sends to the client's
-// process group leaves the agent running — still calling tools, still writing to
-// the workdir — after Multica has already recorded the task as finished.
-// Reproduced against 2.0.10: with the client confirmed dead, a shell command the
-// agent had started went on to complete 35 seconds later.
+// On that shared-service topology the client is only a thin client: the work
+// happens inside a background service that outlives it, so the
+// SIGTERM→SIGKILL the backend sends to the client's process group leaves the
+// agent running — still calling tools, still writing to the workdir — after
+// Multica has already recorded the task as finished. Reproduced against
+// 2.0.10: with the client confirmed dead, a shell command the agent had
+// started went on to complete 35 seconds later.
 //
 // Best effort by construction. This runs in front of the existing termination
 // path and never replaces it, so an unreachable service, a session id that was

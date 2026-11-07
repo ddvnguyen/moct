@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -88,21 +87,20 @@ func TestOpencodeModelArg(t *testing.T) {
 
 const testMCPConfig = `{"mcpServers":{"probe":{"command":"node","args":["probe.js"]}}}`
 
-// TestOpencodeCheckMCPSupport pins the refusal. 2.x has no channel that can
-// carry MCP credentials without putting them where the agent can commit them,
-// so a configured run fails instead of quietly starting without its servers.
-func TestOpencodeCheckMCPSupport(t *testing.T) {
+// TestOpencodeV2EnvCarriesMCPConfig pins that the run transport projects MCP
+// through OPENCODE_CONFIG_CONTENT on 2.x, now that every 2.x run launches on
+// a private server (`--standalone`) whose environment the daemon controls.
+func TestOpencodeV2EnvCarriesMCPConfig(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name    string
-		raw     string
-		wantErr bool
+		name string
+		raw  string
 	}{
-		{"no mcp config", "", false},
-		{"empty object asks for nothing", `{"mcpServers":{}}`, false},
-		{"configured servers are refused", testMCPConfig, true},
-		{"native opencode shape is refused too", `{"mcp":{"probe":{"type":"local","command":["x"]}}}`, true},
+		{"no mcp config", ""},
+		{"empty object asks for nothing", `{"mcpServers":{}}`},
+		{"configured servers are injected", testMCPConfig},
+		{"native opencode shape is injected too", `{"mcp":{"probe":{"type":"local","command":["x"]}}}`},
 	}
 
 	for _, tc := range cases {
@@ -112,30 +110,36 @@ func TestOpencodeCheckMCPSupport(t *testing.T) {
 			if tc.raw != "" {
 				raw = json.RawMessage(tc.raw)
 			}
-			err := opencodeCheckMCPSupport(raw)
-			if tc.wantErr {
-				if !errors.Is(err, ErrOpenCodeV2MCPUnsupported) {
-					t.Fatalf("expected ErrOpenCodeV2MCPUnsupported, got %v", err)
+			content, err := buildOpenCodeMCPConfigContent(raw)
+			if err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+			if tc.raw == "" || tc.raw == `{"mcpServers":{}}` {
+				if content != "" {
+					t.Fatalf("expected no config content for %q, got %q", tc.raw, content)
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("expected no error, got %v", err)
+			if !strings.Contains(content, "probe") {
+				t.Fatalf("expected the probe server in the config content, got %q", content)
 			}
 		})
 	}
 }
 
-// TestOpencodeV2ExecuteRefusesMCPConfig is the end-to-end half: the run must
-// fail before anything starts, and nothing may be written into the workdir —
-// that file is the whole reason MCP is refused here.
-func TestOpencodeV2ExecuteRefusesMCPConfig(t *testing.T) {
+// TestOpencodeV2ExecuteDeliversMCPConfig is the end-to-end half: the run must
+// start, carry MCP through the env, and write nothing into the workdir.
+func TestOpencodeV2ExecuteDeliversMCPConfig(t *testing.T) {
 	t.Parallel()
 
 	tempDir := t.TempDir()
 	marker := filepath.Join(tempDir, "started.txt")
+	envFile := filepath.Join(tempDir, "env.txt")
 	fakePath := filepath.Join(tempDir, "opencode")
-	writeTestExecutable(t, fakePath, []byte("#!/bin/sh\ntouch \""+marker+"\"\n"))
+	script := "#!/bin/sh\ntouch \"" + marker + "\"\nprintf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"" + envFile + "\"\n" +
+		"printf '{\"type\":\"step_start\",\"sessionID\":\"ses\",\"part\":{}}\\n'\n" +
+		"printf '{\"type\":\"step_finish\",\"sessionID\":\"ses\",\"part\":{}}\\n'\n"
+	writeTestExecutable(t, fakePath, []byte(script))
 
 	workDir := t.TempDir()
 
@@ -153,25 +157,37 @@ func TestOpencodeV2ExecuteRefusesMCPConfig(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, execErr := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+	session, execErr := backend.Execute(ctx, "prompt-ignored", ExecOptions{
 		Cwd:       workDir,
 		McpConfig: json.RawMessage(testMCPConfig),
 		Timeout:   5 * time.Second,
 	})
-	if !errors.Is(execErr, ErrOpenCodeV2MCPUnsupported) {
-		t.Fatalf("expected the run to be refused, got %v", execErr)
+	if execErr != nil {
+		t.Fatalf("2.x must accept mcp_config: %v", execErr)
 	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	<-session.Result
 
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("refused run still started the CLI, stat err = %v", err)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected the run to start the CLI, stat err = %v", err)
+	}
+	got, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("read env capture: %v", err)
+	}
+	if !strings.Contains(string(got), "probe") {
+		t.Fatalf("2.x lost its MCP env injection: %q", got)
 	}
 	if _, err := os.Stat(filepath.Join(workDir, "opencode.json")); !os.IsNotExist(err) {
-		t.Fatalf("refused run still wrote a config into the workdir, stat err = %v", err)
+		t.Fatalf("2.x run wrote a config into the workdir, stat err = %v", err)
 	}
 }
 
-// TestOpencodeV1StillDeliversMCPConfig guards the other side of the refusal:
-// 1.x is unaffected and still projects mcp_config through its env channel.
+// TestOpencodeV1StillDeliversMCPConfig guards the other side: 1.x is
+// unaffected and still projects mcp_config through its env channel.
 func TestOpencodeV1StillDeliversMCPConfig(t *testing.T) {
 	t.Parallel()
 
@@ -223,7 +239,8 @@ func TestOpencodeV1StillDeliversMCPConfig(t *testing.T) {
 // TestOpencodeV2ArgvOmitsDirAndFoldsVariant is the end-to-end regression for
 // GH #8586: on a 2.x runtime the daemon must not pass `--dir` (the CLI rejects
 // the unknown flag and the run dies before it starts) and must express the
-// thinking level through the model string instead of `--variant`.
+// thinking level through the model string instead of `--variant`. The run
+// also owns a private server (`--standalone`) so per-run env reaches it.
 func TestOpencodeV2ArgvOmitsDirAndFoldsVariant(t *testing.T) {
 	t.Parallel()
 
@@ -281,6 +298,9 @@ func TestOpencodeV2ArgvOmitsDirAndFoldsVariant(t *testing.T) {
 	}
 	if !containsString(args, "anthropic/claude-sonnet-4-5#high") {
 		t.Fatalf("expected the thinking level folded into the model string, got %q", args)
+	}
+	if !containsString(args, "--standalone") {
+		t.Fatalf("2.x argv must carry --standalone, got %q", args)
 	}
 
 	// Dropping --dir is only safe because cwd still anchors discovery, so the
@@ -349,6 +369,9 @@ func TestOpencodeV1ArgvKeepsDirAndVariant(t *testing.T) {
 	}
 	if containsString(args, "anthropic/claude-sonnet-4-5#high") {
 		t.Fatalf("1.x must not fold the variant into the model, got %q", args)
+	}
+	if containsString(args, "--standalone") {
+		t.Fatalf("1.x argv must not carry --standalone, got %q", args)
 	}
 }
 

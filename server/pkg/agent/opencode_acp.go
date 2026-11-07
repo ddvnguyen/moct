@@ -38,11 +38,13 @@ import (
 //     session/set_config_option; 2.x has no session/set_model at all (-32601).
 //     Reasoning effort is the advertised `effort` option on both, so the 2.x
 //     `provider/model#variant` spelling is only split, never sent.
-//   - MCP. 1.x still honours OPENCODE_CONFIG_CONTENT, which carries every shape
-//     the OpenCode translator accepts, so it keeps that channel. 2.x ignores the
-//     env var; ACP session/new's `mcpServers` is the channel there, which keeps
-//     credentials in the process instead of in a file in the agent's workdir
-//     (the reason the run transport refuses MCP on 2.x).
+//   - MCP. 1.x reads MCP from OPENCODE_CONFIG_CONTENT, which carries every
+//     shape the OpenCode translator accepts, so it keeps that channel. On
+//     the run transport 2.x honours the same env var under `--standalone`,
+//     which the daemon always passes; over ACP — where there is no backing
+//     run to own a server — 2.x takes ACP session/new's `mcpServers`
+//     instead, which keeps credentials in the process rather than in a file
+//     in the agent's workdir.
 //   - Subagents. 2.x forwards a child session's updates into the parent with
 //     `_meta["opencode/child-session"]`. Its tool calls are kept (they are real
 //     work in flight); its text is dropped so the parent's output stays the

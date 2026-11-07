@@ -36,13 +36,12 @@ func TestCheckOpenCodeResumeClock(t *testing.T) {
 [ "$1" = export ] && [ "$2" = ses-test ] && [ "$3" = --sanitize ] || exit 2
 [ "$PWD" = "$CLOCK_EXPECTED_CWD" ] && [ "$(pwd)" = "$CLOCK_EXPECTED_CWD" ] || exit 3
 [ "$XDG_DATA_HOME" = clock-test-storage ] || exit 4
-[ -z "$OPENCODE_CONFIG_CONTENT" ] || exit 5
 ` + tc.body + "\n"
 			if err := os.WriteFile(bin, []byte(body), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			cfg := Config{ExecutablePath: bin, BuiltinRuntime: true, CLIVersion: "1.18.30", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Env: map[string]string{"CLOCK_EXPECTED_CWD": cwd, "XDG_DATA_HOME": "clock-test-storage"}}
-			opts := ExecOptions{Cwd: cwd, ResumeSessionID: "ses-test", McpConfig: []byte(`{"mcpServers":{"clock-mcp":{"command":"unused"}}}`)}
+			opts := ExecOptions{Cwd: cwd, ResumeSessionID: "ses-test"}
 			ctx := context.Background()
 			if tc.name == "timeout" {
 				var cancel context.CancelFunc

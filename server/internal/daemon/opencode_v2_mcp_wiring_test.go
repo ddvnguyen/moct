@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -15,7 +14,7 @@ import (
 	agentpkg "github.com/multica-ai/multica/server/pkg/agent"
 )
 
-// TestOpenCodeV2RefusesSynthesizedMCPWithoutAgentConfig covers the seam between
+// TestOpenCodeV2AcceptsSynthesizedMCPWithoutAgentConfig covers the seam between
 // what the daemon composes and what the OpenCode backend accepts.
 //
 // ExecOptions.McpConfig is not agent.mcp_config. The daemon folds several
@@ -23,13 +22,14 @@ import (
 // task's integration servers and the plugin-hook tool server (at run, via
 // mergeTaskRemoteMCPConfig), and the runtime's own servers. An agent with no MCP
 // configuration of its own therefore still reaches a 2.x runtime carrying
-// servers, and that run is refused.
+// servers, and that run must deliver them through the run transport's env
+// channel (a private server: `--standalone`), not refuse them.
 //
 // This is here rather than in pkg/agent because only this side can use the real
 // merge helper: pkg/agent cannot import the daemon. It pins both halves — that
-// the daemon really does synthesize a config from nothing, and that the refusal
-// fires on the result.
-func TestOpenCodeV2RefusesSynthesizedMCPWithoutAgentConfig(t *testing.T) {
+// the daemon really does synthesize a config from nothing, and that the run
+// starts with the result instead of failing.
+func TestOpenCodeV2AcceptsSynthesizedMCPWithoutAgentConfig(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake CLI is a shell script")
 	}
@@ -46,8 +46,14 @@ func TestOpenCodeV2RefusesSynthesizedMCPWithoutAgentConfig(t *testing.T) {
 	}
 
 	dir := t.TempDir()
+	envFile := filepath.Join(dir, "env.txt")
+	argsFile := filepath.Join(dir, "argv.txt")
 	fakeCLI := filepath.Join(dir, "opencode")
-	if err := os.WriteFile(fakeCLI, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"" + argsFile + "\"\n" +
+		"printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"" + envFile + "\"\n" +
+		"printf '{\"type\":\"step_start\",\"sessionID\":\"ses\",\"part\":{}}\\n'\n" +
+		"printf '{\"type\":\"step_finish\",\"sessionID\":\"ses\",\"part\":{}}\\n'\n"
+	if err := os.WriteFile(fakeCLI, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake cli: %v", err)
 	}
 
@@ -65,21 +71,32 @@ func TestOpenCodeV2RefusesSynthesizedMCPWithoutAgentConfig(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, execErr := backend.Execute(ctx, "prompt-ignored", agentpkg.ExecOptions{
+	session, execErr := backend.Execute(ctx, "prompt-ignored", agentpkg.ExecOptions{
 		Cwd:       t.TempDir(),
 		McpConfig: composed,
 		Timeout:   5 * time.Second,
 	})
-	if !errors.Is(execErr, agentpkg.ErrOpenCodeV2MCPUnsupported) {
-		t.Fatalf("expected the composed MCP config to be refused, got %v", execErr)
+	if execErr != nil {
+		t.Fatalf("expected the composed MCP config to be accepted, got %v", execErr)
 	}
-
-	// The operator's way out has to be reachable. Naming agent.mcp_config alone
-	// would point at a field that is already empty in exactly this case.
-	message := execErr.Error()
-	for _, want := range []string{"1.x", "workspace", "integration", "plugin"} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("refusal should name the %q recovery path for non-agent MCP sources: %s", want, message)
+	go func() {
+		for range session.Messages {
 		}
+	}()
+	<-session.Result
+
+	got, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("read env capture: %v", err)
+	}
+	if !strings.Contains(string(got), "composio-github") {
+		t.Fatalf("2.x run lost the composed MCP server: %q", got)
+	}
+	argv, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read argv capture: %v", err)
+	}
+	if !strings.Contains(string(argv), "--standalone") {
+		t.Fatalf("2.x run must own a private server, argv = %q", argv)
 	}
 }

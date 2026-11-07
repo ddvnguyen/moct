@@ -37,6 +37,7 @@ var opencodeBlockedArgs = map[string]blockedArgMode{
 	"--format":                       blockedWithValue,  // json output format for daemon communication
 	"--dir":                          blockedWithValue,  // task workdir anchor for skill / AGENTS.md discovery
 	"--variant":                      blockedWithValue,  // owned by agent.thinking_level
+	"--standalone":                    blockedStandalone, // 2.x always runs on a private server for per-run env
 	"--dangerously-skip-permissions": blockedStandalone, // daemon manages non-interactive permission prompts
 }
 
@@ -125,37 +126,27 @@ func openCodeEnvironment(cfg Config, opts ExecOptions) ([]string, error) {
 	if opts.Cwd != "" {
 		env = append(env, "PWD="+opts.Cwd)
 	}
-	// Project agent.mcp_config into OpenCode. The channel differs by major:
-	//
-	// On 1.x, OPENCODE_CONFIG_CONTENT — OpenCode's general inline-config
-	// injection mechanism that merges at "local" scope (after the
-	// project-config loop, before remote / managed configs). MCP is the only
-	// field we currently project there; if a future Multica field needs the
-	// same channel it would assemble a combined OpenCode config slice before
-	// the env append. That path deliberately leaves <workdir>/opencode.json
-	// untouched — the workdir is reused across turns for the same
-	// (agent, issue), and any agent- or user-written model / tools /
-	// permission settings in it must survive across runs.
-	//
-	// 2.x stopped honouring that env var, and the only channel it left puts the
-	// credentials in the agent's own working tree, where the agent can commit
-	// them. Such runs are refused rather than started without their servers —
-	// see ErrOpenCodeV2MCPUnsupported.
-	if opencodeUsesV2Contract(cfg) {
-		if err := opencodeCheckMCPSupport(opts.McpConfig); err != nil {
-			return nil, err
+	// Project agent.mcp_config into OpenCode through OPENCODE_CONFIG_CONTENT —
+	// OpenCode's general inline-config injection mechanism that merges at
+	// "local" scope (after the project-config loop, before remote / managed
+	// configs). MCP is the only field currently projected there; if a future
+	// Multica field needs the same channel it would assemble a combined
+	// OpenCode config slice before the env append. On 2.x the env config is
+	// honoured when the run owns a private server (`opencode run
+	// --standalone`), which Execute always passes on 2.x. That path
+	// deliberately leaves <workdir>/opencode.json untouched — the workdir is
+	// reused across turns for the same (agent, issue), and any agent- or
+	// user-written model / tools / permission settings in it must survive
+	// across runs.
+	mcpContent, err := buildOpenCodeMCPConfigContent(opts.McpConfig)
+	if err != nil {
+		return nil, err
+	}
+	if mcpContent != "" {
+		if _, dup := cfg.Env["OPENCODE_CONFIG_CONTENT"]; dup {
+			cfg.Logger.Warn("agent.custom_env sets OPENCODE_CONFIG_CONTENT but agent.mcp_config takes precedence and overrides it")
 		}
-	} else {
-		mcpContent, err := buildOpenCodeMCPConfigContent(opts.McpConfig)
-		if err != nil {
-			return nil, err
-		}
-		if mcpContent != "" {
-			if _, dup := cfg.Env["OPENCODE_CONFIG_CONTENT"]; dup {
-				cfg.Logger.Warn("agent.custom_env sets OPENCODE_CONFIG_CONTENT but agent.mcp_config takes precedence and overrides it")
-			}
-			env = append(env, "OPENCODE_CONFIG_CONTENT="+mcpContent)
-		}
+		env = append(env, "OPENCODE_CONFIG_CONTENT="+mcpContent)
 	}
 	return env, nil
 }
@@ -208,6 +199,17 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 				"thinkingLevel", opts.ThinkingLevel)
 		}
 		model = folded
+		// Give the run a private server that inherits the daemon's
+		// environment, so OPENCODE_CONFIG_CONTENT and per-agent settings
+		// reach it. Without this flag `opencode run` is a thin client to
+		// one resident background service whose environment was fixed at
+		// startup, and managed MCP servers never apply. Skipped when the
+		// operator pinned a connection via custom_args (--server): that
+		// run talks to the chosen service, and the extra flag would confuse
+		// the CLI.
+		if server, _ := opencodeConnectionFromArgs(opts.CustomArgs); server == "" {
+			args = append(args, "--standalone")
+		}
 	}
 	if model != "" {
 		args = append(args, "--model", model)
