@@ -879,6 +879,7 @@ def main():
         "ledger_error": led_err, "ledger_seed": seeded or None,
         **result,
     }
+    print(json.dumps(out, indent=1, ensure_ascii=False))
     return 0
 
 
