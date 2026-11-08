@@ -292,19 +292,21 @@ func cardToResponse(c db.AgentQuestionCard) cardResponse {
 // callerRunningIssueTask resolves the task token's task and refuses anything
 // that is not the caller's own RUNNING issue task in the URL workspace. An
 // agent may only park itself, and only while it is executing.
-func (h *Handler) callerRunningIssueTask(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID) (db.AgentTaskQueue, bool) {
+func (h *Handler) callerRunningIssueTask(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID, taskInPath bool) (db.AgentTaskQueue, bool) {
 	task, ok := h.taskFromRequestHeader(r)
 	if !ok {
 		writeError(w, http.StatusForbidden, "ask/plan requires a running task token")
 		return db.AgentTaskQueue{}, false
 	}
-	pathTaskID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "taskId"), "task_id")
-	if !ok {
-		return db.AgentTaskQueue{}, false
-	}
-	if task.ID != pathTaskID {
-		writeError(w, http.StatusForbidden, "task token does not match the path task")
-		return db.AgentTaskQueue{}, false
+	if taskInPath {
+		pathTaskID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "taskId"), "task_id")
+		if !ok {
+			return db.AgentTaskQueue{}, false
+		}
+		if task.ID != pathTaskID {
+			writeError(w, http.StatusForbidden, "task token does not match the path task")
+			return db.AgentTaskQueue{}, false
+		}
 	}
 	if task.Status != "running" {
 		writeError(w, http.StatusConflict, "task is not running")
@@ -330,7 +332,7 @@ func (h *Handler) SubmitAsk(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	task, ok := h.callerRunningIssueTask(w, r, workspaceID)
+	task, ok := h.callerRunningIssueTask(w, r, workspaceID, true)
 	if !ok {
 		return
 	}
@@ -382,7 +384,7 @@ func (h *Handler) CreatePlan(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	task, ok := h.callerRunningIssueTask(w, r, workspaceID)
+	task, ok := h.callerRunningIssueTask(w, r, workspaceID, true)
 	if !ok {
 		return
 	}
@@ -445,7 +447,7 @@ func (h *Handler) WritePlanSection(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	task, ok := h.callerRunningIssueTask(w, r, workspaceID)
+	task, ok := h.callerRunningIssueTask(w, r, workspaceID, false)
 	if !ok {
 		return
 	}
@@ -539,7 +541,7 @@ func (h *Handler) SubmitPlan(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	task, ok := h.callerRunningIssueTask(w, r, workspaceID)
+	task, ok := h.callerRunningIssueTask(w, r, workspaceID, false)
 	if !ok {
 		return
 	}

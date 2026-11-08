@@ -77,7 +77,7 @@ func agentPlanRequest(t *testing.T, f askPlanFixture, method, path, planID strin
 	req.Header.Set("X-Task-ID", f.taskID)
 	req.Header.Set("X-Agent-ID", f.agentID)
 	req.Header.Set("X-Actor-Source", "task_token")
-	return withURLParams(req, "id", testWorkspaceID, "taskId", f.taskID, "planId", planID)
+	return withURLParams(req, "id", testWorkspaceID, "planId", planID)
 }
 
 func TestSubmitAskParksTaskAndCreatesCard(t *testing.T) {
@@ -206,6 +206,27 @@ func TestPlanWriteSectionRevisionFence(t *testing.T) {
 	if written.Revision != created.Revision+1 {
 		t.Fatalf("revision = %d, want %d", written.Revision, created.Revision+1)
 	}
+}
+
+func TestPlanRoutesRejectAnotherTask(t *testing.T) {
+	owner := newAskPlanFixture(t)
+	other := owner
+	other.agentID = dbfx.Agent(t, "Other Plan Agent", owner.runtimeID)
+	other.issueID = dbfx.Issue(t, "other plan issue", testutil.Cols{"status": "planing_2", "assignee_type": "agent", "assignee_id": other.agentID})
+	other.taskID = dbfx.Task(t, other.agentID, testutil.Cols{"issue_id": other.issueID, "runtime_id": owner.runtimeID, "status": "running"})
+	var plan planResponse
+	testutil.Call(t, testHandler.CreatePlan,
+		agentAskRequest(t, owner, http.MethodPost, "/plans", map[string]any{
+			"title": "Owner plan", "outline": []string{"Goal"},
+		}),
+	).Want(http.StatusCreated).JSON(&plan)
+	write := agentPlanRequest(t, other, http.MethodPut, "/sections", plan.ID, map[string]any{
+		"base_revision": plan.Revision,
+		"section":       map[string]any{"section_id": "s1", "heading": "Goal", "markdown": "Other agent"},
+	})
+	testutil.Call(t, testHandler.WritePlanSection, write).Want(http.StatusForbidden)
+	submit := agentPlanRequest(t, other, http.MethodPost, "/submit", plan.ID, map[string]any{"revision": plan.Revision})
+	testutil.Call(t, testHandler.SubmitPlan, submit).Want(http.StatusForbidden)
 }
 
 func TestPlanVerdictApproveWritesDescriptionAndResumes(t *testing.T) {
