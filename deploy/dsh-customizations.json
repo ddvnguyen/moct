@@ -3,7 +3,6 @@
     {
       "repo": "ddvnguyen/moct-dsh-team-room",
       "packages": [
-        { "name": "@ddvnguyen/moct-dsh-team-room", "dir": "." },
         { "name": "@ddvnguyen/dsh-sidebar", "dir": "packages/sidebar" }
       ]
     }
