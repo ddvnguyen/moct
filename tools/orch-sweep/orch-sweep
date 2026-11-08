@@ -784,7 +784,6 @@ def build_stuck_list(board, issues, t, resume_map):
     """M-268 deterministic stuck-list. No LLM judgment: four threshold rules
     over the sweep board (+ blocked cards + baseline resume counts). Returns
     {hash, triggers, items} where items are {card, trigger, age_min, pr}."""
-    by_card = {b.get("card"): b for b in issues and board if b.get("card")}
     items, seen = [], set()
 
     def add(card, trigger, age_min, pr=None):
@@ -821,16 +820,12 @@ def build_stuck_list(board, issues, t, resume_map):
             add(b.get("card"), "idle-after-resume", idle)
 
     # (c) blocked >4 h (blocked cards are in issues but not on the board).
-    board_cards = {b.get("card") for b in board}
     for i in issues or []:
         if i.get("status") != "blocked":
             continue
         idle = idle_minutes(i.get("last_activity_at"))
         if idle is not None and idle > BLOCKED_STUCK_MIN:
-            if i.get("identifier") not in board_cards:
-                add(i.get("identifier"), "blocked", idle)
-            else:
-                add(i.get("identifier"), "blocked", idle)
+            add(i.get("identifier"), "blocked", idle)
 
     # (d) >=3 cards share one failure_class/reason code.
     codes = {}
