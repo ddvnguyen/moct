@@ -555,6 +555,7 @@ type AgentTaskResponse struct {
 	SupplementCapability  string                 `json:"supplement_capability,omitempty"`
 	SupplementCommentIDs  []string               `json:"supplement_comment_ids,omitempty"`
 	CanSupplement         bool                   `json:"can_supplement,omitempty"`
+	SteerQueueCapable     bool                   `json:"steer_queue_capable,omitempty"`
 	TriggerThreadID       string                 `json:"trigger_thread_id,omitempty"`       // root comment ID for the triggering thread
 	TriggerCommentContent string                 `json:"trigger_comment_content,omitempty"` // content of the triggering comment
 	TriggerSummary        *string                `json:"trigger_summary,omitempty"`         // canonical short description snapshot — comment text / autopilot title — taken at task creation; survives source edits/deletes

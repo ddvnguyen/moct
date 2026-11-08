@@ -77,7 +77,10 @@ function SteerableRun({
 
   const { data: runtimes = [] } = useQuery(runtimeListOptions(workspaceId));
   const provider = runtimes.find((runtime) => runtime.id === task.runtime_id)?.provider;
-  const queueSupported = provider === "dsh";
+  // Prefer the server-provided bit; fall back to the provider check for older servers.
+  const queueSupported =
+    task.steer_queue_capable === true ||
+    (task.steer_queue_capable === undefined && provider === "dsh");
   const defaultMode: "steer" | "queue" = queueSupported ? "queue" : "steer";
 
   const submit = async (mode: "steer" | "queue") => {

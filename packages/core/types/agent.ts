@@ -384,6 +384,8 @@ export interface AgentTask {
   supplement_comment_ids?: string[];
   /** Server-side invocation verdict for the current member and this agent. */
   can_supplement?: boolean;
+  /** Whether this run's bridge supports queue mode (steer + queue), not just steer. */
+  steer_queue_capable?: boolean;
   /**
    * Canonical short description of what triggered this task — snapshot
    * taken at creation time. For comment-triggered tasks it's the

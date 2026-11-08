@@ -42,6 +42,35 @@ func (h *Handler) hydrateTaskSupplementMetadata(ctx context.Context, r *http.Req
 	}
 
 	userID := requestUserID(r)
+
+	// steer_queue_capable mirrors the bridge/runtime: only dsh providers can
+	// take a queued message, so the UI shows Steer/Queue only when this bit
+	// is present instead of guessing from the provider name.
+	// Named fallback (M-135 review): the server has no recorded per-task
+	// bridge capability (the ready frame's steer/queue flags live only in
+	// daemon-local dshRunState and are never persisted), so this bit is
+	// derived from the runtime provider being "dsh" behind the negotiated
+	// task-supplement-v1 row, not from the bridge itself.
+	runtimeProvider := make(map[string]string)
+	runtimeIDs := make([]pgtype.UUID, 0, len(tasks))
+	seenRuntime := make(map[string]bool)
+	for i := range tasks {
+		id := uuidToString(tasks[i].RuntimeID)
+		if id == "" || seenRuntime[id] {
+			continue
+		}
+		seenRuntime[id] = true
+		runtimeIDs = append(runtimeIDs, tasks[i].RuntimeID)
+	}
+	if len(runtimeIDs) > 0 {
+		runtimes, rerr := h.Queries.GetAgentRuntimes(r.Context(), runtimeIDs)
+		if rerr == nil {
+			for _, rt := range runtimes {
+				runtimeProvider[uuidToString(rt.ID)] = rt.Provider
+			}
+		}
+	}
+
 	// can_supplement answers for the caller: an agent is judged as its
 	// steering comment would be, never as the member it runs for.
 	actorType, actorID := h.resolveActor(r, userID, uuidToString(workspaceID))
@@ -56,6 +85,7 @@ func (h *Handler) hydrateTaskSupplementMetadata(ctx context.Context, r *http.Req
 			continue
 		}
 		resp[i].SupplementCapability = row.Capability
+		resp[i].SteerQueueCapable = runtimeProvider[uuidToString(task.RuntimeID)] == "dsh"
 		resp[i].SupplementCommentIDs = uuidsToStrings(row.CommentIds)
 		if task.Status != "running" || row.Capability != protocol.DaemonCapabilityTaskSupplementV1 || userID == "" {
 			continue

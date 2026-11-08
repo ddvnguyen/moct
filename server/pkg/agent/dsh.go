@@ -1023,7 +1023,7 @@ func dshSupplementUnsupported(mode string, questionsCapable bool) error {
 	if !questionsCapable {
 		return fmt.Errorf("dsh runtime bridge cannot take a %s: its ready frame advertises neither `%s` nor `questions`", mode, mode)
 	}
-	return fmt.Errorf("dsh runtime bridge cannot take a %s: its ready frame does not advertise `%s`, and no question is pending to answer instead", mode, mode)
+	return fmt.Errorf("dsh runtime bridge cannot take a %s: its ready frame does not advertise `%s` (a parked question would have been answered instead, but no question is pending)", mode, mode)
 }
 
 // waitForDshInboxState waits for the bridge's answer to one steer/queue.
