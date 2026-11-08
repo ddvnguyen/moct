@@ -163,7 +163,8 @@ WHERE id = $1
 RETURNING *;
 
 -- name: SetAgentTaskQueueAccount :one
-UPDATE agent_task_queue SET account_id = $2, updated_at = now()
+-- agent_task_queue has no updated_at column; touch only the lease marker.
+UPDATE agent_task_queue SET account_id = $2
 WHERE id = $1
 RETURNING *;
 

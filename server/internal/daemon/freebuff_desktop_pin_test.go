@@ -41,6 +41,36 @@ func TestDesktopPinReconciliation(t *testing.T) {
 	}
 }
 
+func TestDesktopEnsureRejectsThreadlessEngine(t *testing.T) {
+	fx := newFreebuffFixture(t)
+	rt := Runtime{ID: "pin-threadless"}
+	key := freebuffDesktopLoginKey(rt.ID, "a")
+	t.Cleanup(func() { freebuffAccountPins.Delete(key) })
+	threadless := &fakeAccount{statuses: []freebuffrt.AuthStatus{signedIn("x")}, noThreads: true}
+	prev := startFreebuffAccount
+	startFreebuffAccount = func(context.Context, string, string) (freebuffAccount, func(), error) {
+		return threadless, func() {}, nil
+	}
+	t.Cleanup(func() { startFreebuffAccount = prev })
+	if _, err := fx.daemon.ensureFreebuffDesktopInstance(context.Background(), rt, "a"); err == nil {
+		t.Fatal("ensure accepted an engine without thread routes")
+	}
+	if _, ok := fx.daemon.freebuffDesktopInstances.Load(key); ok {
+		t.Fatal("threadless instance was published")
+	}
+	if pin, ok := fx.daemon.freebuffDesktopFailedPins[key]; !ok || pin != freebuffAccountEngineVersion(rt.ID, "a") {
+		t.Fatalf("threadless pin not recorded as failed: %v", fx.daemon.freebuffDesktopFailedPins)
+	}
+	good := &fakeAccount{statuses: []freebuffrt.AuthStatus{signedIn("x")}}
+	startFreebuffAccount = func(context.Context, string, string) (freebuffAccount, func(), error) {
+		return good, func() {}, nil
+	}
+	client, err := fx.daemon.ensureFreebuffDesktopInstance(context.Background(), rt, "a")
+	if err != nil || client != good {
+		t.Fatalf("ensure after threadless failure: client=%v err=%v", client, err)
+	}
+}
+
 func TestDesktopPinDefersLoginAndReportsFailure(t *testing.T) {
 	fx := newFreebuffFixture(t)
 	rt := Runtime{ID: "pin-failure"}
