@@ -76,6 +76,11 @@ fi
 container_exists() { [ "${PODMAN_CONTAINER_EXISTS:-1}" = "1" ] && podman inspect "$CONTAINER" >/dev/null 2>&1; }
 container_running() { [ "$(podman inspect "$CONTAINER" --format '{{.State.Status}}' 2>/dev/null || true)" = "running" ]; }
 container_image() { podman inspect "$CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true; }
+# podman may report the image with an explicit docker.io/ registry prefix;
+# normalize it so it compares equal to the short IMAGE name.
+normalize_image() {
+  case "$1" in docker.io/*) printf '%s' "${1#docker.io/}" ;; *) printf '%s' "$1" ;; esac
+}
 
 if [ "$DRY_RUN" = 1 ]; then
   printf 'MMX PG17 target plan\n'
@@ -99,7 +104,7 @@ if [ "$INSTALL_UNIT" = 1 ]; then
 fi
 
 if container_exists; then
-  if [ "$(container_image)" != "$IMAGE" ]; then
+  if [ "$(normalize_image "$(container_image)")" != "$(normalize_image "$IMAGE")" ]; then
     die "container $CONTAINER exists but uses image $(container_image | head -c 120) (expected $IMAGE); nothing changed"
   fi
   if ! container_running; then

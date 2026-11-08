@@ -47,9 +47,9 @@ case "$*" in
   *DROP\ DATABASE*) printf 'dropped\n' ;;
   *pg_dump*) printf 'pg dump bytes\n' ;;
   *inspect\ multica-pg17-mmx\ --format\ *State.Status*) printf 'running\n' ;;
-  *inspect\ multica-pg17-mmx\ --format\ *Config.Image*) printf 'pgvector/pgvector:pg17\n' ;;
+  *inspect\ multica-pg17-mmx\ --format\ *Config.Image*) printf '%s\n' "${STUB_IMAGE:-pgvector/pgvector:pg17}" ;;
   *inspect\ multica-pg17-mmx\ --format\ *PortBindings*) printf '{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"55434"}]}\n' ;;
-  *inspect\ multica-pg17-mmx\ --format*) printf '{"Config":{"Image":"pgvector/pgvector:pg17"}}\n' ;;
+  *inspect\ multica-pg17-mmx\ --format*) printf '{"Config":{"Image":"%s"}}\n' "${STUB_IMAGE:-pgvector/pgvector:pg17}" ;;
   *inspect\ *State.Status*) printf 'running\n' ;;
   *ps\ -q*) printf 'main-pg-id\n' ;;
   *inspect*) printf '{"State":{"Status":"running"}}\n' ;;
@@ -146,4 +146,17 @@ contains "$out" "match"
 out="$(DB_EXISTS=1 bash "$RESTORE" "$bdir" --recreate 2>&1)"
 contains "$out" "restore verified"
 
+# no counts.tsv: counts fall back to live source (stubbed 42), still matches
+liveonly="$SANDBOX/liveonly"
+cp -a "$bdir" "$liveonly"
+rm "$liveonly/counts.tsv"
+( cd "$liveonly" && sha256sum database.dump uploads.tar > sha256sums.txt )
+out="$(bash "$RESTORE" "$liveonly" 2>&1)"
+contains "$out" "restore verified"
+contains "$out" "match"
+
+# docker.io-prefixed image reports the same image: adopt, do not refuse
+out="$(STUB_IMAGE="docker.io/pgvector/pgvector:pg17" bash "$START" 2>&1)"
+contains "$out" "PG17 target ready"
+if STUB_IMAGE="postgres:17" bash "$START" >/dev/null 2>&1; then echo "expected foreign-image refusal" >&2; exit 1; fi
 printf 'mmx-migrate stub tests passed\n'
