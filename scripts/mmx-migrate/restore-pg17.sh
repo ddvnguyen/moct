@@ -167,7 +167,7 @@ if [ -n "$MAIN_PG_CONTAINER" ] && podman inspect "$MAIN_PG_CONTAINER" --format '
     count="$(podman exec "$MAIN_PG_CONTAINER" psql -U "$SOURCE_USER" -d "$SOURCE_DB" -tAc "SELECT count(*) FROM \"$table\";" 2>/dev/null || true)"
     [[ "$count" =~ ^[0-9]+$ ]] || count=""
     live_counts="$live_counts
-:$table	$count"
+$table	$count"
   done
 fi
 for table in issue comment attachment agent agent_runtime user workspace schema_migrations; do
