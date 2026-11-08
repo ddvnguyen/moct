@@ -38,10 +38,7 @@ func (d *Daemon) ensureFreebuffDesktopInstance(ctx context.Context, rt Runtime, 
 	key := freebuffDesktopLoginKey(rt.ID, accountID)
 	if v, ok := d.freebuffDesktopInstances.Load(key); ok {
 		inst := v.(*freebuffDesktopInstance)
-		hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := inst.client.AuthStatus(hctx)
-		cancel()
-		if err == nil {
+		if desktopInstanceReady(ctx, inst.client) {
 			return inst.client, nil
 		}
 		inst.stop()
@@ -56,9 +53,36 @@ func (d *Daemon) ensureFreebuffDesktopInstance(ctx context.Context, rt Runtime, 
 		d.freebuffDesktopFailedPins[key] = freebuffAccountEngineVersion(rt.ID, accountID)
 		return nil, err
 	}
+	if !desktopInstanceReady(d.daemonLifecycleCtx(), client) {
+		stop()
+		if d.freebuffDesktopFailedPins == nil {
+			d.freebuffDesktopFailedPins = make(map[string]string)
+		}
+		d.freebuffDesktopFailedPins[key] = freebuffAccountEngineVersion(rt.ID, accountID)
+		return nil, errors.New("managed Freebuff Desktop account is not task-ready (thread routes unavailable); check the pinned engine version")
+	}
 	delete(d.freebuffDesktopFailedPins, key)
 	d.freebuffDesktopInstances.Store(key, &freebuffDesktopInstance{client: client, stop: stop, pin: freebuffAccountEngineVersion(rt.ID, accountID)})
 	return client, nil
+}
+
+// desktopInstanceReady reports whether a managed account instance can run
+// tasks: it must answer auth status AND serve the thread routes the bridge
+// drives (POST /api/threads). An engine bundle without local thread routes
+// (e.g. a hosted-workspace-only build) passes auth but fails every run with
+// POST /api/threads -> 404, so readiness must cover both.
+func desktopInstanceReady(ctx context.Context, client freebuffAccount) bool {
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if _, err := client.AuthStatus(rctx); err != nil {
+		return false
+	}
+	if probe, ok := client.(interface {
+		ThreadProbe(ctx context.Context) error
+	}); ok {
+		return probe.ThreadProbe(rctx) == nil
+	}
+	return true
 }
 
 // Reservations span the entire task, including the interval after endpoint lookup.

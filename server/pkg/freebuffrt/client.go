@@ -139,6 +139,31 @@ type LoginState struct {
 	Phase string `json:"phase"`
 }
 
+// ThreadProbe verifies the orchestrator serves the local thread routes the
+// task bridge drives. GET /api/events answers 200 with the event stream on
+// builds that serve threads, and 404 {"error":"not found"} on builds whose
+// router dropped those routes (e.g. a hosted-workspace-only build passes
+// /api/auth/status but 404s POST /api/threads on every run). Only 404 fails
+// the probe; any other outcome (200 stream, 401 without a launch token, 403
+// forbidden origin) means the route exists.
+func (c *Client) ThreadProbe(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/events", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(launchHeader, c.launchID)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	if resp.StatusCode == http.StatusNotFound {
+		return errors.New("freebuff orchestrator does not serve thread routes")
+	}
+	return nil
+}
+
 // AuthStatus reads GET /api/auth/status.
 func (c *Client) AuthStatus(ctx context.Context) (AuthStatus, error) {
 	var raw json.RawMessage
@@ -153,7 +178,6 @@ func (c *Client) AuthStatus(ctx context.Context) (AuthStatus, error) {
 	return st, nil
 }
 
-// LoginStart is the answer to starting a browser login.
 type LoginStart struct {
 	URL       string `json:"url"`
 	AttemptID string `json:"attemptId"`

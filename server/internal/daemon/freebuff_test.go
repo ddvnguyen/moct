@@ -63,14 +63,15 @@ func (fx *freebuffFixture) snapshot() []map[string]any {
 // fakeAccount is an orchestrator stand-in for the account flow.
 type fakeAccount struct {
 	mu         sync.Mutex
-	statuses   []freebuffrt.AuthStatus // returned in order; the last repeats
+	statuses   []freebuffrt.AuthStatus
 	authErr    error
 	launchID   string
-	catalogs   []freebuffrt.ModelCatalog // returned in order; the last repeats
+	catalogs   []freebuffrt.ModelCatalog
 	catalogErr error
 	login      freebuffrt.LoginStart
 	loginErr   error
 	canceled   bool
+	noThreads  bool
 }
 
 func (f *fakeAccount) AuthStatus(context.Context) (freebuffrt.AuthStatus, error) {
@@ -84,6 +85,18 @@ func (f *fakeAccount) AuthStatus(context.Context) (freebuffrt.AuthStatus, error)
 		f.statuses = f.statuses[1:]
 	}
 	return st, nil
+}
+
+// ThreadProbe reports whether the fake serves thread routes. Tests set
+// noThreads to simulate an engine bundle without them (auth passes, every
+// run would 404 on POST /api/threads).
+func (f *fakeAccount) ThreadProbe(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.noThreads {
+		return errors.New("freebuff orchestrator does not serve thread routes")
+	}
+	return nil
 }
 
 func (f *fakeAccount) LaunchID() string { return f.launchID }
