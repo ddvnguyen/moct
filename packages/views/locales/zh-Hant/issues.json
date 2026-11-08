@@ -575,7 +575,10 @@
   },
   "timeline": {
     "loading": "載入中…",
-    "jump_to_latest": "跳到最新"
+    "jump_to_latest": "跳到最新",
+    "order_oldest_first": "最早在前",
+    "order_newest_first": "最新在前",
+    "order_toggle_hint": "切換時間線順序"
   },
   "activity": {
     "created": "建立了這個任務",

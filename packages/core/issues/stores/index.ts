@@ -69,6 +69,10 @@ export {
 } from "./surface-view-store";
 export { useSubIssuesCollapseStore } from "./sub-issues-collapse-store";
 export {
+  useTimelineDisplayStore,
+  type TimelineOrder,
+} from "./timeline-display-store";
+export {
   useSubIssueDisplayStore,
   SUB_ISSUE_ROW_PROPERTY_KEYS,
   DEFAULT_SUB_ISSUE_ROW_PROPERTIES,

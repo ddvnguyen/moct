@@ -10,6 +10,7 @@ import { ApiError } from "@multica/core/api/client";
 import { toast } from "sonner";
 import { useResolvedExpandStore } from "@multica/core/issues/stores/resolved-expand-store";
 import { useCommentCollapseStore } from "@multica/core/issues/stores";
+import { useTimelineDisplayStore } from "@multica/core/issues/stores/timeline-display-store";
 import {
   DEFAULT_SUB_ISSUE_ROW_PROPERTIES,
   useSubIssueDisplayStore,
@@ -386,6 +387,13 @@ vi.mock("@multica/core/issues/stores", async () => ({
   ...(await vi.importActual<
     typeof import("@multica/core/issues/stores/sub-issues-collapse-store")
   >("@multica/core/issues/stores/sub-issues-collapse-store")),
+  // Real store: the persisted timeline-order preference. Persistence is a
+  // no-op under jsdom (defaultStorage guards on window.localStorage), so
+  // tests drive the order with setState and the component reads the same
+  // instance through the barrel.
+  ...(await vi.importActual<
+    typeof import("@multica/core/issues/stores/timeline-display-store")
+  >("@multica/core/issues/stores/timeline-display-store")),
   useRecentIssuesStore: Object.assign(
     (selector?: any) => {
       const state = { byWorkspace: {}, recordVisit: mockRecordVisit, pruneWorkspaces: vi.fn() };
@@ -727,6 +735,7 @@ describe("IssueDetail (shared)", () => {
     readonlyContentRenders.length = 0;
     descriptionSelectionAction.current = undefined;
     mockViewport.isMobile = false;
+    useTimelineDisplayStore.setState({ order: "oldest-first" });
     // Default: issue loads successfully
     mockApiObj.getIssue.mockResolvedValue(mockIssue);
     // /timeline returns the entries flat in chronological order (oldest first).
@@ -3772,6 +3781,32 @@ describe("IssueDetail (shared)", () => {
     const rendered = Array.from(container.querySelectorAll("[id^='comment-']")).map((el) => el.id)
       .filter((id) => ["comment-confirm", "comment-step2", "comment-aside", "comment-step3"].includes(id));
     expect(rendered).toEqual(["comment-confirm", "comment-step2", "comment-aside", "comment-step3"]);
+  });
+
+  // M-290: the timeline-order preference reverses the top-level presentation
+  // so the newest entry is on top on long-running issues. Thread nesting is
+  // untouched — replies still render inside their root's card.
+  it("renders newest first when the timeline order preference is newest-first", async () => {
+    useTimelineDisplayStore.setState({ order: "newest-first" });
+    const { container } = renderIssueDetail();
+    await screen.findByText("Started working on this");
+    await screen.findByText("I can help with this");
+
+    const rendered = Array.from(container.querySelectorAll("[id^='comment-']")).map((el) => el.id)
+      .filter((id) => ["comment-comment-1", "comment-comment-2"].includes(id));
+    expect(rendered).toEqual(["comment-comment-2", "comment-comment-1"]);
+  });
+
+  it("toggles the timeline order from the Activity header", async () => {
+    renderIssueDetail();
+    await screen.findByText("Started working on this");
+
+    const toggle = screen.getByTitle("Toggle timeline order");
+    expect(useTimelineDisplayStore.getState().order).toBe("oldest-first");
+    fireEvent.click(toggle);
+    expect(useTimelineDisplayStore.getState().order).toBe("newest-first");
+    fireEvent.click(toggle);
+    expect(useTimelineDisplayStore.getState().order).toBe("oldest-first");
   });
 
 });

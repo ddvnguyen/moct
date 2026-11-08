@@ -655,7 +655,10 @@
   },
   "timeline": {
     "loading": "加载中…",
-    "jump_to_latest": "跳到最新"
+    "jump_to_latest": "跳到最新",
+    "order_oldest_first": "最早在前",
+    "order_newest_first": "最新在前",
+    "order_toggle_hint": "切换时间线顺序"
   },
   "activity": {
     "created": "创建了这个任务",

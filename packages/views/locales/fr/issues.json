@@ -663,7 +663,10 @@
   },
   "timeline": {
     "loading": "Chargement...",
-    "jump_to_latest": "Aller au plus récent"
+    "jump_to_latest": "Aller au plus récent",
+    "order_oldest_first": "Plus anciens d'abord",
+    "order_newest_first": "Plus récents d'abord",
+    "order_toggle_hint": "Changer l'ordre de la chronologie"
   },
   "activity": {
     "created": "a créé cette tâche",
