@@ -2918,7 +2918,7 @@ RETURNING *;
 -- nothing. Session only: work_dir is already on the row from StartTask.
 -- Deliberately NOT a terminal transition: no completed_at, no settlement.
 UPDATE agent_task_queue
-SET session_id = sqlc.narg('session_id'),
+SET session_id = COALESCE(sqlc.narg('session_id'), session_id),
     work_dir = COALESCE(sqlc.narg('work_dir'), work_dir)
 WHERE id = $1 AND status = 'blocked'
 RETURNING *;

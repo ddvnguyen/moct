@@ -398,6 +398,43 @@ func TestParkReportRecordsSession(t *testing.T) {
 	testutil.Call(t, testHandler.BlockTask, withURLParam(other, "taskId", f.taskID)).Want(http.StatusOK)
 }
 
+func TestEmptyParkReportPreservesPinnedSession(t *testing.T) {
+	f := newAskPlanFixture(t)
+	// A runtime may report its session while running, then return no session
+	// when the daemon interrupts it after an ask parks the task.
+	pin := newDaemonTokenRequest(http.MethodPost, "/session", map[string]any{
+		"session_id": "sess-pinned", "work_dir": "/workspace/fixture",
+	}, testWorkspaceID, "park-daemon")
+	testutil.Call(t, testHandler.PinTaskSession, withURLParam(pin, "taskId", f.taskID)).Want(http.StatusNoContent)
+	var ask askResponse
+	testutil.Call(t, testHandler.SubmitAsk,
+		agentAskRequest(t, f, http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/tasks/"+f.taskID+"/ask", validAskBody()),
+	).Want(http.StatusAccepted).JSON(&ask)
+	park := newDaemonTokenRequest(http.MethodPost, "/blocked", map[string]any{}, testWorkspaceID, "park-daemon")
+	testutil.Call(t, testHandler.BlockTask, withURLParam(park, "taskId", f.taskID)).Want(http.StatusOK)
+	var sessionID string
+	dbfx.QueryRow(t, `SELECT COALESCE(session_id,'') FROM agent_task_queue WHERE id=$1`, f.taskID).Scan(&sessionID)
+	if sessionID != "sess-pinned" {
+		t.Fatalf("parked session = %q, want the pinned session", sessionID)
+	}
+	answer := newRequest(http.MethodPost, "/answer", map[string]any{
+		"answers": []map[string]any{{"selected": []int{0}}},
+	})
+	var response map[string]any
+	testutil.Call(t, testHandler.AnswerQuestionCard,
+		withURLParams(answer, "id", testWorkspaceID, "cardId", ask.CardID),
+	).Want(http.StatusOK).JSON(&response)
+	resumeID, _ := response["resume_task"].(string)
+	if resumeID == "" {
+		t.Fatalf("no resume task in answer response: %#v", response)
+	}
+	var sourceSession string
+	dbfx.QueryRow(t, `SELECT COALESCE(parked.session_id,'') FROM agent_task_queue resumed JOIN agent_task_queue parked ON parked.id=resumed.rerun_of_task_id WHERE resumed.id=$1`, resumeID).Scan(&sourceSession)
+	if sourceSession != "sess-pinned" {
+		t.Fatalf("resume source session = %q, want sess-pinned", sourceSession)
+	}
+}
+
 // keep the generated and encoding imports used even if a future edit drops a
 // direct reference.
 var _ = db.AgentQuestionCard{}
