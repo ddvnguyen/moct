@@ -8940,6 +8940,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			PriorSessionID:  task.PriorSessionID,
 			PriorEndedAt:    task.PriorSessionEndedAt,
 			PriorWorkDir:    task.PriorWorkDir,
+			PriorPinned:     task.PriorSessionPinned,
 			LinkedSessionID: task.LinkedPriorSessionID,
 			LinkedIssueID:   task.LinkedPriorSessionIssueID,
 			LinkedEndedAt:   task.LinkedPriorSessionEndedAt,

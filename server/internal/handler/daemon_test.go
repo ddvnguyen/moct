@@ -2795,6 +2795,7 @@ func TestClaimResponseAgentIdentityMatches(t *testing.T) {
 
 type claimRuntimeGuardTask struct {
 	PriorSessionID                string          `json:"prior_session_id"`
+	PriorSessionPinned            bool            `json:"prior_session_pinned"`
 	PriorWorkDir                  string          `json:"prior_work_dir"`
 	PriorSessionResumeUnavailable bool            `json:"prior_session_resume_unavailable"`
 	ChatMessage                   string          `json:"chat_message"`

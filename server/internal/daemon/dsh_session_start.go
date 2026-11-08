@@ -5,6 +5,7 @@ package daemon
 // Every dsh run that has a related prior session now has three possible
 // starts, and the choice is deterministic — no model judge:
 //
+//	related + pinned by a human answer       → resume the same session
 //	related + cache still warm              → resume the same session
 //	related + cold + a fresh summary beside  → fork a new session seeded with
 //	  the prior session                        that summary, parentSession linked
@@ -101,6 +102,11 @@ type dshSessionStartInput struct {
 	PriorSessionID string
 	PriorEndedAt   string
 	PriorWorkDir   string
+	// PriorPinned reports that PriorSessionID is the session a human
+	// explicitly continued by answering a parked ask/plan run. Such a
+	// candidate is resumed on that intent alone: the park never reached a
+	// terminal state, so it has no end time and cannot be judged warm.
+	PriorPinned bool
 	// Linked* is the newest terminal session on an issue explicitly linked to
 	// this one, also off the claim payload.
 	LinkedSessionID string
@@ -168,6 +174,22 @@ func decideDshSessionStart(in dshSessionStartInput) dshSessionStartPlan {
 		ResumeSessionID: candidate.SessionID,
 		TTL:             ttl,
 		Margin:          in.Cfg.Margin,
+	}
+
+	// A pinned candidate is the conversation a human just answered (S1-A1):
+	// the run parked on its question and the answer continues it, so the
+	// resume is the human's intent, not an inference from cache warmth. It is
+	// judged only on reachability — the warmth table below would call every
+	// parked run cold, because a park has no end time at all.
+	if in.PriorPinned && candidate.SessionID == in.PriorSessionID {
+		if in.Reachable != nil && !in.Reachable(candidate) {
+			plan.ResumeSessionID = ""
+			plan.Verdict = dshSessionStartFresh
+			plan.Reason = "pinned: session store not reachable"
+			return plan
+		}
+		plan.Reason = "pinned: answering the run that parked here"
+		return plan
 	}
 
 	// Without an end time the cache cannot be judged warm and a summary's age

@@ -3511,6 +3511,13 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				if !service.ResumeUnsafeFailure(src.FailureReason.String, src.Error.String) &&
 					src.SessionID.Valid && src.RuntimeID == task.RuntimeID && !sourceSessionRetired {
 					resp.PriorSessionID = src.SessionID.String
+					// A parked source (ask/plan) is the one rerun that continues the
+					// conversation the human just answered, and it is the one source
+					// with no terminal timestamp: blocked is not terminal, so there is
+					// no completed_at to date the session's end. Flag it so the dsh
+					// session-start decision resumes it rather than calling a warmth
+					// it cannot have (S1-A1/M-177).
+					resp.PriorSessionPinned = src.Status == "blocked"
 					resumedRunStartedAt = src.StartedAt
 					// The deltas date from the run we actually resume, which on
 					// this path is the operator-chosen source — routinely NOT

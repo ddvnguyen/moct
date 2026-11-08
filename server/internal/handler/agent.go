@@ -481,6 +481,14 @@ type AgentTaskResponse struct {
 	// cache's warmth from this instead of guessing from the trigger time.
 	// Empty on a cold start and on rows that recorded no timestamp.
 	PriorSessionEndedAt string `json:"prior_session_ended_at,omitempty"`
+	// PriorSessionPinned marks PriorSessionID as the session a human explicitly
+	// continued: the source run parked awaiting an answer (ask/plan) and the
+	// answer's run must land in that same session, however long the question
+	// waited. A parked row is not terminal, so it has no completed_at and
+	// therefore no end time to judge — the dsh session-start decision resumes a
+	// pinned session instead of calling it fresh (S1-A1/M-177).
+	// Mirror field: internal/daemon/types.go, same JSON name.
+	PriorSessionPinned bool `json:"prior_session_pinned,omitempty"`
 	// LinkedPriorSession* carry the newest terminal dsh session on an issue
 	// explicitly linked to this one (its parent or a child), with the same
 	// resume guards GetLastTaskSession applies (S3-B2/M-138). Deterministic

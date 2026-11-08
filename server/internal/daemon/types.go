@@ -132,6 +132,13 @@ type Task struct {
 	// Empty on servers predating it and on a cold start, which reads as "age
 	// unknown" — the decision then cannot call the cache warm.
 	PriorSessionEndedAt string `json:"prior_session_ended_at,omitempty"`
+	// PriorSessionPinned marks PriorSessionID as the session a human explicitly
+	// continued: the source run parked awaiting an answer (ask/plan) and the
+	// answer's run belongs in that same session, however long the question
+	// waited. A parked row is not terminal, so it has no end time; the dsh
+	// session-start decision resumes a pinned session instead of judging the
+	// cache warmth it cannot measure (S1-A1/M-177). Absent on older servers.
+	PriorSessionPinned bool `json:"prior_session_pinned,omitempty"`
 	// LinkedPriorSession* name the newest terminal dsh session on an issue
 	// explicitly linked to this one — its parent or a child (S3-B2/M-138).
 	// Deterministic relevance v1: an explicit parent/child link is the whole

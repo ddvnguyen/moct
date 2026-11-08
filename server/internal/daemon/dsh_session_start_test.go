@@ -446,6 +446,51 @@ func TestDecideDshSessionStartUnreachableWarm(t *testing.T) {
 	}
 }
 
+// TestDecideDshSessionStartPinnedPark covers S1-A1/M-177: answering a parked
+// ask/plan run continues the session that parked. A blocked row is not
+// terminal, so the claim carries no end time at all — without the pin the warmth
+// table calls every answered park fresh and the human's answer lands in a new
+// conversation. The pin also outranks a stale end time for the same reason: the
+// question may wait longer than any cache TTL and still be the same turn.
+func TestDecideDshSessionStartPinnedPark(t *testing.T) {
+	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	const priorID = "sess-parked"
+	for _, tc := range []struct {
+		name    string
+		pinned  bool
+		endedAt string
+		reach   bool
+		want    string
+	}{
+		{name: "pinned park with no end time resumes", pinned: true, reach: true, want: dshSessionStartResumed},
+		{name: "pinned park resumes after a long wait", pinned: true, endedAt: now.Add(-24 * time.Hour).Format(time.RFC3339), reach: true, want: dshSessionStartResumed},
+		{name: "pinned park whose session store is unreachable starts fresh", pinned: true, reach: false, want: dshSessionStartFresh},
+		{name: "unpinned candidate with no end time still starts fresh", reach: true, want: dshSessionStartFresh},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := decideDshSessionStart(dshSessionStartInput{
+				Now:            now,
+				Cfg:            testSessionStartConfig(),
+				PriorSessionID: priorID,
+				PriorEndedAt:   tc.endedAt,
+				PriorWorkDir:   "/wd",
+				PriorPinned:    tc.pinned,
+				ReadSummary:    summaryStore{}.read,
+				Reachable:      func(dshSessionCandidate) bool { return tc.reach },
+			})
+			if plan.Verdict != tc.want {
+				t.Fatalf("verdict = %q, want %q (reason %q)", plan.Verdict, tc.want, plan.Reason)
+			}
+			if tc.want == dshSessionStartResumed && plan.ResumeSessionID != priorID {
+				t.Fatalf("resume = %q, want the parked session %q", plan.ResumeSessionID, priorID)
+			}
+			if tc.want != dshSessionStartResumed && plan.ResumeSessionID != "" {
+				t.Fatalf("a non-resumed plan must not carry a resume id, got %q", plan.ResumeSessionID)
+			}
+		})
+	}
+}
+
 // TestDecideDshSessionStartLinkedWarm pins the linked-session semantics the
 // bridge enforces: a resume whose session cwd differs from the run's is
 // rejected (resumeAgent → ResumeRejectedError), so a warm LINKED session in
