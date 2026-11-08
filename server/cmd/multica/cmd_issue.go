@@ -1954,10 +1954,23 @@ func runIssueUpdate(cmd *cobra.Command, args []string) error {
 			strVal(result, "priority"),
 		}}
 		cli.PrintTable(os.Stdout, headers, rows)
+		printContinuationReminder(result)
 		return nil
 	}
 
 	return cli.PrintJSON(os.Stdout, result)
+}
+
+// printContinuationReminder surfaces the M-279 run-end rule in the CLI after
+// a handed-off write that started no run: move the issue or arm a wakeup, or
+// a continuation will be queued. The server sends continuation_reminder only
+// when the predicate holds; the wording is the hook's, echoed verbatim.
+func printContinuationReminder(result map[string]any) {
+	note, _ := result["continuation_reminder"].(string)
+	if note == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Note: %s\n", note)
 }
 
 func runIssueAssign(cmd *cobra.Command, args []string) error {
@@ -2081,6 +2094,7 @@ func runIssueStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	output, _ := cmd.Flags().GetString("output")
+	printContinuationReminder(result)
 	if output == "json" {
 		return cli.PrintJSON(os.Stdout, result)
 	}

@@ -5088,6 +5088,9 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// input is not silently dropped. Agent replays are restricted to explicit
 	// mentions and recorded worker inputs; see reconcileCommentsOnCompletion.
 	h.reconcileCommentsOnCompletion(r.Context(), task)
+	// M-279: if the run ended cleanly without moving the issue or arming a
+	// wakeup, queue one continuation run instead of leaving the card idle.
+	h.TaskService.MaybeContinueUnfinishedStep(r.Context(), *task)
 	// The terminal transaction and completion reconciliation are committed.
 	// Wake the owning runtime now so queued work that was blocked by this
 	// task's agent capacity or serialization key is re-claimed immediately.

@@ -104,6 +104,12 @@ type IssueResponse struct {
 	// preserves whatever labels are already in cache. nil pointer = "field
 	// absent, do not touch"; non-nil (incl. empty slice) = authoritative list.
 	Labels *[]LabelResponse `json:"labels,omitempty"`
+	// ContinuationReminder is the M-279 run-end rule for the agent that made a
+	// handed-off write starting no run: move the issue or arm a wakeup, or a
+	// continuation will be queued. Omitted unless the predicate holds, so the
+	// IssueToMap parity test deliberately skips it (map renderings never carry
+	// per-write reminders).
+	ContinuationReminder *string `json:"continuation_reminder,omitempty"`
 	// SourceContext is detail-only. List, board, search, and children responses
 	// deliberately omit the potentially large immutable snapshot.
 	SourceContext *sourceContextDetailResponse `json:"source_context,omitempty"`
@@ -4186,6 +4192,13 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	if handoff != nil {
 		updatedPayload["workflow_handoff"] = workflowHandoffPayload(issue, handoff, h.workflowHandoffBrief(r.Context(), issue, handoff), willRun)
+	}
+	// M-279: a handed-off write that starts no run leaves the assignee idle —
+	// hand them the rule now, so the run-end path is not the only surface.
+	if handoff != nil && !willRun {
+		if note := h.IssueService.ContinuationReminder(); note != "" {
+			resp.ContinuationReminder = &note
+		}
 	}
 	h.publish(protocol.EventIssueUpdated, workspaceID, actorType, actorID, updatedPayload)
 	if attachmentsChanged {
