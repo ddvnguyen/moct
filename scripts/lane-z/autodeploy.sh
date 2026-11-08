@@ -154,11 +154,13 @@ assert_health() { # $1 = sha the lane must report
   fi
   wait_http "http://127.0.0.1:$MULTICA_BE_Z_PORT/healthz" 120 '"status":"ok"' \
     || { log "multica-be z /healthz did not answer ok"; return 1; }
-  wait_http "http://127.0.0.1:3180/multica/healthz" 60 '' \
+  # The lane web binds LANE_WEB_HOST (10.88.0.1, podman bridge), not loopback.
+  web="http://${LANE_WEB_HOST:-127.0.0.1}:3180"
+  wait_http "$web/multica/healthz" 60 '' \
     || { log "lane web /multica/healthz did not answer"; return 1; }
-  wait_http "http://127.0.0.1:3180/moct/status" 60 '' \
+  wait_http "$web/moct/status" 60 '' \
     || { log "lane web /moct/status did not answer"; return 1; }
-  commit="$(curl -fsS --max-time 5 http://127.0.0.1:3180/multica/health | jq -r '.commit // empty')" \
+  commit="$(curl -fsS --max-time 5 "$web/multica/health" | jq -r '.commit // empty')" \
     || { log "lane web /multica/health did not answer"; return 1; }
   commit_matches "$commit" "$sha" \
     || { log "/multica/health reports commit '$commit', expected '$sha'"; return 1; }
@@ -455,7 +457,7 @@ if [ "$PLUGIN_PRESENT" = 1 ]; then
     rsync -a --delete "$ART/dsh-plugin/" "$DSH_Z_PLUGIN_BUNDLE/"
     printf 'updated (dsh-z restarted)\n' > "$LANE_ROOT/data/autodeploy-plugin.note"
     systemctl --user restart "$DSH_Z_WEB_UNIT"
-    wait_http "http://127.0.0.1:3180/" 90 '' || fail "lane web did not come back after the plugin update"
+    wait_http "http://${LANE_WEB_HOST:-127.0.0.1}:3180/" 90 '' || fail "lane web did not come back after the plugin update"
     assert_health "$SHA" || fail "health check failed after the plugin update"
   fi
 else
