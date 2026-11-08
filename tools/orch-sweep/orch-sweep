@@ -1,0 +1,891 @@
+#!/usr/bin/env python3
+"""orch-sweep — M-218 P2 (quota ledger and worker rotation), M-284 (dead/stale
+wakeups, partial stops, stuck queues), M-268 (committee stuck-list)
+
+One deterministic pass over the live board for the Orchestrator tick.
+Run by the tick as a SINGLE tool call; all internal multica/gh calls are the
+script's own subprocesses, they do not count against the tick's tool-call
+budget (tick contract: at most 6 tool calls plus one per action).
+
+Read-only by default. `--apply-cooldown` additionally writes confirmed quota
+cooldowns to M-86 metadata key `quota_ledger`. It never touches card status,
+assignments, comments or PRs — acting on the output stays the agent's job.
+
+`--stuck-list` prints only the compact committee slice:
+  {at, tool:"orch-sweep", mode:"stuck-list", hash, triggers, items}
+Triggers (deterministic, no LLM judgment):
+  (a) green PR with no verdict on its SHA for >30 min, on a card with no
+      live run and no pending wakeup (verdict-amendment M-268);
+  (b) card idle >2 h with a resume already tried
+      (`orch_baseline.resume.<card>.count>=1`);
+  (c) card `blocked` >4 h;
+  (d) >=3 cards share one `failure_class`/`reason` code.
+Items are {card, trigger, age_min, pr} — small enough to keep M-86 metadata
+(`stuck_list` + ledger + baseline) under the 4 KB cap.
+
+Output: one JSON object on stdout:
+  { at, board[], gate_waiting[], todo_reroutes[], ledger{}, counts{},
+    wip_breaches[], eligible{engineers[],reviewers[]}, stuck{} }
+
+Only confirmed quota signals cool a shared account (leader scope 2026-11-07):
+  * OMP Go      `429 Go usage limit exceeded retry-after-ms=...` / GoUsageLimitError
+  * Claude      `You've hit your weekly limit|session limit · resets <time>`
+  * Codex       `usage limit` (generic form)
+  * Pi upstream `429 {"type":"rate_limit_error", ...}`        (short cooldown)
+Unknown / generic errors (Codebuddy "error result without details", Freebuff
+generic, 401 config errors, idle watchdog) NEVER cool an account: they become
+`unknown` or plain failure classes and go to triage.
+
+There is no remaining-quota field in `multica runtime usage` — the ledger is
+observed-signal only; do not invent one.
+"""
+
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+
+M86_ID = "01a172f2-440d-70ea-b1fd-b470b382a7bb"  # M-86 Delivery management
+LEDGER_KEY = "quota_ledger"
+TICK_AGENT = "0e86b49e-1c6a-4a86-93a6-b602b9a86eae"  # Orchestrator (pi runtime)
+IDLE_THRESHOLD_MIN = 60
+STALE_WAKEUP_HOURS = 24  # M-284 r1+r2: condition wakeup older than this, card idle longer than this
+PARTIAL_STOP_MIN = 60  # M-284 r3: open PR + idle longer than this + no live run
+STUCK_KEY = "stuck_list"  # M-268: committee trigger state on M-86
+VERDICT_WAIT_MIN = 30  # M-268 (a): green PR, no verdict on SHA, waiting this long
+STUCK_IDLE_MIN = 120  # M-268 (b): card idle this long after a resume was tried
+BLOCKED_STUCK_MIN = 240  # M-268 (c): card blocked this long
+SHARED_CODE_MIN = 3  # M-268 (d): this many cards sharing one failure_class/reason
+# in_progress child states an agent (or reviewer) can still move forward.
+# Anything else open (in_review waits on the Owner, wait_for_decision on the
+# Owner/Architect, blocked on a fix) never auto-fires children_done.
+PROGRESSIBLE = ("todo", "planing_2", "in_progress", "agent_review_deploy")
+LEADER_SCOPE = "Leader decision 01a1b51a (2026-11-07): observed-signal ledger, role pools, --after 1m resume"
+
+# --- Role pools (agent ids; names resolved from `multica agent list`) -------
+# M-284 reason codes: every board entry carries `reason` (run-live | fresh |
+# cooldown-routing | wakeup-pending | resumable:<sub>). `action` keeps its old
+# values; `resumable` always pairs with reason dead-wakeup | partial-stop |
+# wakeup-stale | idle. `wakeup_detail` lists each enabled wakeup as live/dead.
+ENGINEERS_ORDER = [  # ok daily-free rows first, then codex window (burst); unknown-tier rows last
+    "934934a4-5f72-4fb4-a73a-f8f33940e271",  # Opencode2   opencode-zen  daily-free
+    "1f23308e-83e4-4923-9ff6-2fc7ce80d841",  # [Go Free] Engineer  omp-go  daily-free
+    "d5c380b6-590a-498f-8591-557c05f462ec",  # Software Engineer   omp-go  daily-free
+    "81abd36c-d925-4cf1-a701-08a80dee99e6",  # Codex Terra         codex window (burst)
+    "23cdae17-72b6-4c7f-a561-8c190808d201",  # Codex Luna          codex window (burst)
+    "a62593fd-09b4-4fe6-aae9-5351829e8a7d",  # [Free] Codebuddy    codebuddy unknown
+    "02cd4c29-7693-4d5f-a2dd-7260f4aa08dc",  # Codebuddy Senior    codebuddy unknown
+    "f4e0179f-2e51-47d8-a20d-281547b4fa64",  # Mika                codebuddy unknown
+    "b70d1cb9-97c9-41f4-a78e-d6be562b2866",  # Freebuff Engineer   freebuff unknown
+]
+LEAD_POOL = [  # committee lead seat (Owner amendment 2026-11-07)
+    "bd7b7aae-88e9-4260-a7b5-301993757e59",  # Claude Architect
+    "9ecc1dde-1c4b-4f58-a9ef-1fcf59fb8545",  # Lead (Muse Spark)
+    "7895c8ca-aed6-461e-9fea-a115b2681872",  # Opus Architect
+]
+ARCHITECT_POOL = [  # committee architect seat (Owner amendment 2026-11-07)
+    "7895c8ca-aed6-461e-9fea-a115b2681872",  # Opus Architect
+    "88908ce5-231a-450c-a2a1-5212e028a1eb",  # Codex Architect
+    "96a1cd5e-2a6e-4ced-a8b3-c28d413e956e",  # Architect (fallback >2h only)
+]
+SEATS_KEY = "quota_seats"
+REVIEWERS_ORDER = [
+    "bd7b7aae-88e9-4260-a7b5-301993757e59",  # Claude Architect  manager
+    "7895c8ca-aed6-461e-9fea-a115b2681872",  # Opus Architect    manager
+    "88908ce5-231a-450c-a2a1-5212e028a1eb",  # Codex Architect   window
+    "96a1cd5e-2a6e-4ced-a8b3-c28d413e956e",  # Architect         fallback >2h only
+]
+GITHUB_REPOS = ["ddvnguyen/moct", "ddvnguyen/moct-dsh-team-room",
+                "ddvnguyen/multica-x", "ddvnguyen/deepseek-harness"]
+ACTIVE_RUN_STATUSES = {"running", "queued", "dispatched", "waiting_local_directory", "started"}
+
+ICT = timezone(timedelta(hours=7))  # Asia/Ho_Chi_Minh
+
+
+# ---------------------------------------------------------------- utilities
+def sh(args, timeout=90):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s: {' '.join(args[:3])}"
+
+
+def sh_json(args, timeout=90):
+    rc, out, err = sh(args, timeout)
+    if rc != 0:
+        return {"__error__": f"rc={rc} {err.strip()[:200]}"}
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as e:
+        return {"__error__": f"bad json ({e}) from {' '.join(args[:3])}"}
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def idle_minutes(ts):
+    t = parse_ts(ts)
+    if not t:
+        return None
+    return round((now() - t).total_seconds() / 60.0, 1)
+
+
+def until_iso(minutes=None, until=None):
+    t = until or (now() + timedelta(minutes=minutes))
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ------------------------------------------------------- failure classifier
+RESET_RE = re.compile(r"weekly limit|session limit", re.I)
+RESET_TIME_RE = re.compile(r"resets?\s+(\d{1,2}(?::\d{2})?)\s*(am|pm)", re.I)
+
+
+def classify_failure(err):
+    """-> (class, account_hint, cooldown_minutes or None, cooldown_until_iso or None)
+    Only classes in CONFIRMED signals produce cooldowns. Return (None,..) for no error."""
+    if not err:
+        return None, None, None, None
+    e = err.strip()
+
+    # OMP Go quota (confirmed) — carry the provider's own retry-after
+    m = re.search(r"retry-after-ms=(\d+)", e)
+    if m or "GoUsageLimitError" in e or "Go usage limit" in e:
+        ms = int(m.group(1)) if m else 30 * 60 * 1000
+        mins = max(15, round(ms / 60000))
+        mins = min(mins, 24 * 60)  # cap one day
+        return "provider_quota_limit", "omp-go", mins, until_iso(minutes=mins)
+
+    # Claude weekly/session limit (confirmed) — cooldown until the reset time
+    if RESET_RE.search(e):
+        minutes = 4 * 60  # fallback
+        reset_until = None
+        mt = RESET_TIME_RE.search(e)
+        if mt:
+            hh = int(re.match(r"(\d{1,2})", mt.group(1)).group(1)) % 12
+            if mt.group(2).lower() == "pm":
+                hh += 12
+            mm = 0
+            tmp = mt.group(1)
+            if ":" in tmp:
+                mm = int(tmp.split(":")[1])
+            cand = now().astimezone(ICT).replace(hour=hh, minute=mm, second=0)
+            if cand <= now().astimezone(ICT):
+                cand += timedelta(days=1)
+            cand = cand.astimezone(timezone.utc)
+            reset_until = cand.strftime("%Y-%m-%dT%H:%M:%SZ")
+            minutes = None
+        return "provider_quota_limit", "claude", minutes, reset_until if reset_until else until_iso(minutes=minutes)
+
+    # Codex / generic usage limit (confirmed for codex + claude wording)
+    if re.search(r"\busage limit\b|UsageLimit", e, re.I):
+        return "provider_quota_limit", "codex", 60, until_iso(minutes=60)
+
+    # Pi upstream 429 (confirmed, short cooldown)
+    if "429" in e and ("rate_limit" in e or "rate limit" in e.lower()):
+        return "provider_rate_limit", "pi-beam-free", 30, until_iso(minutes=30)
+
+    # NEVER-cooldown classes
+    if "429" in e:
+        return "provider_rate_limit", None, None, None
+    if re.search(r"\b401\b|Unauthorized|Incorrect API key", e):
+        return "config_error", None, None, None
+    if "idle watchdog" in e.lower():
+        return "startup", None, None, None
+    if e.lower() == "cancelled":
+        return "cancelled", None, None, None
+    if "codebuddy" in e.lower():
+        return "unknown", "codebuddy", None, None
+    if "freebuff" in e.lower():
+        return "unknown", "freebuff", None, None
+    return "other", None, None, None
+
+
+# ---------------------------------------------------------------- multica fns
+def agent_names():
+    d = sh_json(["multica", "agent", "list", "--output", "json"])
+    if isinstance(d, list):
+        d = {"agents": d}
+    out = {}
+    rows = d.get("agents", []) if isinstance(d, dict) else []
+    for a in rows:
+        if a.get("id"):
+            out[a["id"]] = {"name": a.get("name"), "model": a.get("model"), "status": a.get("status")}
+    return out
+
+
+def fetch_issues():
+    # One call per status: a single list caps at 50 rows and the managed board
+    # (in_progress + gate-waiting + assigned todos + blocked for the M-268
+    # stuck-list) can exceed that. Still cheap: 4 list calls for the sweep.
+    issues, seen = [], set()
+    for st in ("in_progress", "planing_2", "todo", "blocked"):
+        d = sh_json(["multica", "issue", "list", "--output", "json", "--status", st,
+                     "--fields", "identifier,id,status,assignee_id,updated_at,last_activity_at,priority,title"])
+        rows = d if isinstance(d, list) else d.get("issues", [])
+        for i in rows:
+            if i.get("id") not in seen:
+                seen.add(i.get("id"))
+                issues.append(i)
+    return {"issues": issues, "has_more": False}
+
+
+def card_runs(card_id):
+    d = sh_json(["multica", "issue", "runs", card_id, "--output", "json"])
+    if isinstance(d, list):
+        return d
+    return d.get("runs", [d.get(k) for k in ()] if isinstance(d, dict) and "__error__" in d else d.get("runs", []))
+
+
+def card_wakeups(card_id):
+    d = sh_json(["multica", "issue", "wakeup", "list", card_id, "--output", "json"])
+    return d if isinstance(d, list) else d.get("wakeups", []) if isinstance(d, dict) else []
+
+
+def wakeup_age_hours(w, t):
+    c = parse_ts(w.get("created_at"))
+    return (t - c).total_seconds() / 3600.0 if c else None
+
+
+def target_status(identifier):
+    """Status of another issue by M-key, or None when it cannot be read."""
+    d = sh_json(["multica", "issue", "get", identifier, "--output", "json"])
+    if isinstance(d, dict) and d.get("status") and "__error__" not in d:
+        return d.get("status")
+    return None
+
+
+def children_statuses(card_key):
+    """Statuses of a card's sub-issues, or None when unreadable."""
+    d = sh_json(["multica", "issue", "children", card_key, "--output", "json"])
+    if not isinstance(d, dict) or "__error__" in d:
+        return None
+    out = []
+    for s in d.get("stages", []) or []:
+        out += [(c.get("status") or "?") for c in s.get("issues", []) or []]
+    out += [(c.get("status") or "?") for c in d.get("unstaged", []) or []]
+    return out
+
+
+def classify_wakeup(w, card_key, idle_min, t, tcache, chcache):
+    """M-284 r1: live or dead + dead reason. Dead wakeups never fire, so a
+    card whose only wakeups are dead has no driver (reason dead-wakeup)."""
+    cond = w.get("condition") or {}
+    ctype = cond.get("type")
+    if w.get("last_error"):
+        return False, "last-error"
+    if ctype == "children_done":
+        if card_key not in chcache:
+            chcache[card_key] = children_statuses(card_key)
+        sts = chcache[card_key]
+        if sts is not None:
+            open_sts = [s for s in sts if s not in ("done", "cancelled")]
+            if open_sts and not any(s in PROGRESSIBLE for s in open_sts):
+                # every open child sits in an Owner-held state (in_review) or
+                # blocked/waiting: nothing here auto-closes, can never fire
+                return False, "children-stuck"
+    elif ctype == "other_issue":
+        ident, wait = cond.get("identifier"), (cond.get("state") or "done")
+        if ident:
+            if ident not in tcache:
+                tcache[ident] = target_status(ident)
+            ts = tcache[ident]
+            if ts is None:
+                return False, "target-missing"
+            if wait == "in_review" and ts in ("blocked", "done", "cancelled"):
+                return False, "target-irrelevant"
+            if wait == "done" and ts == "cancelled":
+                return False, "target-irrelevant"
+    if ctype is not None:
+        age_h = wakeup_age_hours(w, t)
+        if age_h is not None and age_h > STALE_WAKEUP_HOURS and \
+                idle_min is not None and idle_min > STALE_WAKEUP_HOURS * 60:
+            return False, "condition-stale"
+    return True, None
+
+
+def wakeup_liveness(wakeups, card_key, idle_min, t, tcache, chcache):
+    """-> (live_list, [(id6, kind, live, dead_reason)]) for enabled wakeups."""
+    live, detail = [], []
+    for w in wakeups:
+        if not (w.get("enabled") and not w.get("disabled_at")):
+            continue
+        is_live, why = classify_wakeup(w, card_key, idle_min, t, tcache, chcache)
+        if is_live:
+            live.append(w)
+        kind = ((w.get("condition") or {}).get("type") or "+".join(w.get("event_types") or [])
+                or w.get("kind") or "?")
+        detail.append({"id": (w.get("id") or "")[:8], "kind": kind,
+                       "live": is_live, "dead_reason": why})
+    return live, detail
+
+
+def fetch_prs():
+    """One gh call per repo -> open PRs with head sha + review decision."""
+    prs = []
+    for repo in GITHUB_REPOS:
+        d = sh_json(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "50", "--json",
+                     "number,title,state,headRefOid,reviewDecision,statusCheckRollup,baseRefName,updatedAt"], timeout=60)
+        rows = d if isinstance(d, list) else []
+        if not rows and isinstance(d, dict) and "__error__" in d:
+            prs.append({"repo": repo, "error": d["__error__"][:120]})
+            continue
+        for r in rows:
+            roll = r.get("statusCheckRollup") or []
+            fails = [c.get("name") or c.get("conclusion") or "?" for c in roll
+                     if isinstance(c, dict) and str(c.get("conclusion", "")).upper() in
+                     ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")]
+            checks = {"total": len(roll), "failing": fails[:3]} if roll else None
+            prs.append({"repo": repo, "n": r.get("number"), "title": r.get("title"),
+                        "state": r.get("state"), "base": r.get("baseRefName"),
+                        "head": (r.get("headRefOid") or "")[:8],
+                        "review_decision": r.get("reviewDecision") or None,
+                        "checks": checks or "none", "updated_at": r.get("updatedAt")})
+    return prs
+
+
+CARD_KEY_RE = re.compile(r"M-\d+")
+
+
+def prs_for_card(key, all_prs):
+    return [p for p in all_prs if p.get("n") and key in (p.get("title") or "")]
+
+
+def fetch_status_page(status, limit=100, offset=0):
+    d = sh_json(["multica", "issue", "list", "--output", "json", "--status", status,
+                 "--fields", "identifier,id,status,assignee_id,updated_at,last_activity_at,priority,title",
+                 "--limit", str(limit), "--offset", str(offset)])
+    if isinstance(d, list):
+        return d, False
+    if isinstance(d, dict) and "__error__" in d:
+        return [], False
+    rows = d.get("issues", []) if isinstance(d, dict) else []
+    return rows, bool(isinstance(d, dict) and d.get("has_more"))
+
+
+def fetch_queues(t):
+    """M-284 r4: stuck-queue gates the sweep lists for the Leader every tick.
+    in_review is count-only (dozens of cards); the three actionable queues list
+    every card over 24 h idle so the committee wake (M-268) can slice them."""
+    queues = {}
+    for st in ("agent_review_deploy", "wait_for_decision", "todo"):
+        rows, offset = [], 0
+        while True:
+            page, more = fetch_status_page(st, offset=offset)
+            rows += page
+            if not more or not page:
+                break
+            offset += len(page)
+        old = []
+        for r in rows:
+            idle = idle_minutes(r.get("last_activity_at"))
+            if idle is not None and idle > STALE_WAKEUP_HOURS * 60:
+                old.append({"card": r.get("identifier"), "assignee_id": r.get("assignee_id"),
+                            "idle_hours": round(idle / 60.0, 1)})
+        old.sort(key=lambda x: x["idle_hours"], reverse=True)
+        q = {"total": len(rows), "older_24h": len(old), "cards": old}
+        if st == "agent_review_deploy" and old:
+            mid = sorted(c["idle_hours"] for c in old)[len(old) // 2]
+            q["median_idle_days"] = round(mid / 24.0, 1)
+        queues[st] = q
+    rows, offset = [], 0
+    while True:
+        page, more = fetch_status_page("in_review", offset=offset)
+        rows += page
+        if not more or not page:
+            break
+        offset += len(page)
+    old_n = sum(1 for r in rows
+                if (idle_minutes(r.get("last_activity_at")) or 0) > STALE_WAKEUP_HOURS * 60)
+    queues["in_review"] = {"total": len(rows), "older_24h": old_n}
+    return queues
+
+
+# ------------------------------------------------------------------- ledger
+DEFAULT_LEDGER = {
+    "v": 1,
+    "scope": LEADER_SCOPE + "; one row per SHARED account(runtime); cooldown only on confirmed signals; no remaining-quota field anywhere",
+    "tiers": {
+        "daily-free": "free tier, budget daily; rotate first",
+        "window": "weekly cap; burst after free rows; codex PRs need Claude Architect review (review_required)",
+        "manager": "planning/review/triage, never code; daily cap = 20% of weekly cap",
+        "unknown": "no confirmed quota signal; generic errors -> triage, never cooldown",
+        "tick": "orchestrator tick runtime; upstream 429 cools 30m; affects tick, not routing",
+    },
+    "rows": [
+        {"account": "opencode-zen", "tier": "daily-free", "agents": ["934934a4-5f72-4fb4-a73a-f8f33940e271"],
+         "state": "ok", "cooldown_until": None, "last_signal": None},
+        {"account": "omp-go", "tier": "daily-free", "agents": ["1f23308e-83e4-4923-9ff6-2fc7ce80d841",
+                                                              "d5c380b6-590a-498f-8591-557c05f462ec"],
+         "state": "ok", "cooldown_until": None, "last_signal": None},
+        {"account": "codebuddy", "tier": "unknown", "agents": ["a62593fd-09b4-4fe6-aae9-5351829e8a7d",
+                                                              "02cd4c29-7693-4d5f-a2dd-7260f4aa08dc",
+                                                              "f4e0179f-2e51-47d8-a20d-281547b4fa64"],
+         "state": "unknown", "cooldown_until": None, "last_signal": None},
+        {"account": "freebuff", "tier": "unknown", "agents": ["b70d1cb9-97c9-41f4-a78e-d6be562b2866",
+                                                             "6f4ccf81-265e-4af6-8ac8-97debd34ed31"],
+         "state": "unknown", "cooldown_until": None, "last_signal": None,
+         "note": "each freebuff account allows one run at a time; desktop localhost:4320 is paid credit"},
+        {"account": "codex", "tier": "window", "review_required": True,
+         "agents": ["81abd36c-d925-4cf1-a701-08a80dee99e6", "23cdae17-72b6-4c7f-a561-8c190808d201"],
+         "state": "ok", "cooldown_until": None, "last_signal": None,
+         "note": "weekly cap; burst order Terra then Luna"},
+        {"account": "claude", "tier": "manager", "agents": ["bd7b7aae-88e9-4260-a7b5-301993757e59",
+                                                           "7895c8ca-aed6-461e-9fea-a115b2681872"],
+         "state": "ok", "cooldown_until": None, "last_signal": None,
+         "note": "daily cap 20% of weekly; reset times in failure text"},
+        {"account": "pi-beam-free", "tier": "tick", "agents": [TICK_AGENT],
+         "state": "ok", "cooldown_until": None, "last_signal": None},
+        {"account": "freebuff?", "tier": "unknown", "agents": [], "later": "add freebuff rows/accounts (issue scope: later)"},
+    ],
+}
+
+
+def read_ledger():
+    d = sh_json(["multica", "issue", "metadata", "get", M86_ID, "--key", LEDGER_KEY])
+    if isinstance(d, dict) and "__error__" in d:
+        return None, d["__error__"]
+    val = d.get("value") if isinstance(d, dict) else d
+    if val in (None, ""):
+        return None, "absent"
+    try:
+        return (json.loads(val) if isinstance(val, str) else val), None
+    except json.JSONDecodeError as e:
+        return None, f"bad json in {LEDGER_KEY}: {e}"
+
+def read_seats():
+    """M-86 `quota_seats` ({lead:[agent ids], architect:[agent ids]}) or None.
+    Lets the Leader reorder committee pools without touching this script."""
+    d = sh_json(["multica", "issue", "metadata", "get", M86_ID, "--key", SEATS_KEY])
+    if isinstance(d, dict) and "__error__" in d:
+        return None
+    val = d.get("value") if isinstance(d, dict) else d
+    if val in (None, ""):
+        return None
+    try:
+        seats = json.loads(val) if isinstance(val, str) else val
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(seats, dict):
+        return None
+    out = {}
+    for seat in ("lead", "architect"):
+        ids = seats.get(seat)
+        if isinstance(ids, list) and ids and all(isinstance(x, str) for x in ids):
+            out[seat] = ids
+    return out or None
+
+
+def ledger_row_agents(ledger):
+    """agent_id -> ({row dict})"""
+    m = {}
+    for row in ledger.get("rows", []):
+        for aid in row.get("agents", []):
+            m[aid] = row
+    return m
+
+
+def row_state(row, t):
+    """ok | cooling | expired(cooldown needs clearing) | unknown — based on cooldown_until vs now"""
+    if row.get("cooldown_until"):
+        u = parse_ts(row["cooldown_until"])
+        if u and u > t:
+            return "cooling"
+        return "cooldown-expired"
+    return row.get("state", "unknown")
+
+
+def seed_ledger(applied):
+    size = len(json.dumps(DEFAULT_LEDGER))
+    assert size < 4000, f"default ledger too big: {size}"
+    rc, out, err = sh(["multica", "issue", "metadata", "set", M86_ID, "--key", LEDGER_KEY,
+                       "--value", json.dumps(DEFAULT_LEDGER, separators=(",", ":"), ensure_ascii=False),
+                       "--type", "string"])
+    applied["seeded"] = rc == 0
+    applied["bytes"] = size
+    if rc != 0:
+        applied["error"] = err.strip()[:200]
+
+
+# -------------------------------------------------------------------- board
+def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=260):
+    t_start = now()
+    issues_d = fetch_issues()
+    if isinstance(issues_d, list):
+        issues = issues_d
+    else:
+        issues = issues_d.get("issues", [])
+    # note: one list call per status; page covers the small managed board.
+    # has_more=True would need deeper pagination later — the tick report prints
+    # counts so nothing truncates silently.
+
+    in_prog = [i for i in issues if i.get("status") == "in_progress"]
+    planing = [i for i in issues if i.get("status") == "planing_2"]
+    todos = [i for i in issues if i.get("status") == "todo" and i.get("assignee_id")]
+
+    # WIP per agent over in_progress cards
+    wip = {}
+    for i in in_prog:
+        wip[i.get("assignee_id")] = wip.get(i.get("assignee_id"), 0) + 1
+
+    agent_row = ledger_row_agents(ledger) if ledger else {}
+
+    selected = sorted(in_prog, key=lambda x: x.get("last_activity_at") or "")
+    if max_cards:
+        selected = selected[:max_cards]
+
+    board, checked = [], 0
+    sig_detections = {}
+    tcache, chcache = {}, {}  # M-284 r1: target-issue statuses, children statuses
+    for i in selected:
+        key = i.get("identifier")
+        runs = card_runs(i["id"])
+        if isinstance(runs, dict) and "__error__" in runs:
+            board.append({"card": key, "error": runs["__error__"]})
+            continue
+        runs = runs or []
+        active = [r for r in runs if (r.get("status") or "").lower() in ACTIVE_RUN_STATUSES]
+        newest = runs[0] if runs else None  # newest-first; an old failure behind a live run is stale
+        newest_failed = newest if newest and (newest.get("status") or "").lower() == "failed" else None
+        fcs, fa, cmins, c_until = (None, None, None, None)
+        if newest_failed:
+            fcs, fa, cmins, c_until = classify_failure(newest_failed.get("error"))
+        last_failed = newest_failed  # entry + cooldown candidates use the newest run only
+        fc = fcs
+        wakeups = card_wakeups(i["id"])
+        idle = idle_minutes(i.get("last_activity_at"))
+        live_w, wdetail = wakeup_liveness(wakeups, key, idle, t_start, tcache, chcache)
+        wpending = [w for w in wakeups if w.get("enabled") and not w.get("disabled_at")]
+        row = agent_row.get(i.get("assignee_id"), {})
+        acct_state = row_state(row, t_start) if row else None
+        cw = prs_for_card(key, all_prs)
+        open_pr = [p for p in cw if (p.get("state") or "").upper() == "OPEN"]
+
+        entry = {
+            "card": key, "status": i.get("status"),
+            "assignee_id": i.get("assignee_id"), "assignee": i.get("assignee_id"),
+            "active_run": bool(active), "active_run_id": (active[0].get("id") if active else None),
+            "wakeup_pending": bool(live_w),
+            "wakeup_ids": [w.get("id") for w in live_w][:3],
+            "wakeup_detail": wdetail,
+            "activity_minutes": idle,
+            "last_failed_at": (last_failed or {}).get("created_at"),
+            "failure_reason": (repr((last_failed or {}).get("error"))[:max_runs_err_len] if last_failed else None),
+            "failure_class": fc,
+            "runs_seen": len(runs),
+            "wip_of_owner": wip.get(i.get("assignee_id"), 0),
+            "account": (row or {}).get("account"), "account_state": acct_state,
+            "cooldown_until": (row or {}).get("cooldown_until"),
+            "prs": [{"repo": p["repo"], "n": p.get("n"), "state": p.get("state"), "base": p.get("base"),
+                     "head": p.get("head"), "verdict_on_head": p.get("review_decision"), "checks": p.get("checks"),
+                     "updated_at": p.get("updated_at")}
+                    for p in cw],
+        }
+        # action per resume rule (leader scope #3, M-284 reasons):
+        # dead-wakeup > partial-stop > wakeup-stale > live-wakeup > fresh >
+        # cooldown-routing > idle. Only dead-wakeup redefines wakeup_pending:
+        # a card whose only wakeups are dead has no driver. partial-stop
+        # yields to a live *strong* driver (fresh at/every/cron or a live
+        # condition such as until-pr checks): a scheduled resume or running CI
+        # must not be doubled. A stale passive event wait (comment.created)
+        # does not block partial-stop. wakeup-stale needs an old unfired wait:
+        # a wakeup armed minutes ago has not had its chance yet.
+        strong_live = [w for w in live_w
+                       if (w.get("condition") or w.get("kind") in ("at", "every", "cron"))]
+        stale_wait = [w for w in live_w if (w.get("fire_count") or 0) == 0
+                      and (wakeup_age_hours(w, t_start) or 0) > STALE_WAKEUP_HOURS]
+        if entry["active_run"]:
+            entry["action"], entry["reason"] = "run-live", "run-live"
+        elif wpending and not live_w:
+            entry["action"], entry["reason"] = "resumable", "dead-wakeup"
+        elif open_pr and idle is not None and idle > PARTIAL_STOP_MIN and not strong_live:
+            entry["action"], entry["reason"] = "resumable", "partial-stop"
+        elif stale_wait and idle is not None and idle > STALE_WAKEUP_HOURS * 60:
+            entry["action"], entry["reason"] = "resumable", "wakeup-stale"
+        elif live_w:
+            entry["action"], entry["reason"] = "wakeup-pending", "live-wakeup"
+        elif idle is not None and idle <= IDLE_THRESHOLD_MIN:
+            entry["action"], entry["reason"] = "fresh", "fresh"
+        elif acct_state == "cooling":
+            entry["action"], entry["reason"] = "cooldown-routing", "cooldown-routing"
+        else:
+            entry["action"], entry["reason"] = "resumable", "idle"
+        board.append(entry)
+        checked += 1
+
+        # collect confirmed quota signals -> cooldown candidates
+        if fc in ("provider_quota_limit", "provider_rate_limit") and fa:
+            sig = sig_detections.setdefault(fa, {"signal_runs": [], "cooldown_until": c_until, "minutes": cmins})
+            if last_failed and c_until:
+                sig["signal_runs"].append({"card": key, "agent": i.get("assignee_id"),
+                                           "run_id": last_failed.get("id"), "at": last_failed.get("created_at")})
+
+    cooldown_writes = []
+    if apply_cooldown and sig_detections:
+        rows = {r["account"]: r for r in ledger.get("rows", [])}
+        for acct, sig in sig_detections.items():
+            row = rows.get(acct)
+            if not row:
+                continue
+            if row.get("tier") == "unknown":
+                continue  # never cooldown unknown tiers
+            run_id = (sig["signal_runs"][-1]["run_id"] if sig["signal_runs"] else None)
+            if row.get("cooldown_until") and parse_ts(row["cooldown_until"]) and \
+               parse_ts(row["cooldown_until"]) > t_start:
+                continue  # already cooling; never retry the same account
+            row["state"] = "cooling"
+            row["cooldown_until"] = sig["cooldown_until"]
+            row["last_signal"] = run_id
+            cooldown_writes.append({"account": acct, "until": sig["cooldown_until"],
+                                    "signal": run_id, "minutes": sig["minutes"]})
+        if cooldown_writes:
+            payload = json.dumps(ledger, separators=(",", ":"), ensure_ascii=False)
+            if len(payload) < 4096:
+                rc, _, err = sh(["multica", "issue", "metadata", "set", M86_ID, "--key", LEDGER_KEY,
+                                 "--value", payload, "--type", "string"])
+                for c in cooldown_writes:
+                    c["written"] = rc == 0
+                    if rc != 0:
+                        c["write_error"] = err.strip()[:150]
+            else:
+                for c in cooldown_writes:
+                    c["written"] = False
+                    c["write_error"] = f"ledger exceeds 4KB ({len(payload)}B); not written"
+
+    # todo reroutes: todo cards owned by a cooling account -> next eligible row.
+    # Next = first ok row in ENGINEERS_ORDER routing (daily-free, then window burst).
+    def first_ok_account(exclude=None):
+        seen = set()
+        for aid in ENGINEERS_ORDER:
+            acct = (agent_row.get(aid) or {}).get("account")
+            if not acct or acct in seen or acct == exclude:
+                continue
+            seen.add(acct)
+            if row_state((agent_row.get(aid) or {}), t_start) == "cooling":
+                continue
+            return acct
+        return None
+    todo_reroutes = []
+    for i in todos:
+        row = agent_row.get(i.get("assignee_id"), {})
+        if row and row_state(row, t_start) == "cooling":
+            todo_reroutes.append({"card": i.get("identifier"), "owner_account": row["account"],
+                                  "next_account": first_ok_account(exclude=row["account"])})
+
+    gate_waiting = [{"card": i.get("identifier"), "assignee_id": i.get("assignee_id"),
+                     "idle_minutes": idle_minutes(i.get("last_activity_at"))} for i in planing]
+
+    # WIP counts engineer-owned in_progress cards only; the Leader tracks its own
+    # cards outside WIP-1 (tick refinement 2026-10-31).
+    wip_breaches = [{"agent": aid, "name": (names.get(aid) or {}).get("name"), "in_progress": cnt}
+                    for aid, cnt in wip.items() if cnt > 1 and aid in set(ENGINEERS_ORDER)]
+
+    def pool_eligibility(ids, roles):
+        out = []
+        for aid in ids:
+            row = agent_row.get(aid, {})
+            out.append({
+                "agent": aid, "name": (names.get(aid) or {}).get("name"),
+                "account": row.get("account"), "account_state": row_state(row, t_start) if row else "no-row",
+                "wip_in_progress": wip.get(aid, 0), "wip_breach": wip.get(aid, 0) > 1,
+                "engine_ok": (names.get(aid) or {}).get("status") not in ("archived",),
+            })
+        return out
+    # Committee seats (Lead/Architect amendment 2026-11-07): each seat resolves to the
+    # first row whose account is not cooling (ok/expired/unknown/no-row).
+    # No WIP filter: seats are not card assignments, and the Leader tracks its own
+    # cards outside the engineer WIP-1 rule. One agent never holds both seats.
+    # Pools read from M-86 `quota_seats` when present; built-in default otherwise.
+    seat_pools = read_seats() or {"lead": LEAD_POOL, "architect": ARCHITECT_POOL}
+    seats = {}
+    taken = set()
+    for seat in ("lead", "architect"):
+        ids = seat_pools.get(seat) or []
+        elig = pool_eligibility(ids, "reviewer")
+        holder = next((e for e in elig if e.get("account_state") in ("ok", "cooldown-expired", "unknown", "no-row")
+                       and e.get("agent") not in taken), None)
+        if holder:
+            taken.add(holder.get("agent"))
+        seats[seat] = {"pool": ids, "eligible": elig, "holder": (holder or {}).get("agent"),
+                       "holder_name": (holder or {}).get("name")}
+
+    by_action, by_reason = {}, {}
+    for b in board:
+        a = b.get("action")
+        if a:
+            by_action[a] = by_action.get(a, 0) + 1
+        if a == "resumable":
+            r = b.get("reason") or "unknown"
+            by_reason[r] = by_reason.get(r, 0) + 1
+    counts = {
+        "in_progress_total": len(in_prog), "checked": checked, "max_cards_applied": bool(max_cards),
+        "by_action": by_action,
+        "resumable_by_reason": by_reason,
+        "run_live": sum(1 for b in board if b.get("action") == "run-live"),
+        "wakeup_pending": sum(1 for b in board if b.get("action") == "wakeup-pending"),
+        "resumable": sum(1 for b in board if b.get("action") == "resumable"),
+        "cooldown_routing": sum(1 for b in board if b.get("action") == "cooldown-routing"),
+        "unknown_failure": sum(1 for b in board if b.get("failure_class") == "unknown"),
+        "fresh_<=60m": sum(1 for b in board if b.get("action") == "fresh"),
+        "gate_waiting": len(gate_waiting), "todo_reroutes": len(todo_reroutes),
+        "loop_seconds": round((now() - t_start).total_seconds(), 1),
+    }
+    stuck = build_stuck_list(board, issues, t_start, baseline_resume())
+    return {"board": board, "gate_waiting": gate_waiting, "todo_reroutes": todo_reroutes,
+            "cooldown_writes": cooldown_writes, "counts": counts, "stuck": stuck,
+            "queues": fetch_queues(t_start),
+            "wip_breaches": wip_breaches, "seats": seats,
+            "eligible": {"engineers": pool_eligibility(ENGINEERS_ORDER, "engineer"),
+                         "reviewers": pool_eligibility(REVIEWERS_ORDER, "reviewer")}}
+
+# --------------------------------------------------- M-268 stuck-list (committee)
+def read_baseline():
+    d = sh_json(["multica", "issue", "metadata", "get", M86_ID, "--key", "orch_baseline"])
+    if isinstance(d, dict) and "__error__" in d:
+        return {}
+    val = d.get("value") if isinstance(d, dict) else d
+    if val in (None, ""):
+        return {}
+    try:
+        return json.loads(val) if isinstance(val, str) else val
+    except json.JSONDecodeError:
+        return {}
+
+
+def baseline_resume():
+    b = read_baseline()
+    return b.get("resume", {}) if isinstance(b, dict) else {}
+
+
+def pr_checks_green(pr):
+    c = pr.get("checks")
+    if c in (None, "none"):
+        return False  # no CI signal yet: not provably green, ignore for (a)
+    if isinstance(c, dict):
+        return not c.get("failing")
+    return False
+
+
+def build_stuck_list(board, issues, t, resume_map):
+    """M-268 deterministic stuck-list. No LLM judgment: four threshold rules
+    over the sweep board (+ blocked cards + baseline resume counts). Returns
+    {hash, triggers, items} where items are {card, trigger, age_min, pr}."""
+    by_card = {b.get("card"): b for b in issues and board if b.get("card")}
+    items, seen = [], set()
+
+    def add(card, trigger, age_min, pr=None):
+        if card in seen:
+            return
+        seen.add(card)
+        items.append({"card": card, "trigger": trigger,
+                      "age_min": round(age_min, 1) if age_min is not None else None,
+                      "pr": pr})
+
+    # (a) green PR, no verdict on SHA, waiting >30 min, card undriven.
+    for b in board:
+        if b.get("active_run") or b.get("wakeup_pending"):
+            continue
+        for p in b.get("prs") or []:
+            if (p.get("state") or "").upper() != "OPEN":
+                continue
+            if p.get("verdict_on_head"):
+                continue
+            if not pr_checks_green(p):
+                continue
+            age = idle_minutes(p.get("updated_at"))
+            if age is not None and age > VERDICT_WAIT_MIN:
+                add(b.get("card"), "no-verdict", age,
+                    f"{p.get('repo')}#{p.get('n')}@{p.get('head')}")
+
+    # (b) idle >2 h with a resume already tried.
+    for b in board:
+        idle = b.get("activity_minutes")
+        if idle is None or idle <= STUCK_IDLE_MIN:
+            continue
+        r = (resume_map or {}).get(b.get("card")) or {}
+        if (r.get("count") or 0) >= 1:
+            add(b.get("card"), "idle-after-resume", idle)
+
+    # (c) blocked >4 h (blocked cards are in issues but not on the board).
+    board_cards = {b.get("card") for b in board}
+    for i in issues or []:
+        if i.get("status") != "blocked":
+            continue
+        idle = idle_minutes(i.get("last_activity_at"))
+        if idle is not None and idle > BLOCKED_STUCK_MIN:
+            if i.get("identifier") not in board_cards:
+                add(i.get("identifier"), "blocked", idle)
+            else:
+                add(i.get("identifier"), "blocked", idle)
+
+    # (d) >=3 cards share one failure_class/reason code.
+    codes = {}
+    for b in board:
+        code = b.get("failure_class") or b.get("reason")
+        if code:
+            codes.setdefault(code, []).append(b)
+    for code, members in codes.items():
+        if len(members) >= SHARED_CODE_MIN:
+            for b in members:
+                add(b.get("card"), f"shared:{code}", b.get("activity_minutes"))
+
+    items.sort(key=lambda x: (x.get("trigger") or "", x.get("card") or ""))
+    # Hash over stable identity only (card+trigger+pr): age_min drifts every
+    # minute and must not re-arm the committee wake on an unchanged list.
+    canon = json.dumps([{"card": x["card"], "trigger": x["trigger"], "pr": x["pr"]}
+                        for x in items],
+                       sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()[:12]
+    triggers = sorted({x["trigger"].split(":")[0] for x in items})
+    return {"hash": digest, "triggers": triggers, "items": items}
+
+
+
+# --------------------------------------------------------------------- main
+def main():
+    args = sys.argv[1:]
+    apply_cooldown = "--apply-cooldown" in args
+    seed = "--seed" in args
+    max_cards = 0
+    if "--max-cards" in args:
+        max_cards = int(args[args.index("--max-cards") + 1])
+
+    names = agent_names()
+    prs = fetch_prs()
+    ledger, led_err = read_ledger()
+    seeded = {}
+    if seed or led_err:
+        seed_ledger(seeded)
+        ledger, led_err = read_ledger()
+
+    result = sweep(ledger, names, all_prs=prs, apply_cooldown=apply_cooldown, max_cards=max_cards)
+    if "--stuck-list" in args:
+        print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "tool": "orch-sweep", "mode": "stuck-list",
+                          **result["stuck"]}, indent=1, ensure_ascii=False))
+        return 0
+    out = {
+        "at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "tool": "orch-sweep", "leader_scope": LEADER_SCOPE,
+        "ledger_error": led_err, "ledger_seed": seeded or None,
+        **result,
+    }
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
