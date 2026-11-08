@@ -288,6 +288,110 @@ func TestBriefNamesStepCommandsAndHandlers(t *testing.T) {
 	}
 }
 
+// A move that hands the issue to a human owner is a decision, not a stage of
+// the pipeline: the brief says to use it only when an owner decision is really
+// needed, on both render sites. The review column keeps its normal wording:
+// handing delivered work over is the expected exit (M-233).
+func TestBriefSaysWhenAnOwnerMoveNeedsADecision(t *testing.T) {
+	const caveat = "   (use it only when an owner decision is really needed"
+	member := func(key string) Step {
+		return Step{StatusKey: key, Handler: Handler{Type: HandlerMember, ID: testAgentID}}
+	}
+	workflow := func(keys []string, handoffs ...Step) Definition {
+		return withHandoffs(Definition{Name: "Delivery", Steps: stepsFor(ArrangeKeys(keys))}, handoffs)
+	}
+	cases := []struct {
+		name       string
+		workflow   Definition
+		statusKey  string
+		wantMove   string
+		wantCaveat bool
+	}{
+		{
+			// The handler-less span delivers straight into the decision step.
+			name:       "decision after a handlerless span",
+			workflow:   workflow([]string{"implement", "wait_for_decision"}, member("wait_for_decision")),
+			statusKey:  "implement",
+			wantMove:   "Step done      → multica issue status MUL-7 wait_for_decision",
+			wantCaveat: true,
+		},
+		{
+			// The step itself hands off, so the plain next-status branch renders.
+			name: "decision after a step with a handler",
+			workflow: workflow([]string{"implement", "wait_for_decision"},
+				Step{StatusKey: "implement", Handler: Handler{Type: HandlerAgent, ID: testAgentID}, NextStatusKey: "wait_for_decision"},
+				member("wait_for_decision")),
+			statusKey:  "implement",
+			wantMove:   "Step done      → multica issue status MUL-7 wait_for_decision",
+			wantCaveat: true,
+		},
+		{
+			name: "project lead decision",
+			workflow: workflow([]string{"implement", "ask_lead"},
+				Step{StatusKey: "implement", Handler: Handler{Type: HandlerAgent, ID: testAgentID}, NextStatusKey: "ask_lead"},
+				Step{StatusKey: "ask_lead", Handler: Handler{Type: HandlerProjectLead}}),
+			statusKey:  "implement",
+			wantMove:   "Step done      → multica issue status MUL-7 ask_lead",
+			wantCaveat: true,
+		},
+		{
+			name: "creator decision",
+			workflow: workflow([]string{"implement", "ask_creator"},
+				Step{StatusKey: "implement", Handler: Handler{Type: HandlerAgent, ID: testAgentID}, NextStatusKey: "ask_creator"},
+				Step{StatusKey: "ask_creator", Handler: Handler{Type: HandlerCreator}}),
+			statusKey:  "implement",
+			wantMove:   "Step done      → multica issue status MUL-7 ask_creator",
+			wantCaveat: true,
+		},
+		{
+			name: "review column hands delivered work to its owner",
+			workflow: workflow([]string{"implement", "in_review"},
+				Step{StatusKey: "implement", Handler: Handler{Type: HandlerAgent, ID: testAgentID}, NextStatusKey: "in_review"},
+				member("in_review")),
+			statusKey:  "implement",
+			wantMove:   "Step done      → multica issue status MUL-7 in_review",
+			wantCaveat: false,
+		},
+		{
+			name: "agent handoff",
+			workflow: workflow([]string{"implement", "ship"},
+				Step{StatusKey: "implement", Handler: Handler{Type: HandlerAgent, ID: testAgentID}, NextStatusKey: "ship"},
+				Step{StatusKey: "ship", Handler: Handler{Type: HandlerAgent, ID: testAgentID}}),
+			statusKey:  "implement",
+			wantMove:   "Step done      → multica issue status MUL-7 ship",
+			wantCaveat: false,
+		},
+		{
+			name: "squad handoff",
+			workflow: workflow([]string{"implement", "ship"},
+				Step{StatusKey: "implement", Handler: Handler{Type: HandlerAgent, ID: testAgentID}, NextStatusKey: "ship"},
+				Step{StatusKey: "ship", Handler: Handler{Type: HandlerSquad, ID: testAgentID}}),
+			statusKey:  "implement",
+			wantMove:   "Step done      → multica issue status MUL-7 ship",
+			wantCaveat: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			brief := Brief(BriefInput{Workflow: tc.workflow, StatusKey: tc.statusKey, IssueIdentifier: "MUL-7"})
+			moveAt := strings.Index(brief, tc.wantMove)
+			if moveAt < 0 {
+				t.Fatalf("brief is missing %q:\n%s", tc.wantMove, brief)
+			}
+			caveatAt := strings.Index(brief, caveat)
+			if tc.wantCaveat {
+				if caveatAt < moveAt {
+					t.Fatalf("brief does not follow the owner move with the decision caveat:\n%s", brief)
+				}
+				return
+			}
+			if caveatAt >= 0 {
+				t.Fatalf("brief carries the decision caveat on a move that needs no owner decision:\n%s", brief)
+			}
+		})
+	}
+}
+
 func TestBriefForMovedStep(t *testing.T) {
 	for _, current := range []string{"implement", "todo"} {
 		for _, observer := range []bool{false, true} {

@@ -802,6 +802,18 @@ func Brief(in BriefInput) string {
 		}
 		return ""
 	}
+	// Moving an issue to a step that hands it to a human owner is a decision,
+	// not a routine stage of the pipeline: say so under the command, so an
+	// agent keeps working instead of parking the card. The workflow's review
+	// column is the exception — handing delivered work there is the normal
+	// exit — so it carries no caveat (M-233).
+	ownerDecisionCaveat := func(key string) {
+		target, ok := in.Workflow.Step(key)
+		if !ok || !isOwnerHandoff(target) {
+			return
+		}
+		b.WriteString("   (use it only when an owner decision is really needed — otherwise leave the issue at its current step for the team to follow)\n")
+	}
 	// An older daemon still states the built-in rules itself, so its brief
 	// keeps the per-step wording rather than add a second in_progress rule.
 	var span handlerlessSpan
@@ -883,12 +895,14 @@ func Brief(in BriefInput) string {
 		}
 		if span.deliver != "" {
 			fmt.Fprintf(&b, "Step done      → multica issue status %s %s%s\n", in.IssueIdentifier, span.deliver, handsOffTo(span.deliver))
+			ownerDecisionCaveat(span.deliver)
 		} else {
 			fmt.Fprintf(&b, "Step done      → leave the issue at `%s`; `done` is set by a human\n", in.StatusKey)
 		}
 	default:
 		if next := in.Workflow.NextStatus(in.StatusKey); next != "" {
 			fmt.Fprintf(&b, "Step done      → multica issue status %s %s%s\n", in.IssueIdentifier, next, handsOffTo(next))
+			ownerDecisionCaveat(next)
 		}
 	}
 	if step.BackStatusKey != "" {
@@ -913,6 +927,23 @@ func Brief(in BriefInput) string {
 	}
 	b.WriteString("When the issue enters a step you handle, you get a run automatically — do not add a wakeup for that. Wakeups for anything else (a time, a PR, another issue, a step someone else handles) are fine.\n")
 	return b.String()
+}
+
+// isOwnerHandoff reports whether a step hands an issue off to a human owner
+// (a member, the creator, or the project lead) rather than to an agent or
+// squad. Such handoffs are "Wait for decision" style moves: they should only
+// happen when an owner decision is genuinely needed. The review column is not
+// one of them: delivered work normally goes to the owner for acceptance.
+func isOwnerHandoff(s Step) bool {
+	if s.StatusKey == issuestatus.InReview {
+		return false
+	}
+	switch s.Handler.Type {
+	case HandlerMember, HandlerCreator, HandlerProjectLead:
+		// Project leads may be agents; treat as owner-facing by default.
+		return true
+	}
+	return false
 }
 
 // briefLine keeps a user-authored name on one line of a brief: line breaks
