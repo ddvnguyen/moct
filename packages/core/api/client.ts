@@ -3116,24 +3116,6 @@ export class ApiClient {
   }
 
   /**
-   * Move one still-pending queued message to steer.
-   *
-   * The server refuses once the daemon claimed the message or the turn ended,
-   * and answers an already-steered message with the same receipt, so a retry is
-   * safe. Returns the message's receipt, not the comment.
-   */
-  async promoteTaskSupplement(
-    issueId: string,
-    taskId: string,
-    commentId: string,
-  ): Promise<{ supplement_task_id: string; supplement_status: string; supplement_mode?: string }> {
-    return this.fetch(
-      `/api/issues/${issueId}/tasks/${taskId}/supplements/${commentId}/promote`,
-      { method: "POST" },
-    );
-  }
-
-  /**
    * Answer one native ask by the exact transcript sequence it asked at.
    *
    * The supplement endpoint above takes any message for a run; this one names

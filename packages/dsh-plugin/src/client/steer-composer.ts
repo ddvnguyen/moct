@@ -5,7 +5,6 @@ import {
   queuedFor,
   selectOwnedSession,
   subscribe,
-  updateQueued,
   type OwnedSession,
   type QueuedSupplement,
 } from "./steer-store";
@@ -22,8 +21,8 @@ import {
  *
  * What it is, in the shell's vocabulary: the session controller's follow-up
  * composer, with our backend behind it. A follow-up always queues ("Queue —
- * next turn"); Steer is the explicit send-now action; a queued row can be
- * promoted to steer from here. Stop reuses the run row's confirm — a second
+ * next turn"); Steer is the explicit send-now action. Stop reuses the run row's
+ * confirm — a second
  * click, not a dialog and not a keyboard binding — because a stop is a
  * destructive action that must never fire on a stray key.
  *
@@ -295,15 +294,11 @@ function mountComposer(host: HTMLElement, sessionId: string): ComposerHandle {
     const rows = queuedFor(owner.taskId);
     if (rows.length === 0) return;
     for (const row of rows) {
-      queueRows.append(queuedRow(doc, owner, row));
+      queueRows.append(queuedRow(doc, row));
     }
   };
 
-  const queuedRow = (
-    doc: Document,
-    owner: OwnedSession,
-    row: QueuedSupplement,
-  ): HTMLElement => {
+  const queuedRow = (doc: Document, row: QueuedSupplement): HTMLElement => {
     const line = doc.createElement("div");
     Object.assign(line.style, ROW_STYLE);
     const text = doc.createElement("span");
@@ -320,16 +315,6 @@ function mountComposer(host: HTMLElement, sessionId: string): ComposerHandle {
     const lineSpacer = doc.createElement("span");
     Object.assign(lineSpacer.style, SPACER_STYLE);
     line.append(text, lineSpacer, state);
-    if (row.mode === "queue" && row.status === "pending") {
-      const promote = doc.createElement("button");
-      promote.type = "button";
-      promote.textContent = "Steer now";
-      Object.assign(promote.style, BUTTON_STYLE);
-      promote.addEventListener("click", () => {
-        void promoteRow(owner, row, promote);
-      });
-      line.append(promote);
-    }
     return line;
   };
 
@@ -365,25 +350,6 @@ function mountComposer(host: HTMLElement, sessionId: string): ComposerHandle {
     } finally {
       sending = false;
       paint();
-    }
-  };
-
-  const promoteRow = async (
-    owner: OwnedSession,
-    row: QueuedSupplement,
-    button: HTMLButtonElement,
-  ): Promise<void> => {
-    button.disabled = true;
-    try {
-      const receipt = await promoteSupplement(owner, row.commentId);
-      updateQueued(owner.taskId, row.commentId, {
-        mode: "steer",
-        status: receipt.supplement_status,
-      });
-      setStatus("Steered into the running turn");
-    } catch (error) {
-      button.disabled = false;
-      setStatus(errorMessage(error, "Could not steer this message"));
     }
   };
 
@@ -543,25 +509,6 @@ async function postSupplement(
   const receipt = body.supplements?.find((row) => row.task_id === task.taskId);
   const status = typeof receipt?.status === "string" ? receipt.status : "pending";
   return { commentId, status };
-}
-
-async function promoteSupplement(
-  task: OwnedSession,
-  commentId: string,
-): Promise<{ supplement_status: string }> {
-  const response = await fetch(
-    `${ISLAND_API_BASE}/api/issues/${task.issueId}/tasks/${task.taskId}/supplements/${commentId}/promote`,
-    {
-      method: "POST",
-      credentials: "same-origin",
-      headers: await workspaceHeaders(),
-    },
-  );
-  if (!response.ok) throw new Error(await readError(response));
-  const body = (await response.json()) as { supplement_status?: unknown };
-  return {
-    supplement_status: typeof body.supplement_status === "string" ? body.supplement_status : "pending",
-  };
 }
 
 async function postStop(task: OwnedSession): Promise<void> {

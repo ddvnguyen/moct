@@ -101,21 +101,6 @@ test("steers into the running turn with Cmd+Enter", async ({ page }) => {
   expect(writes[0]?.body).toMatchObject({ mode: "steer" });
 });
 
-test("promotes a queued message to a steer from its own row", async ({ page }) => {
-  const input = takeover(page).getByLabel("Message this run");
-  await input.fill("do it now");
-  await input.press("Enter");
-  await expect(page.getByText("queued — next turn")).toBeVisible();
-
-  await takeover(page).getByRole("button", { name: "Steer now" }).click();
-
-  await expect(page.getByText("steered — delivering")).toBeVisible();
-  const writes = await page.evaluate(() => window.__mutations ?? []);
-  expect(writes.at(-1)?.path).toBe(
-    "/multica/api/issues/11111111-1111-4111-8111-111111111111/tasks/task-1/supplements/comment-steer-1/promote",
-  );
-});
-
 test("stops the run only on the second click", async ({ page }) => {
   await takeover(page).getByRole("button", { name: "Stop" }).click();
 

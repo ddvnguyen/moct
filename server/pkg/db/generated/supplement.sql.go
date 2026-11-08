@@ -991,68 +991,6 @@ func (q *Queries) LockTaskSupplementsByComment(ctx context.Context, arg LockTask
 	return items, nil
 }
 
-const promoteTaskSupplement = `-- name: PromoteTaskSupplement :one
-WITH locked_task AS MATERIALIZED (
-    SELECT t.id
-    FROM agent_task_queue t
-    JOIN agent_runtime r ON r.id = t.runtime_id
-    JOIN task_supplement_capability cap ON cap.task_id = t.id
-    WHERE t.id = $3
-      AND t.issue_id = $4
-      AND r.workspace_id = $2
-      AND t.status = 'running'
-      AND cap.capability = 'task-supplement-v1'
-    FOR UPDATE OF t
-)
-UPDATE task_supplement s
-SET mode = 'steer',
-    updated_at = now()
-FROM locked_task t
-WHERE s.task_id = t.id
-  AND s.comment_id = $1
-  AND s.workspace_id = $2
-  AND s.status = 'pending'
-  AND s.mode = 'queue'
-RETURNING s.task_id, s.workspace_id, s.issue_id, s.comment_id, s.author_id, s.client_request_id, s.status, s.failure_reason, s.attempt_count, s.created_at, s.updated_at, s.delivered_at, s.mode
-`
-
-type PromoteTaskSupplementParams struct {
-	CommentID   pgtype.UUID `json:"comment_id"`
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	TaskID      pgtype.UUID `json:"task_id"`
-	IssueID     pgtype.UUID `json:"issue_id"`
-}
-
-// Flips one still-pending queued message to steer, so the running turn reads it
-// at its next step instead of after the turn. Locking the task serializes
-// against terminal transitions, and the status guard turns a message the
-// daemon already claimed into a conflict instead of a second delivery.
-func (q *Queries) PromoteTaskSupplement(ctx context.Context, arg PromoteTaskSupplementParams) (TaskSupplement, error) {
-	row := q.db.QueryRow(ctx, promoteTaskSupplement,
-		arg.CommentID,
-		arg.WorkspaceID,
-		arg.TaskID,
-		arg.IssueID,
-	)
-	var i TaskSupplement
-	err := row.Scan(
-		&i.TaskID,
-		&i.WorkspaceID,
-		&i.IssueID,
-		&i.CommentID,
-		&i.AuthorID,
-		&i.ClientRequestID,
-		&i.Status,
-		&i.FailureReason,
-		&i.AttemptCount,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeliveredAt,
-		&i.Mode,
-	)
-	return i, err
-}
-
 const retryTaskSupplement = `-- name: RetryTaskSupplement :one
 WITH comment AS MATERIALIZED (
     SELECT id FROM comment

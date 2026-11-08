@@ -2197,7 +2197,6 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/tasks/{taskId}/cancel", h.CancelTask)
 					r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/supplements", h.CreateTaskSupplement)
 					r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/supplements/{commentId}/retry", h.RetryTaskSupplement)
-					r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/supplements/{commentId}/promote", h.PromoteTaskSupplement)
 					r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/question-answers", h.CreateNativeQuestionAnswer)
 					r.Post("/rerun", h.RerunIssue)
 					r.Post("/quick-actions/{quickActionId}/run", h.RunQuickAction)

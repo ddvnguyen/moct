@@ -637,57 +637,6 @@ func (h *Handler) RetryTaskSupplement(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, supplementReceipt(row))
 }
 
-// PromoteTaskSupplement moves one still-pending queued message to steer: the
-// running turn reads it at its next step instead of after the turn. It is the
-// only write that can change an existing message's delivery mode, and it never
-// creates a second one — the comment, its receipt and its status stay as they
-// are, so a client that retries the promote gets the same receipt back.
-func (h *Handler) PromoteTaskSupplement(w http.ResponseWriter, r *http.Request) {
-	issue, task, _, ok := h.loadTaskSupplementTarget(w, r)
-	if !ok {
-		return
-	}
-	commentID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "commentId"), "comment id")
-	if !ok {
-		return
-	}
-	if task.Status != "running" {
-		writeErrorCode(w, http.StatusConflict, "task_supplement_turn_ended", "this run has ended")
-		return
-	}
-	row, err := h.Queries.PromoteTaskSupplement(r.Context(), db.PromoteTaskSupplementParams{
-		CommentID: commentID, WorkspaceID: issue.WorkspaceID, TaskID: task.ID, IssueID: issue.ID,
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Already steer: a retry is an idempotent success. Anything else —
-		// claimed, delivered, failed or another run's comment — is a conflict,
-		// because the message is no longer a queued item this client owns.
-		existing, loadErr := h.Queries.GetTaskSupplementForRun(r.Context(), db.GetTaskSupplementForRunParams{
-			CommentID: commentID, TaskID: task.ID, WorkspaceID: issue.WorkspaceID,
-		})
-		switch {
-		case loadErr != nil:
-			writeErrorCode(w, http.StatusNotFound, "task_supplement_not_found", "this message is not bound to the run")
-			return
-		case existing.Status == "pending" && existing.Mode == "steer":
-			// The UPDATE matched nothing because the flip already happened;
-			// clearing err keeps this a success instead of falling through to
-			// the 500 below with the retry's ErrNoRows still in hand.
-			row, err = existing, nil
-		default:
-			writeErrorCode(w, http.StatusConflict, "task_supplement_taken", "this message is no longer waiting")
-			return
-		}
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to steer the queued message")
-		return
-	}
-	h.publishTaskSupplementUpdate(r, row)
-	h.notifyTaskSupplementAvailable(task)
-	writeJSON(w, http.StatusOK, supplementReceipt(row))
-}
-
 type ackTaskSupplementRequest struct {
 	Delivered bool   `json:"delivered"`
 	Error     string `json:"error,omitempty"`

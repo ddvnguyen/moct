@@ -36,13 +36,13 @@ export interface OwnedSession {
 
 /** One message this composer queued, with the state the server last reported. */
 export interface QueuedSupplement {
-  /** The comment the supplement created; the promote route names it. */
+  /** The comment the supplement created; the queued row is keyed by it. */
   commentId: string;
   /** Task the message was bound to. */
   taskId: string;
   /** What the reader typed, kept so the row can show it. */
   content: string;
-  /** `queued` until the server flips it, then `steer`. */
+  /** The delivery mode the message was sent with. */
   mode: "steer" | "queue";
   /** Server receipt state: `pending`, `delivered`, `failed`, `steered`. */
   status: string;
@@ -118,27 +118,6 @@ export function addQueued(item: QueuedSupplement): void {
   const rows = queued.get(item.taskId) ?? [];
   if (rows.some((row) => row.commentId === item.commentId)) return;
   queued.set(item.taskId, [...rows, item]);
-  notify();
-}
-
-/** Update one queued row from a server receipt. Unknown rows are ignored. */
-export function updateQueued(
-  taskId: string,
-  commentId: string,
-  patch: Partial<Pick<QueuedSupplement, "mode" | "status">>,
-): void {
-  const rows = queued.get(taskId);
-  if (rows === undefined) return;
-  let changed = false;
-  const next = rows.map((row) => {
-    if (row.commentId !== commentId) return row;
-    const merged = { ...row, ...patch };
-    if (merged.mode === row.mode && merged.status === row.status) return row;
-    changed = true;
-    return merged;
-  });
-  if (!changed) return;
-  queued.set(taskId, next);
   notify();
 }
 

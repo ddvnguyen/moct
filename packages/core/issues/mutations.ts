@@ -969,21 +969,6 @@ export function useCreateTaskSupplement(issueId: string) {
 }
 
 /**
- * Move one still-pending queued message to steer (M-136).
- *
- * The receipt, not the comment, is the answer: it carries the new mode and the
- * delivery state, which is what the queued row paints. The server broadcasts
- * the comment's updated receipts, so the issue timeline needs no invalidate of
- * its own.
- */
-export function usePromoteTaskSupplement(issueId: string) {
-  return useMutation({
-    mutationFn: ({ taskId, commentId }: { taskId: string; commentId: string }) =>
-      api.promoteTaskSupplement(issueId, taskId, commentId),
-  });
-}
-
-/**
  * Answer one native ask by its exact transcript sequence.
  *
  * The supplement mutation above names only the turn, so two windows can each

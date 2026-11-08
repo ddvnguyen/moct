@@ -156,28 +156,6 @@ describe("steer composer", () => {
     expect(textarea().value).toBe("too late");
   });
 
-  it("promotes a queued row to steer from the row itself", async () => {
-    const fetchMock = vi.fn(async (url: string) =>
-      url.endsWith("/promote") ? jsonResponse({ supplement_status: "pending" }) : receipt(),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    mount();
-
-    fireEvent.input(textarea(), { target: { value: "do it now" } });
-    fireEvent.click(screen.getByRole("button", { name: "Queue" }));
-    await waitFor(() => expect(screen.getByText("queued — next turn")).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole("button", { name: "Steer now" }));
-
-    await waitFor(() => expect(screen.getByText("steered — delivering")).toBeInTheDocument());
-    const promoteCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/promote"));
-    expect(promoteCall?.[0]).toBe(
-      "/multica/api/issues/issue-1/tasks/task-1/supplements/comment-1/promote",
-    );
-    // The row is a steer now, so the promote action is gone.
-    expect(screen.queryByRole("button", { name: "Steer now" })).not.toBeInTheDocument();
-  });
-
   it("stops only on the second click, never on the first", async () => {
     const fetchMock = vi.fn(async () => jsonResponse({ ok: true }));
     vi.stubGlobal("fetch", fetchMock);

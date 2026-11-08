@@ -10,7 +10,6 @@ import {
   setAgentTasks,
   subscribe,
   TASK_SUPPLEMENT_CAPABILITY,
-  updateQueued,
 } from "../src/client/steer-store";
 
 /** Only the fields the ownership map reads; the rest of the row is noise here. */
@@ -150,26 +149,6 @@ describe("queued supplements", () => {
     addQueued(row);
     expect(queuedFor("t-1")).toHaveLength(1);
     expect(listener).not.toHaveBeenCalled();
-  });
-
-  it("applies a promote receipt to the row", () => {
-    addQueued(row);
-    updateQueued("t-1", "c-1", { mode: "steer", status: "pending" });
-    expect(queuedFor("t-1")[0]).toMatchObject({ mode: "steer", status: "pending" });
-  });
-
-  it("does not notify for an unchanged or unknown row", () => {
-    addQueued(row);
-    const listener = vi.fn();
-    subscribe(listener);
-
-    updateQueued("t-1", "c-1", { mode: "queue", status: "pending" });
-    updateQueued("t-1", "c-missing", { status: "delivered" });
-    updateQueued("t-unknown", "c-1", { status: "delivered" });
-    expect(listener).not.toHaveBeenCalled();
-
-    updateQueued("t-1", "c-1", { status: "delivered" });
-    expect(listener).toHaveBeenCalledTimes(1);
   });
 
   it("drops a row on remove, and ignores an unknown one", () => {
