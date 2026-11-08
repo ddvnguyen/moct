@@ -144,12 +144,12 @@ read_manifest() {
     const repo = (m.repos || [])[0];
     if (!repo) { console.error("manifest has no repos[] entry"); process.exit(2); }
     for (const p of repo.packages || []) console.log(`${p.name}\t${p.dir}`);
-    for (const patch of m.patches || []) console.log(`#PATCH\t${patch.target}\t${patch.script}`);
+    for (const patch of m.patches || []) console.log(`#PATCH\t${patch.target}\t${patch.script}\t${patch.maxVersionExclusive || "-"}`);
   ' "$MANIFEST"
 }
 
 MANIFEST_LINES="$(read_manifest)" || die "manifest is unreadable: $MANIFEST"
-PATCH_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCH" && NF==3 { print $2 "\t" $3 }')"
+PATCH_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1=="#PATCH" && NF==4 { print $2 "\t" $3 "\t" $4 }')"
 PKG_LINES="$(printf '%s\n' "$MANIFEST_LINES" | awk -F'\t' '$1!="#PATCH" && NF==2')"
 [ -n "$PKG_LINES" ] || die "manifest lists no packages"
 [ -n "$PATCH_LINES" ] || die "the manifest names no patches"
@@ -167,9 +167,9 @@ done <<< "$PKG_LINES"
 # The appliers are owned by the plugins repo; their paths are relative to
 # that checkout.
 PATCH_APPLIERS=""
-while IFS=$'\t' read -r target script; do
+while IFS=$'\t' read -r target script below; do
   [ -n "${target:-}" ] || continue
-  PATCH_APPLIERS="${PATCH_APPLIERS}${target}	${PLUGINS_ROOT}/${script}
+  PATCH_APPLIERS="${PATCH_APPLIERS}${target}	${PLUGINS_ROOT}/${script}	${below}
 "
 done <<< "$PATCH_LINES"
 
@@ -179,9 +179,9 @@ log "profile: $PROFILE_DIR"
 log "artifacts: $ARTIFACTS_DIR"
 log "packages: $(printf '%s\n' "$PKG_LINES" | cut -f1 | tr '\n' ' ')"
 log "patches:"
-while IFS=$'\t' read -r target applier; do
+while IFS=$'\t' read -r target applier below; do
   [ -n "${target:-}" ] || continue
-  log "  $target <- $applier"
+  log "  $target <- $applier (only below ${below:--})"
 done <<< "$PATCH_APPLIERS"
 
 # --- build and pack (definitions) -------------------------------------------
@@ -396,9 +396,9 @@ if [ "$DRY_RUN" = "1" ]; then
   log "would REMOVE the installed copies of the manifest's packages so pnpm re-links this build"
   log "would run pnpm install in $PROFILE_DIR"
   log "would compare every installed package with the artifact it was installed from"
-  while IFS=$'\t' read -r target applier; do
+  while IFS=$'\t' read -r target applier below; do
     [ -n "${target:-}" ] || continue
-    log "would apply $applier to $PROFILE_DIR/node_modules/$target"
+    log "would apply $applier (skipped when the installed $target is >= ${below:--}) to $PROFILE_DIR/node_modules/$target"
     log "would verify that $PROFILE_DIR/node_modules/$target carries its patch"
   done <<< "$PATCH_APPLIERS"
   log "would verify every package version and print the package -> version table"
@@ -734,10 +734,27 @@ done <<< "$PACKED"
 # patch. A package that was left half-patched - an applier that wrote one
 # file and stopped, a package that was already patched in a way this applier
 # does not recognise - fails the deploy here instead of reaching the lane.
-while IFS=$'\t' read -r target applier; do
+while IFS=$'\t' read -r target applier below; do
   [ -n "${target:-}" ] || continue
   patch_dir="$PROFILE_DIR/node_modules/$target"
   [ -d "$patch_dir" ] || die "patch target not installed: $patch_dir"
+  # A patch may declare maxVersionExclusive: the first target version it is
+  # NOT written for. An installed target at or above it is skipped loudly
+  # (the patch is for an older bundle layout); below it, a missing anchor
+  # still fails the deploy.
+  if [ "${below:--}" != "-" ]; then
+    installed_version="$(node -p 'require(process.argv[1]).version' "$patch_dir/package.json")" \
+      || die "cannot read the installed $target version"
+    if node -e '
+      const parse = (v) => String(v).split("-")[0].split(".").map((n) => parseInt(n, 10) || 0);
+      const [a, b] = [parse(process.argv[1]), parse(process.argv[2])];
+      for (let i = 0; i < 3; i++) { if ((a[i] || 0) !== (b[i] || 0)) process.exit((a[i] || 0) > (b[i] || 0) ? 0 : 1); }
+      process.exit(0);
+    ' "$installed_version" "$below"; then
+      log "SKIPPING the $target patch: installed $target $installed_version is >= $below, the version this patch is not written for"
+      continue
+    fi
+  fi
   require_path "$applier" "the patch applier for $target"
   log "applying the $target patch: $applier $patch_dir"
   case "$applier" in

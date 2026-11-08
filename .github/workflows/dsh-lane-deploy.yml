@@ -226,8 +226,9 @@ jobs:
           set -euo pipefail
           echo "--- lane root"
           # The lane serves its UI behind the session token it publishes in its
-          # own journal, and it binds the address its unit names (the harness
-          # refuses a wildcard bind, so the unit pins one concrete address).
+          # own journal, and it binds the address its unit names. The wildcard
+          # bind is the contract: the release deploy refuses a unit that does
+          # not carry --host 0.0.0.0, so the unit pins 0.0.0.0.
           # Take the URL the lane published for THIS boot; fall back to the
           # unit's --host address.
           URL="$(journalctl --user -u "dsh-${{ inputs.lane }}.service" -n 300 --no-pager \
