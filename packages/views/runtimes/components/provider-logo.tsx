@@ -450,6 +450,7 @@ export function ProviderLogo({
     case "codex":
       return <CodexLogo className={className} />;
     case "opencode":
+    case "opencode2":
       return <OpenCodeLogo className={className} />;
     case "deveco":
       return <DevecoLogo className={className} />;

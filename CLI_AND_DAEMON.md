@@ -279,6 +279,7 @@ The daemon auto-detects these AI CLIs on your PATH:
 | [Codex](https://github.com/openai/codex) | `codex` | OpenAI's coding agent |
 | [GitHub Copilot CLI](https://docs.github.com/en/copilot) | `copilot` | GitHub's coding agent (model routed by your GitHub entitlement) |
 | OpenCode | `opencode` | Open-source coding agent |
+| OpenCode 2 | `opencode2` | OpenCode 2.x as its own runtime, alongside 1.x. Codemode (`execute`) is native; Multica-managed MCP is not supported |
 | [ZCode](https://zcode.z.ai/) | `zcode` / ZCode Desktop | Native NDJSON app-server, sessions, model discovery, thinking levels, MCP and yolo execution |
 | OpenClaw | `openclaw` | Open-source coding agent |
 | Hermes | `hermes` | Nous Research coding agent |
@@ -429,6 +430,8 @@ Agent-specific overrides:
 | `MULTICA_COPILOT_MODEL` | Override the Copilot model used (note: GitHub Copilot routes models through your account entitlement, so this may not be honoured) |
 | `MULTICA_OPENCODE_PATH` | Custom path to the `opencode` binary |
 | `MULTICA_OPENCODE_MODEL` | Override the OpenCode model used |
+| `MULTICA_OPENCODE2_PATH` | Custom path to the `opencode2` binary |
+| `MULTICA_OPENCODE2_MODEL` | Override the OpenCode 2 model used |
 | `MULTICA_OPENCLAW_PATH` | Custom path to the `openclaw` binary |
 | `MULTICA_OPENCLAW_MODEL` | Select the registered OpenClaw agent ID used by default; the agent's `runtime_config.model_override` persistently overrides its underlying model for all newly claimed runs until changed or cleared |
 | `MULTICA_OPENCLAW_CLI_TIMEOUT` | Deadline for each `openclaw config ...` call during task preparation (default 30s; accepts `45s` or `45`). Raise it when the local CLI is slow to start; the daemon also reads it from `backends.openclaw.cli_timeout` in the CLI config |

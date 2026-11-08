@@ -149,6 +149,7 @@ export type RuntimeProtocolFamily =
 export const RUNTIME_PROFILE_RUNTIME_TYPES = [
   ...RUNTIME_PROFILE_PROTOCOL_FAMILIES,
   "omp",
+  "opencode2",
 ] as const;
 export type RuntimeProfileType = (typeof RUNTIME_PROFILE_RUNTIME_TYPES)[number];
 
