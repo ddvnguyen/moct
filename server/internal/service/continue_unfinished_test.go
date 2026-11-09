@@ -14,11 +14,16 @@ import (
 )
 
 // continueFixture builds an issue assigned to a private agent at the given
-// status, plus a completed step-bound run for it. The issue has no project,
-// so the workflow switch defaults on.
+// status, plus a completed step-bound run for it. The router is explicitly
+// enabled so the test exercises its active behavior.
 func continueFixture(t *testing.T, status string) (principalFixture, *TaskService, pgtype.UUID, string) {
 	t.Helper()
 	f, owner := newPrincipalFixture(t)
+	if _, err := f.q.SetWorkspaceSetting(context.Background(), db.SetWorkspaceSettingParams{
+		ID: parseTestUUID(t, f.WorkspaceID), Key: "turn_end_router_mode", Value: []byte(`"on"`),
+	}); err != nil {
+		t.Fatalf("enable turn-end router for continuation fixture: %v", err)
+	}
 	issue := f.Issue(t, "Continuation test", testutil.Cols{"status": status})
 	agent := f.privateAgentOwnedBy(t, owner, "cont")
 	f.Exec(t, "UPDATE issue SET assignee_type='agent',assignee_id=$1 WHERE id=$2", agent, issue)
@@ -26,6 +31,67 @@ func continueFixture(t *testing.T, status string) (principalFixture, *TaskServic
 	f.Cleanup(t, "DELETE FROM comment WHERE issue_id=$1", issue)
 	svc := &TaskService{Queries: f.q, TxStarter: f.Pool, Bus: events.New()}
 	return f, svc, parseTestUUID(t, issue), agent
+}
+
+func TestContinuationChainResetsAtStatusEpisodeBoundary(t *testing.T) {
+	f, _, issue, agent := continueFixture(t, "in_progress")
+	old := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
+	oldContinuation := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, old.ID)
+	f.Exec(t, "UPDATE agent_task_queue SET created_at=now()-interval '20 minutes' WHERE id=$1", util.UUIDToString(oldContinuation.ID))
+	f.Exec(t, `INSERT INTO activity_log (workspace_id,issue_id,actor_type,actor_id,action,details)
+		VALUES ($1,$2,'agent',$3,'status_changed','{"from":"todo","to":"in_progress"}'::jsonb)`,
+		f.WorkspaceID, util.UUIDToString(issue), agent)
+	current := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, oldContinuation.ID)
+	f.Exec(t, "UPDATE agent_task_queue SET created_at=now() WHERE id=$1", util.UUIDToString(current.ID))
+	current, err := f.q.GetAgentTask(context.Background(), current.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := continuationChain(context.Background(), f.q, mustGetIssue(t, f, issue), "in_progress", current)
+	if len(chain) != 1 || util.UUIDToString(chain[0].ID) != util.UUIDToString(current.ID) {
+		t.Fatalf("episode chain = %v, want only current episode continuation %s", taskIDs(chain), util.UUIDToString(current.ID))
+	}
+}
+
+func TestContinuationProgressIgnoresTaskResult(t *testing.T) {
+	f, _, issue, agent := continueFixture(t, "in_progress")
+	prev := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
+	f.Exec(t, "UPDATE agent_task_queue SET result='\"agent wrote output\"'::jsonb WHERE id=$1", util.UUIDToString(prev.ID))
+	prev, err := f.q.GetAgentTask(context.Background(), prev.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progressSince(context.Background(), f.q, mustGetIssue(t, f, issue), prev) {
+		t.Fatal("non-empty task result counted as progress without a status, comment, or PR change")
+	}
+}
+
+func TestContinuationReminderMatchesOutcome(t *testing.T) {
+	queued := ContinuationReminderForOutcome("queued")
+	suppressed := ContinuationReminderForOutcome("suppressed:pending_task")
+	if !strings.Contains(queued, "queued") {
+		t.Fatalf("queued reminder = %q, want queued outcome", queued)
+	}
+	if strings.Contains(suppressed, "will be queued") || !strings.Contains(suppressed, "No continuation was queued") {
+		t.Fatalf("suppressed reminder = %q, must describe suppression", suppressed)
+	}
+}
+
+func mustGetIssue(t *testing.T, f principalFixture, issue pgtype.UUID) db.Issue {
+	t.Helper()
+	got, err := f.q.GetIssue(context.Background(), issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func taskIDs(tasks []db.AgentTaskQueue) []string {
+	ids := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		ids = append(ids, util.UUIDToString(task.ID))
+	}
+	return ids
 }
 
 // continueCompletedRun inserts a completed run on the issue bound to step with
@@ -125,13 +191,16 @@ func TestContinueUnfinishedSuppressedOnMoveReassignWakeup(t *testing.T) {
 	}
 }
 
-func TestContinueUnfinishedConsultStaysQuiet(t *testing.T) {
+func TestContinueUnfinishedCommentRunCanContinue(t *testing.T) {
 	f, svc, issue, agent := continueFixture(t, "in_progress")
 	commentID := f.Comment(t, util.UUIDToString(issue), "@agent what do you think?")
 	consult := continueCompletedRun(t, f, issue, agent, "in_progress", parseTestUUID(t, commentID), pgtype.UUID{})
-	svc.MaybeContinueUnfinishedStep(context.Background(), consult)
-	if got := continuePendingCount(t, f, issue); got != 0 {
-		t.Fatalf("consult queued %d, want 0", got)
+	d := svc.DecideContinueUnfinishedStep(context.Background(), consult)
+	if d.Outcome != "queued" {
+		t.Fatalf("comment-triggered run outcome = %q, want queued", d.Outcome)
+	}
+	if got := continuePendingCount(t, f, issue); got != 1 {
+		t.Fatalf("comment-triggered run queued %d, want 1 continuation", got)
 	}
 }
 

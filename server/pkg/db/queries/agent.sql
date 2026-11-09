@@ -392,6 +392,58 @@ SELECT
 WHERE lock_task_owner_rows($1, $3, $2)
 RETURNING *;
 
+-- name: SetTaskTurnEndRouterContext :exec
+-- Persist the reason for a derived turn-end run on its task so routing can
+-- dedupe recent runs and report productivity without another table.
+UPDATE agent_task_queue
+SET context = COALESCE(context, '{}'::jsonb) || jsonb_build_object(
+    'turn_end_router', jsonb_build_object(
+        'origin', 'derived',
+        'reason', sqlc.arg('reason')::text,
+        'baseline_status', sqlc.arg('baseline_status')::text,
+        'baseline_comment_count', sqlc.arg('baseline_comment_count')::bigint,
+        'baseline_head_sha', sqlc.arg('baseline_head_sha')::text
+    )
+)
+WHERE id = sqlc.arg('id');
+
+-- name: SetTaskTurnEndRouterProductive :exec
+UPDATE agent_task_queue
+SET context = jsonb_set(
+    COALESCE(context, '{}'::jsonb),
+    '{turn_end_router,productive}',
+    to_jsonb(sqlc.arg('productive')::boolean),
+    true
+)
+WHERE id = sqlc.arg('id')
+  AND context -> 'turn_end_router' ->> 'origin' = 'derived';
+
+-- name: CountRecentTurnEndRouterRuns :one
+SELECT count(*)::bigint
+FROM agent_task_queue
+WHERE issue_id = sqlc.arg('issue_id')
+  AND context -> 'turn_end_router' ->> 'origin' = 'derived'
+  AND created_at >= now() - interval '2 minutes';
+
+-- name: CountTurnEndRouterRunsSince :one
+SELECT count(*)::bigint AS run_count,
+       count(*) FILTER (WHERE
+           (context -> 'turn_end_router' ->> 'productive')::boolean = true
+       )::bigint AS productive_count
+FROM agent_task_queue
+WHERE issue_id = sqlc.arg('issue_id')
+  AND context -> 'turn_end_router' ->> 'origin' = 'derived'
+  AND created_at >= now() - interval '24 hours';
+
+-- name: CountWorkspaceTurnEndRouterRunsSince :one
+SELECT count(*)::bigint AS run_count,
+       count(*) FILTER (WHERE (task.context -> 'turn_end_router' ->> 'productive')::boolean = true)::bigint AS productive_count
+FROM agent_task_queue task
+JOIN issue i ON i.id = task.issue_id
+WHERE i.workspace_id = sqlc.arg('workspace_id')
+  AND task.context -> 'turn_end_router' ->> 'origin' = 'derived'
+  AND task.created_at >= now() - interval '24 hours';
+
 -- name: CreateDeferredChannelIssueTask :one
 -- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
 -- locks the owners' workspace rows in the writer's own transaction and returns

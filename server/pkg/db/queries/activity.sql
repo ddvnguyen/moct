@@ -66,3 +66,13 @@ SELECT actor_type, actor_id FROM activity_log
 WHERE issue_id = @issue_id AND action = 'status_changed'
 ORDER BY created_at DESC, id DESC
 LIMIT 1;
+
+-- name: GetIssueStatusEnteredAt :one
+-- Returns the start of the current uninterrupted status episode. Continuation
+-- caps must reset when an issue returns to a status it occupied earlier.
+SELECT created_at FROM activity_log
+WHERE issue_id = sqlc.arg('issue_id')
+  AND action = 'status_changed'
+  AND details->>'to' = sqlc.arg('status')::text
+ORDER BY created_at DESC, id DESC
+LIMIT 1;

@@ -120,6 +120,29 @@ func (q *Queries) GetActivity(ctx context.Context, id pgtype.UUID) (ActivityLog,
 	return i, err
 }
 
+const getIssueStatusEnteredAt = `-- name: GetIssueStatusEnteredAt :one
+SELECT created_at FROM activity_log
+WHERE issue_id = $1
+  AND action = 'status_changed'
+  AND details->>'to' = $2::text
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+`
+
+type GetIssueStatusEnteredAtParams struct {
+	IssueID pgtype.UUID `json:"issue_id"`
+	Status  string      `json:"status"`
+}
+
+// Returns the start of the current uninterrupted status episode. Continuation
+// caps must reset when an issue returns to a status it occupied earlier.
+func (q *Queries) GetIssueStatusEnteredAt(ctx context.Context, arg GetIssueStatusEnteredAtParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, getIssueStatusEnteredAt, arg.IssueID, arg.Status)
+	var created_at pgtype.Timestamptz
+	err := row.Scan(&created_at)
+	return created_at, err
+}
+
 const getLastIssueStatusChange = `-- name: GetLastIssueStatusChange :one
 SELECT actor_type, actor_id FROM activity_log
 WHERE issue_id = $1 AND action = 'status_changed'

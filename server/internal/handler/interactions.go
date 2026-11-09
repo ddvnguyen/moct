@@ -108,6 +108,101 @@ type UpdateMoctSettingsRequest struct {
 	MemoryInject json.RawMessage `json:"memory_inject"`
 }
 
+// TurnEndRouterSettingsResponse exposes the workspace's turn-end routing mode.
+type TurnEndRouterSettingsResponse struct {
+	Mode               string  `json:"mode"`
+	ModeSet            bool    `json:"mode_set"`
+	Editable           bool    `json:"editable"`
+	Runs24h            int64   `json:"runs_24h"`
+	ProductiveRuns24h  int64   `json:"productive_runs_24h"`
+	ProductiveRatio24h float64 `json:"productive_ratio_24h"`
+}
+
+type UpdateTurnEndRouterSettingsRequest struct {
+	Mode json.RawMessage `json:"mode"`
+}
+
+const turnEndRouterSettingKey = "turn_end_router_mode"
+
+func turnEndRouterMode(settings []byte) (string, bool) {
+	raw, ok := settingValue(settings, turnEndRouterSettingKey)
+	if !ok {
+		return "shadow", false
+	}
+	mode, ok := raw.(string)
+	if !ok || (mode != "off" && mode != "shadow" && mode != "on") {
+		return "shadow", false
+	}
+	return mode, true
+}
+
+func (h *Handler) GetTurnEndRouterSettings(w http.ResponseWriter, r *http.Request) {
+	workspaceID := workspaceIDFromURL(r, "id")
+	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
+	if !ok {
+		return
+	}
+	member, ok := h.requireWorkspaceMember(w, r, workspaceID, "workspace not found")
+	if !ok {
+		return
+	}
+	ws, err := h.Queries.GetWorkspace(r.Context(), wsUUID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+	mode, set := turnEndRouterMode(ws.Settings)
+	response := TurnEndRouterSettingsResponse{Mode: mode, ModeSet: set, Editable: isWorkspaceAdmin(member)}
+	stats, err := h.Queries.CountWorkspaceTurnEndRouterRunsSince(r.Context(), wsUUID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load turn-end router metrics")
+		return
+	}
+	response.Runs24h = stats.RunCount
+	response.ProductiveRuns24h = stats.ProductiveCount
+	if stats.RunCount > 0 {
+		response.ProductiveRatio24h = float64(stats.ProductiveCount) / float64(stats.RunCount)
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) UpdateTurnEndRouterSettings(w http.ResponseWriter, r *http.Request) {
+	workspaceID := workspaceIDFromURL(r, "id")
+	if _, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id"); !ok {
+		return
+	}
+	var req UpdateTurnEndRouterSettingsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	var mode string
+	if len(req.Mode) == 0 || json.Unmarshal(req.Mode, &mode) != nil || (mode != "off" && mode != "shadow" && mode != "on") {
+		writeError(w, http.StatusBadRequest, "mode must be off, shadow, or on")
+		return
+	}
+	stats, err := h.Queries.CountWorkspaceTurnEndRouterRunsSince(r.Context(), parseUUID(workspaceID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load turn-end router metrics")
+		return
+	}
+	updated, err := h.setWorkspaceSetting(r, workspaceID, turnEndRouterSettingKey, mode)
+	if err != nil {
+		slog.Error("update turn-end router settings failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to update turn-end router settings")
+		return
+	}
+	h.publishWorkspaceSettingsChanged(r, updated)
+	ratio := float64(0)
+	if stats.RunCount > 0 {
+		ratio = float64(stats.ProductiveCount) / float64(stats.RunCount)
+	}
+	writeJSON(w, http.StatusOK, TurnEndRouterSettingsResponse{
+		Mode: mode, ModeSet: true, Editable: true,
+		Runs24h: stats.RunCount, ProductiveRuns24h: stats.ProductiveCount, ProductiveRatio24h: ratio,
+	})
+}
+
 // settingNumber reads one numeric key out of a settings object. A value that is
 // not a whole number counts as absent: a settings object can be written by
 // clients this file does not control, and a malformed entry must read as "no

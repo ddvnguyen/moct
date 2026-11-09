@@ -5090,7 +5090,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	h.reconcileCommentsOnCompletion(r.Context(), task)
 	// M-279: if the run ended cleanly without moving the issue or arming a
 	// wakeup, queue one continuation run instead of leaving the card idle.
-	h.TaskService.MaybeContinueUnfinishedStep(r.Context(), *task)
+	continuation := h.TaskService.DecideContinueUnfinishedStep(r.Context(), *task)
 	// The terminal transaction and completion reconciliation are committed.
 	// Wake the owning runtime now so queued work that was blocked by this
 	// task's agent capacity or serialization key is re-claimed immediately.
@@ -5107,7 +5107,9 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("task completed", "task_id", taskID, "agent_id", uuidToString(task.AgentID))
-	writeJSON(w, http.StatusOK, taskToResponse(*task, workspaceID))
+	response := taskToResponse(*task, workspaceID)
+	response.ContinuationReminder = continuation.Reminder
+	writeJSON(w, http.StatusOK, response)
 }
 
 // emitIssueExecutedOnFirstCompletion atomically flips issue.first_executed_at

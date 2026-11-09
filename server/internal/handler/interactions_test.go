@@ -307,6 +307,40 @@ func TestMoctSettings_InjectSwitch(t *testing.T) {
 	}
 }
 
+func TestTurnEndRouterSettings_Mode(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	fx := setupInteractionsFixture(t, "handler-tests-turn-end-router")
+	path := "/api/workspaces/" + fx.WorkspaceID + "/turn-end-router"
+
+	var initial TurnEndRouterSettingsResponse
+	testutil.Call(t, testHandler.GetTurnEndRouterSettings,
+		interactionsRequest(t, "GET", path, fx.WorkspaceID, nil)).Want(http.StatusOK).JSON(&initial)
+	if initial.Mode != "shadow" || initial.ModeSet {
+		t.Fatalf("initial setting = %+v, want default shadow and unset", initial)
+	}
+
+	var enabled TurnEndRouterSettingsResponse
+	testutil.Call(t, testHandler.UpdateTurnEndRouterSettings,
+		interactionsRequest(t, "PUT", path, fx.WorkspaceID, map[string]any{"mode": "on"})).
+		Want(http.StatusOK).JSON(&enabled)
+	if enabled.Mode != "on" || !enabled.ModeSet {
+		t.Fatalf("after setting on = %+v", enabled)
+	}
+	if value, ok := storedSetting(t, "workspace", turnEndRouterSettingKey, fx.WorkspaceID, ""); !ok || value != "on" {
+		t.Fatalf("stored mode = %v (present=%v), want on", value, ok)
+	}
+	for _, body := range []any{
+		map[string]any{"mode": "enabled"},
+		map[string]any{"mode": false},
+		map[string]any{},
+	} {
+		testutil.Call(t, testHandler.UpdateTurnEndRouterSettings,
+			interactionsRequest(t, "PUT", path, fx.WorkspaceID, body)).Want(http.StatusBadRequest)
+	}
+}
+
 // An absent or malformed setting must read as ON. The switch exists to turn
 // memory OFF; nothing about a settings object this file does not control may
 // silently strip memory from every run in a workspace.

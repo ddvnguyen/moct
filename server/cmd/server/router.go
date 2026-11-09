@@ -1846,6 +1846,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// admin-gated.
 					r.Get("/interactions", h.GetInteractions)
 					r.Get("/moct", h.GetMoctSettings)
+					r.Get("/turn-end-router", h.GetTurnEndRouterSettings)
 				})
 				// Admin-level access
 				r.Group(func(r chi.Router) {
@@ -1854,6 +1855,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Patch("/", h.UpdateWorkspace)
 					r.Put("/interactions", h.UpdateInteractions)
 					r.Put("/moct", h.UpdateMoctSettings)
+					r.Put("/turn-end-router", h.UpdateTurnEndRouterSettings)
 					r.Post("/members", h.CreateInvitation)
 					r.Route("/members/{memberId}", func(r chi.Router) {
 						r.Patch("/", h.UpdateMember)
