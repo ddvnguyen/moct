@@ -7860,6 +7860,10 @@ type taskModelSelection struct {
 // Who asks for the catalog:
 //   - opencode and its DevEco fork cannot execute an unqualified selector, so
 //     a pinned model has to be resolved against the catalog before launch.
+//   - dsh dispatches every model call through its adapter registry, so a
+//     persisted id naming an SDK provider (opencode-go) instead of a
+//     registered route (dsh-opencode-go) fails at dispatch; qualification maps
+//     it onto the catalog's canonical route id first.
 //   - thinking_level / service_tier are catalog-owned and keyed on the
 //     catalog's own model id, so they need it whenever they are set.
 //
@@ -8011,7 +8015,7 @@ func qualifyTaskModel(
 		)
 		return model
 	}
-	qualified, rewritten := agent.QualifyModelID(catalog, model)
+	qualified, rewritten := agent.QualifyModelIDForProvider(provider, catalog, model)
 	if !rewritten {
 		return model
 	}

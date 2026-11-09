@@ -1902,12 +1902,13 @@ func TestModelSelectorMustBeProviderQualifiedIsAnExecutionContract(t *testing.T)
 	}{
 		{"opencode", true, "run --model resolves strictly through provider/model"},
 		{"deveco", true, "opencode fork with the same --model contract"},
+		{"opencode2", true, "opencode-family builtin, inherits the opencode contract"},
 		{"pi", false, "pi's own resolver accepts bare and slash-shaped ids"},
 		{"omp", false, "pi-family fork, inherits pi's resolver"},
 		{"claude", false, "bare model ids, no provider segment to miss"},
 		{"codex", false, "bare model ids"},
 		{"copilot", false, "bare model ids under a display-name provider"},
-		{"dsh", false, "resolves its own provider-prefixed ids"},
+		{"dsh", true, "dispatch resolves the selection through its adapter registry; an SDK-shape provider fails at dispatch"},
 		{"", false, "unknown provider must not spend discovery"},
 	}
 

@@ -396,7 +396,18 @@ func ListModels(ctx context.Context, providerType string, runtimeCmd Command) (C
 // opencode's `run --model` and the DevEco fork of it resolve strictly through
 // `provider/model` and reject anything else — verified against opencode
 // 1.18.14, which answers a bare id with `UnknownError` before any provider
-// call. pi is deliberately absent: its resolver accepts a canonical selector,
+// call. dsh resolves the same shape of contract: its LLM layer dispatches
+// every model call through the (provider route, model id) tuple the task
+// carries, so an id whose provider segment is not a route the runtime's own
+// adapter registry registered — a bare SDK provider like `opencode-go`, where
+// the registered route is `dsh-opencode-go` — fails the run at dispatch with
+// `DSH_RUNTIME_ERROR: no adapter registered for provider "..."` (observed,
+// 2026-11-08 lane z, task 01a1bbaa-3051 for the M-135 S3 acceptance). Like
+// opencode, a pinned dsh model is worth one catalog read before launch so the
+// daemon can map the persisted id onto the route the runtime actually
+// registered (qualifyDshModelID).
+//
+// pi is deliberately absent: its resolver accepts a canonical selector,
 // a bare id, AND an id containing a slash (see buildPiArgs), so a pi task
 // launches correctly without the daemon qualifying anything first.
 //
@@ -407,7 +418,7 @@ func ModelSelectorMustBeProviderQualified(providerType string) bool {
 		providerType = desc.ProtocolFamily
 	}
 	switch providerType {
-	case "opencode", "deveco":
+	case "opencode", "deveco", "dsh":
 		return true
 	default:
 		return false
@@ -456,6 +467,93 @@ func QualifyModelID(catalog Catalog, model string) (string, bool) {
 		if qualified != "" && qualified != m.ID {
 			// Two providers expose this same bare id. Picking one would be a
 			// coin flip that silently routes the task to the wrong gateway.
+			return model, false
+		}
+		qualified = m.ID
+	}
+	if qualified == "" {
+		return model, false
+	}
+	return qualified, true
+}
+
+// QualifyModelIDForProvider dispatches model qualification by provider, the
+// one seam provider-keyed model behaviour uses to accept a runtime identity.
+// QualifyModelID alone assumes a catalog row whose Provider field is the
+// provider segment of its own ID (`vendor/id`, matched by
+// `m.Provider == provider`); the dsh runtime's frames carry a display name in
+// that field ("DSH OpenCode Go"), and its model IDs name a provider ROUTE
+// (`dsh-opencode-go/<model>`) rather than the SDK-facing provider a
+// persisted id holds, so the generic rewrite can never match a dsh row.
+func QualifyModelIDForProvider(provider string, catalog Catalog, model string) (string, bool) {
+	if Family(provider) == "dsh" {
+		return qualifyDshModelID(catalog, model)
+	}
+	return QualifyModelID(catalog, model)
+}
+
+// qualifyDshModelID resolves a persisted model id onto the canonical ID the
+// dsh runtime's own catalog advertises.
+//
+// dsh-llm (the dsh harness's LLM layer) resolves every model call strictly
+// through its adapter registry: the provider segment of the selection must be
+// a route the runtime actually registered. dsh LLM-provider plugins register
+// their harness-facing route namespaced OVER the SDK-facing provider
+// (the opencode-go provider plugin declares PROVIDER_ID "dsh-opencode-go"
+// beside SDK_PROVIDER_ID "opencode-go" in its own provider-identity.ts), so a
+// persisted id in the SDK shape (`opencode-go/beam-free`) can never exist in
+// the catalog and the run dies at dispatch with
+// `DSH_RUNTIME_ERROR: no adapter registered for provider "opencode-go"`.
+//
+// The rewrite is catalog-confirmed, never invented: the runtime's catalog
+// must advertise exactly one row whose model segment is the persisted one and
+// whose route keeps the persisted provider as a namespaced suffix
+// (`dsh-opencode-go` over `opencode-go`). Two candidates mean the daemon
+// cannot tell which route the persisted name meant, so the value goes to the
+// runtime untouched and its own resolver judges it.
+func qualifyDshModelID(catalog Catalog, model string) (string, bool) {
+	model = strings.TrimSpace(model)
+	// Same posture as QualifyModelID: a blank value means "let the runtime
+	// resolve its own default", and a fallback catalog (or one whose discovery
+	// never succeeded) must not rewrite a working id into one the runtime never
+	// advertised.
+	if model == "" || !catalog.Verified() {
+		return model, false
+	}
+	for _, m := range catalog.Models {
+		if m.ID == model {
+			return model, false
+		}
+	}
+	provider, selectedID, ok := strings.Cut(model, "/")
+	if !ok || strings.TrimSpace(provider) == "" || strings.TrimSpace(selectedID) == "" {
+		// A bare id names no SDK provider to namespace, and dsh's own selection
+		// parser rejects a route-less id anyway; the runtime is the better judge.
+		return model, false
+	}
+	qualified := ""
+	for _, m := range catalog.Models {
+		// The model segment is everything after the LAST slash so a
+		// gateway-style route (`gateway-a/claude`) stays intact; such a route
+		// fails the suffix check below and is left alone.
+		idx := strings.LastIndex(m.ID, "/")
+		if idx < 0 {
+			continue
+		}
+		route, catalogID := m.ID[:idx], m.ID[idx+1:]
+		if catalogID != selectedID {
+			continue
+		}
+		// dsh-llm routes are single-segment plugin identities; an id whose
+		// route half itself contains a slash is a gateway-style selector, not
+		// a route name, and is left for the runtime to judge.
+		if route == provider || !strings.HasSuffix(route, provider) || strings.Contains(route, "/") {
+			continue
+		}
+		if qualified != "" && qualified != m.ID {
+			// Two routes claim this namespace. Picking one would silently
+			// route the task through a foreign provider — same reasoning as
+			// QualifyModelID's ambiguous branch.
 			return model, false
 		}
 		qualified = m.ID
