@@ -1,12 +1,11 @@
 package middleware
 
 import (
-	"errors"
 	"log/slog"
+	"errors"
 	"net/http"
 	"net/url"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -113,16 +112,16 @@ func checkTaskTokenWorkspaceTarget(w http.ResponseWriter, r *http.Request, queri
 			}
 			id, ok := resolved[slug]
 			if !ok {
-				ws, err := queries.GetWorkspaceBySlug(r.Context(), slug)
+				resolvedID, err := ResolveWorkspaceSlug(r.Context(), queries, slug)
 				if err != nil {
-					if errors.Is(err, pgx.ErrNoRows) {
+					if errors.Is(err, errWorkspaceNotFound) {
 						return reject(http.StatusNotFound, "workspace not found", sel.name, slug)
 					}
 					slog.Error("auth: task token workspace slug lookup failed", "path", r.URL.Path, "error", err)
 					writeError(w, http.StatusInternalServerError, "failed to resolve workspace")
 					return true
 				}
-				id = util.UUIDToString(ws.ID)
+				id = resolvedID
 				resolved[slug] = id
 			}
 			if id != boundWorkspaceID {

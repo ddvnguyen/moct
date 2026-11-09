@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -301,17 +302,63 @@ func (h *Handler) taskFromRequestHeader(r *http.Request) (db.AgentTaskQueue, boo
 // (run counts, activity histograms, task snapshots) that need to filter out
 // private / non-allow-listed agents the member can't access. Returns nil and
 // false on error.
+type agentAccessCacheEntry struct {
+	allowed  map[string]struct{}
+	ok       bool
+	computed bool
+}
+
+type agentAccessCache struct {
+	mu sync.Mutex
+	m  map[string]agentAccessCacheEntry
+}
+
+var requestAgentAccessCaches sync.Map
+
+func agentAccessCacheFor(ctx context.Context) *agentAccessCache {
+	if v, ok := requestAgentAccessCaches.Load(ctx); ok {
+		return v.(*agentAccessCache)
+	}
+	c := &agentAccessCache{m: map[string]agentAccessCacheEntry{}}
+	actual, _ := requestAgentAccessCaches.LoadOrStore(ctx, c)
+	return actual.(*agentAccessCache)
+}
+
+// resetAgentAccessCacheFor is used by tests to drop cached state for a ctx.
+func resetAgentAccessCacheFor(ctx context.Context) {
+	requestAgentAccessCaches.Delete(ctx)
+}
+
 func (h *Handler) accessibleAgentIDs(ctx context.Context, workspaceID, actorType, actorID, role string) (map[string]struct{}, bool) {
+	cache := agentAccessCacheFor(ctx)
+	key := workspaceID + "|" + actorType + "|" + actorID + "|" + role
+
+	cache.mu.Lock()
+	if e, ok := cache.m[key]; ok && e.computed {
+		cache.mu.Unlock()
+		return e.allowed, e.ok
+	}
+	cache.mu.Unlock()
+
 	wsUUID, err := util.ParseUUID(workspaceID)
 	if err != nil {
+		cache.mu.Lock()
+		cache.m[key] = agentAccessCacheEntry{allowed: nil, ok: false, computed: true}
+		cache.mu.Unlock()
 		return nil, false
 	}
 	agents, err := h.Queries.ListAllAgents(ctx, wsUUID)
 	if err != nil {
+		cache.mu.Lock()
+		cache.m[key] = agentAccessCacheEntry{allowed: nil, ok: false, computed: true}
+		cache.mu.Unlock()
 		return nil, false
 	}
 	targetsByAgent, ok := h.loadInvocationTargetsByAgent(ctx, agents)
 	if !ok {
+		cache.mu.Lock()
+		cache.m[key] = agentAccessCacheEntry{allowed: nil, ok: false, computed: true}
+		cache.mu.Unlock()
 		return nil, false
 	}
 	allowed := make(map[string]struct{}, len(agents))
@@ -323,6 +370,10 @@ func (h *Handler) accessibleAgentIDs(ctx context.Context, workspaceID, actorType
 		}
 		allowed[uuidToString(a.ID)] = struct{}{}
 	}
+
+	cache.mu.Lock()
+	cache.m[key] = agentAccessCacheEntry{allowed: allowed, ok: true, computed: true}
+	cache.mu.Unlock()
 	return allowed, true
 }
 
