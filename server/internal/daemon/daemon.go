@@ -6004,6 +6004,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			taskLog.Warn("report task usage failed", "error", usageErr)
 		}
 	}
+	// S1-B (M-110): write the usage summary and session_ref back to moct-be.
+	// Never blocking: moct-be down/timeout/5xx logs a warning and continues.
+	moctRecordUsage(finalCtx, d.cfg.MoctBaseURL, task, result.SessionID, result.Usage, taskLog)
 
 	// Check if we were cancelled by the polling goroutine.
 	select {
