@@ -299,6 +299,15 @@ func resetWorkspaceSlugCache() {
 	workspaceSlugCache.m = map[string]slugCacheEntry{}
 }
 
+// InvalidateWorkspaceSlug drops a cached slug→UUID entry. Call when a
+// workspace with that slug is deleted or recreated so stale UUIDs are
+// never served.
+func InvalidateWorkspaceSlug(slug string) {
+	workspaceSlugCache.mu.Lock()
+	defer workspaceSlugCache.mu.Unlock()
+	delete(workspaceSlugCache.m, slug)
+}
+
 // ResolveWorkspaceSlug resolves a workspace slug to its UUID, using an
 // in-process cache (5 min hit TTL, few-second miss TTL). It is the single
 // slug→UUID resolver shared by the middleware, task-token checks, and the

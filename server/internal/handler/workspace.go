@@ -19,6 +19,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/util"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -1152,6 +1154,14 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 	if requester.Role != "owner" {
 		writeError(w, http.StatusForbidden, "insufficient permissions")
 		return
+	}
+
+	// Invalidate the slug→UUID cache for this workspace so a later
+	// workspace created with the same slug resolves to the new UUID.
+	if wsUUID, err := util.ParseUUID(workspaceID); err == nil {
+		if ws, err := h.Queries.GetWorkspace(r.Context(), wsUUID); err == nil {
+			middleware.InvalidateWorkspaceSlug(ws.Slug)
+		}
 	}
 
 	// Stop remote work before deleting the only durable session journal.
