@@ -292,6 +292,8 @@ func cardToResponse(c db.AgentQuestionCard) cardResponse {
 // callerRunningIssueTask resolves the task token's task and refuses anything
 // that is not the caller's own RUNNING issue task in the URL workspace. An
 // agent may only park itself, and only while it is executing.
+// taskInPath is false for plan section writes and submits, whose routes carry
+// only planId; plan ownership is checked by those handlers after this check.
 func (h *Handler) callerRunningIssueTask(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID, taskInPath bool) (db.AgentTaskQueue, bool) {
 	task, ok := h.taskFromRequestHeader(r)
 	if !ok {

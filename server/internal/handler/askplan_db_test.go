@@ -159,6 +159,68 @@ func TestAnswerQuestionCardEnqueuesResumeTask(t *testing.T) {
 	).Want(http.StatusConflict)
 }
 
+// taskTokenRequestWithoutPathTask builds the request the router actually
+// produces for the plan routes that carry no taskId segment
+// (PUT /plans/{planId}/sections, POST /plans/{planId}/submit): the token's own
+// task is the only identity in play.
+func taskTokenRequestWithoutPathTask(t *testing.T, f askPlanFixture, method, path string, body any) *http.Request {
+	t.Helper()
+	req := newRequest(method, path, body)
+	req.Header.Set("X-Task-ID", f.taskID)
+	req.Header.Set("X-Agent-ID", f.agentID)
+	req.Header.Set("X-Actor-Source", "task_token")
+	// "id" is the workspace in the router; "planId" is the plan. No "taskId":
+	// those routes do not declare that param.
+	return withURLParams(req, "id", testWorkspaceID)
+}
+
+// Production registers the plan write and submit routes without a taskId URL
+// param. Before this guard the handler demanded one anyway and answered every
+// agent write and submit with 400 "invalid task_id", so no agent could ever
+// submit a plan; the older tests injected taskId by hand and hid it.
+func TestPlanWriteAndSubmitWorkWithoutTaskIDPathParam(t *testing.T) {
+	f := newAskPlanFixture(t)
+	var created planResponse
+	testutil.Call(t, testHandler.CreatePlan,
+		agentAskRequest(t, f, http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/tasks/"+f.taskID+"/plans", map[string]any{
+			"title": "Release plan", "outline": []string{"Goal"},
+		}),
+	).Want(http.StatusCreated).JSON(&created)
+
+	writeReq := taskTokenRequestWithoutPathTask(t, f, http.MethodPut,
+		"/api/workspaces/"+testWorkspaceID+"/plans/"+created.ID+"/sections",
+		map[string]any{
+			"base_revision": created.Revision,
+			"section":       map[string]any{"section_id": "s1", "heading": "Goal", "markdown": "Ship it"},
+		})
+	writeReq = withURLParams(writeReq, "planId", created.ID)
+	var written planResponse
+	testutil.Call(t, testHandler.WritePlanSection, writeReq).Want(http.StatusOK).JSON(&written)
+	if written.Revision != created.Revision+1 {
+		t.Fatalf("revision = %d, want %d", written.Revision, created.Revision+1)
+	}
+
+	submitReq := taskTokenRequestWithoutPathTask(t, f, http.MethodPost,
+		"/api/workspaces/"+testWorkspaceID+"/plans/"+created.ID+"/submit",
+		map[string]any{"revision": written.Revision})
+	submitReq = withURLParams(submitReq, "planId", created.ID)
+	testutil.Call(t, testHandler.SubmitPlan, submitReq).Want(http.StatusAccepted)
+
+	// Submitting parks the run, which is what makes the verdict resume it.
+	if status := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE id=$1 AND status='blocked'`, f.taskID); status != 1 {
+		t.Fatalf("task not parked as blocked after submit")
+	}
+}
+
+// A path task that disagrees with the token is still a refusal, param or not.
+func TestAskRouteRefusesMismatchedPathTask(t *testing.T) {
+	f := newAskPlanFixture(t)
+	req := taskTokenRequestWithoutPathTask(t, f, http.MethodPost,
+		"/api/workspaces/"+testWorkspaceID+"/tasks/"+f.taskID+"/ask", validAskBody())
+	req = withURLParams(req, "taskId", "99999999-9999-4999-8999-999999999999")
+	testutil.Call(t, testHandler.SubmitAsk, req).Want(http.StatusForbidden)
+}
+
 func TestPlanCreateGateRefusesNonPlanningIssue(t *testing.T) {
 	f := newAskPlanFixture(t)
 	dbfx.Exec(t, `UPDATE issue SET status='in_progress' WHERE id=$1`, f.issueID)
