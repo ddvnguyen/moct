@@ -622,10 +622,26 @@ log "phase 11: lane web"
 if [ -n "${DSH_Z_WEB_UNIT:-}" ]; then
   if [ -f "$LANE_ROOT/data/.plugin-changed" ]; then
     systemctl --user restart "$DSH_Z_WEB_UNIT"
+    # Resolve the unit's actual bind address/port from ExecStart (lane z binds
+    # the podman bridge, not loopback); fall back to 127.0.0.1:3180.
+    if [ -z "${WEB_UNIT_FILE:-}" ]; then
+      WEB_UNIT_FILE=""
+      for web_unit_candidate in \
+        "$REAL_HOME/.config/systemd/user/$DSH_Z_WEB_UNIT" \
+        "/etc/systemd/user/$DSH_Z_WEB_UNIT" \
+        "$REAL_HOME/.local/share/systemd/user/$DSH_Z_WEB_UNIT"; do
+        if [ -f "$web_unit_candidate" ]; then WEB_UNIT_FILE="$web_unit_candidate"; break; fi
+      done
+    fi
+    WEB_HOST="$(sed -n 's/^ExecStart=.*--host \([^ ]*\).*/\1/p' "$WEB_UNIT_FILE" 2>/dev/null | head -1)"
+    [ -n "$WEB_HOST" ] || WEB_HOST="127.0.0.1"
+    WEB_PORT="$(sed -n 's/^ExecStart=.*--port \([^ ]*\).*/\1/p' "$WEB_UNIT_FILE" 2>/dev/null | head -1)"
+    [ -n "$WEB_PORT" ] || WEB_PORT="3180"
+    WEB_URL="http://$WEB_HOST:$WEB_PORT/"
     # wait_http on the web root: the shell must answer before acceptance opens it
-    wait_http "http://127.0.0.1:3180/" 60 '' \
-      || { journalctl --user -u "$DSH_Z_WEB_UNIT" -n 30 --no-pager >&2; die "lane web http://127.0.0.1:3180/ did not come up"; }
-    log "lane web up on http://127.0.0.1:3180/ (unit $DSH_Z_WEB_UNIT, profile web, multica row patch applied)"
+    wait_http "$WEB_URL" 60 '' \
+      || { journalctl --user -u "$DSH_Z_WEB_UNIT" -n 30 --no-pager >&2; die "lane web $WEB_URL did not come up"; }
+    log "lane web up on $WEB_URL (unit $DSH_Z_WEB_UNIT, profile web, multica row patch applied)"
     rm -f "$LANE_ROOT/data/.plugin-changed"
   else
     log "phase 11: plugin bundle unchanged; not restarting $DSH_Z_WEB_UNIT"
@@ -641,5 +657,5 @@ log "  postgres       $MULTICA_Z_DB_ROLE @ 127.0.0.1:$MULTICA_Z_DB_PORT/$MULTICA
 log "  moct-be z      http://127.0.0.1:$MOCT_BE_Z_PORT  (unit $MOCT_BE_Z_UNIT, db $MOCT_Z_DB_PATH)"
 log "  lane daemon    profile $MULTICA_Z_PROFILE, home $LANE_HOME (unit $MULTICA_DAEMON_Z_UNIT)"
 log "  workspace      $MULTICA_Z_WS_SLUG = $MULTICA_Z_WORKSPACE_ID"
-log "  lane web       http://127.0.0.1:3180/ (unit ${DSH_Z_WEB_UNIT:-manual}, multica plugin row)"
+log "  lane web       ${WEB_URL:-http://127.0.0.1:3180/} (unit ${DSH_Z_WEB_UNIT:-manual}, multica plugin row)"
 log "done"
