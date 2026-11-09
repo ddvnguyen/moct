@@ -320,6 +320,22 @@ func TestTurnEndRouterSettings_Mode(t *testing.T) {
 	if initial.Mode != "shadow" || initial.ModeSet {
 		t.Fatalf("initial setting = %+v, want default shadow and unset", initial)
 	}
+	if initial.ShadowWouldQueue24h != 0 || len(initial.RunsByReasonDestination24h) != 0 || len(initial.RunsPerIssue24h) != 0 || len(initial.RunsPerIssue7d) != 0 {
+		t.Fatalf("initial router metrics = %+v, want zero counts and initialized histograms", initial)
+	}
+	if _, err := testPool.Exec(context.Background(), `INSERT INTO activity_log(workspace_id,actor_type,action,details)
+		VALUES($1,'system','turn_end_router_shadow','{"reason":"run_failed","destination":"orchestrator"}')`, fx.WorkspaceID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM activity_log WHERE workspace_id=$1 AND action='turn_end_router_shadow'`, fx.WorkspaceID)
+	})
+	var shadow TurnEndRouterSettingsResponse
+	testutil.Call(t, testHandler.GetTurnEndRouterSettings,
+		interactionsRequest(t, "GET", path, fx.WorkspaceID, nil)).Want(http.StatusOK).JSON(&shadow)
+	if shadow.ShadowWouldQueue24h != 1 {
+		t.Fatalf("shadow decisions = %d, want 1", shadow.ShadowWouldQueue24h)
+	}
 
 	var enabled TurnEndRouterSettingsResponse
 	testutil.Call(t, testHandler.UpdateTurnEndRouterSettings,

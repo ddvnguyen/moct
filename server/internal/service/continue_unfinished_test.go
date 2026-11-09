@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +28,16 @@ func continueFixture(t *testing.T, status string) (principalFixture, *TaskServic
 	}
 	issue := f.Issue(t, "Continuation test", testutil.Cols{"status": status})
 	agent := f.privateAgentOwnedBy(t, owner, "cont")
+	quotaLedger := fmt.Sprintf(`{"rows":[{"tier":"tick","state":"ok","agents":["%s"]}]}`, agent)
+	quotaSeats := fmt.Sprintf(`{"lead":["%s"],"architect":["%s"]}`, agent, agent)
+	metadata, err := json.Marshal(map[string]string{"quota_ledger": quotaLedger, "quota_seats": quotaSeats})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Issue(t, "Router quota ledger", testutil.Cols{
+		"number":   86,
+		"metadata": testutil.Raw("'" + string(metadata) + "'::jsonb"),
+	})
 	f.Exec(t, "UPDATE issue SET assignee_type='agent',assignee_id=$1 WHERE id=$2", agent, issue)
 	f.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id=$1", issue)
 	f.Cleanup(t, "DELETE FROM comment WHERE issue_id=$1", issue)
@@ -72,8 +84,18 @@ func TestContinuationReminderMatchesOutcome(t *testing.T) {
 	if !strings.Contains(queued, "queued") {
 		t.Fatalf("queued reminder = %q, want queued outcome", queued)
 	}
-	if strings.Contains(suppressed, "will be queued") || !strings.Contains(suppressed, "No continuation was queued") {
+	if strings.Contains(suppressed, "will be queued") || !strings.Contains(suppressed, "No follow-up was queued") {
 		t.Fatalf("suppressed reminder = %q, must describe suppression", suppressed)
+	}
+	for outcome, want := range map[string]string{
+		"queued:orchestrator": "Orchestrator",
+		"queued:leader":       "Leader",
+		"queued:architect":    "Architect",
+		"shadow:would_queue":  "no follow-up run was queued",
+	} {
+		if reminder := ContinuationReminderForOutcome(outcome); !strings.Contains(strings.ToLower(reminder), strings.ToLower(want)) {
+			t.Errorf("%s reminder = %q, want %q", outcome, reminder, want)
+		}
 	}
 }
 
@@ -222,69 +244,175 @@ func TestContinueUnfinishedSwitchOffQueuesNothing(t *testing.T) {
 	}
 }
 
-func TestContinueUnfinishedCapAndNoProgressBlock(t *testing.T) {
+func TestSilentContinuationsEscalateWithoutChangingIssueStatus(t *testing.T) {
 	ctx := context.Background()
 	f, svc, issue, agent := continueFixture(t, "in_progress")
-	first := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
-
-	// Queue cap-many continuations, marking each completed WITH progress (a
-	// comment) so the guard lets the chain grow to the cap.
-	prev := first
-	for range maxContinuationsPerEpisode {
+	prev := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
+	for i := 1; i <= maxSilentContinuationsPerEpisode; i++ {
 		d := svc.DecideContinueUnfinishedStep(ctx, prev)
-		if d.Outcome != "queued" {
-			t.Fatalf("continuation decision = %q, want queued", d.Outcome)
+		if d.Outcome != "queued" || d.ContinuationID == "" {
+			t.Fatalf("silent exit %d decision = %+v, want queued continuation", i, d)
 		}
-		if d.ContinuationID == "" {
-			t.Fatal("queued continuation has no id")
-		}
-		f.Comment(t, util.UUIDToString(issue), "progress note")
-		f.Exec(t, "UPDATE agent_task_queue SET created_at=now()-interval '7 minutes',started_at=now()-interval '6 minutes',status='completed',completed_at=now(),result='null' WHERE id=$1", d.ContinuationID)
-		updated, err := f.q.GetAgentTask(ctx, parseTestUUID(t, d.ContinuationID))
+		f.Exec(t, "UPDATE agent_task_queue SET created_at=now()-interval '3 minutes',started_at=now()-interval '4 minutes',status='completed',completed_at=now(),result='null' WHERE id=$1", d.ContinuationID)
+		var err error
+		prev, err = f.q.GetAgentTask(ctx, parseTestUUID(t, d.ContinuationID))
 		if err != nil {
 			t.Fatal(err)
 		}
-		prev = updated
 	}
-	// The cap is reached: one more quiet completion queues nothing.
 	d := svc.DecideContinueUnfinishedStep(ctx, prev)
-	if d.Outcome == "queued" {
-		t.Fatalf("cap reached but still queued %s", d.ContinuationID)
+	if d.Outcome != "queued:orchestrator" {
+		t.Fatalf("third silent exit = %q, want queued:orchestrator", d.Outcome)
 	}
-	if d.Outcome != "suppressed:cap_reached" {
-		t.Fatalf("outcome = %q, want suppressed:cap_reached", d.Outcome)
+	var status string
+	if err := f.Pool.QueryRow(ctx, "SELECT status FROM issue WHERE id=$1", issue).Scan(&status); err != nil {
+		t.Fatal(err)
 	}
-
-	// No-progress guard on a fresh issue: first continuation quiet, second
-	// decision blocks instead of queueing a second continuation.
-	f2, svc2, issue2, agent2 := continueFixture(t, "in_progress")
-	opening := continueCompletedRun(t, f2, issue2, agent2, "in_progress", pgtype.UUID{}, pgtype.UUID{})
-	d1 := svc2.DecideContinueUnfinishedStep(ctx, opening)
-	if d1.Outcome != "queued" {
-		t.Fatalf("first decision = %q, want queued", d1.Outcome)
+	if status != "in_progress" {
+		t.Fatalf("issue status = %q, want unchanged in_progress", status)
 	}
-	f2.Exec(t, "UPDATE agent_task_queue SET created_at=now()-interval '7 minutes',started_at=now()-interval '6 minutes',status='completed',completed_at=now(),result='null' WHERE id=$1", d1.ContinuationID)
-	quiet, err := f2.q.GetAgentTask(ctx, parseTestUUID(t, d1.ContinuationID))
+	orchestratorID := d.ContinuationID
+	f.Exec(t, "UPDATE agent_task_queue SET created_at=now()-interval '3 minutes',started_at=now()-interval '4 minutes',status='completed',completed_at=now(),result='null' WHERE id=$1", orchestratorID)
+	orchestrator, err := f.q.GetAgentTask(ctx, parseTestUUID(t, orchestratorID))
 	if err != nil {
 		t.Fatal(err)
 	}
-	d2 := svc2.DecideContinueUnfinishedStep(ctx, quiet)
-	if d2.Outcome != "no_progress_blocked" {
-		t.Fatalf("outcome = %q, want no_progress_blocked", d2.Outcome)
+	d = svc.DecideContinueUnfinishedStep(ctx, orchestrator)
+	if d.Outcome != "queued:leader" {
+		t.Fatalf("silent Orchestrator outcome = %q, want queued:leader", d.Outcome)
 	}
-	var status string
-	if err := f2.Pool.QueryRow(ctx, "SELECT status FROM issue WHERE id=$1", issue2).Scan(&status); err != nil {
+	leaderID := d.ContinuationID
+	f.Exec(t, "UPDATE agent_task_queue SET created_at=now()-interval '3 minutes',started_at=now()-interval '4 minutes',status='completed',completed_at=now(),result='null' WHERE id=$1", leaderID)
+	leader, err := f.q.GetAgentTask(ctx, parseTestUUID(t, leaderID))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if status != "blocked" {
-		t.Fatalf("issue status = %q, want blocked", status)
+	d = svc.DecideContinueUnfinishedStep(ctx, leader)
+	if d.Outcome != "audit:leader_no_progress" {
+		t.Fatalf("silent Leader outcome = %q, want audit", d.Outcome)
 	}
-	if got := f2.Count(t, "SELECT count(*) FROM comment WHERE issue_id=$1 AND author_type='system' AND content LIKE 'Continuation stopped%'", issue2); got != 1 {
-		t.Fatalf("no-progress system comments = %d, want 1", got)
+	if got := f.Count(t, "SELECT count(*) FROM comment WHERE issue_id=$1 AND content LIKE 'Turn-end router stopped%'", issue); got != 1 {
+		t.Fatalf("router exhaustion audit comments = %d, want 1", got)
 	}
-	if got := continuePendingCount(t, f2, issue2); got != 0 {
-		t.Fatalf("blocked issue still has %d pending tasks, want 0", got)
+}
+
+func TestFailedRunRoutesToOrchestrator(t *testing.T) {
+	f, svc, issue, agent := continueFixture(t, "in_progress")
+	task := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
+	task.Status = "failed"
+
+	d := svc.DecideFailedIssueRun(context.Background(), task)
+	if d.Outcome != "queued:orchestrator" {
+		t.Fatalf("failed-run outcome = %q, want queued:orchestrator", d.Outcome)
 	}
+	if got := continuePendingCount(t, f, issue); got != 1 {
+		t.Fatalf("pending tasks after failure = %d, want one Orchestrator task", got)
+	}
+}
+
+func TestRunWithoutWorkflowStepUsesCurrentIssueStep(t *testing.T) {
+	f, svc, issue, agent := continueFixture(t, "in_progress")
+	task := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
+	task.WorkflowStep = pgtype.Text{}
+
+	d := svc.DecideContinueUnfinishedStep(context.Background(), task)
+	if d.Outcome != "queued" {
+		t.Fatalf("no-step run outcome = %q, want continuation bound to current issue step", d.Outcome)
+	}
+}
+
+func TestShadowModeRecordsDecisionWithoutQueueing(t *testing.T) {
+	f, svc, issue, agent := continueFixture(t, "in_progress")
+	if _, err := f.q.SetWorkspaceSetting(context.Background(), db.SetWorkspaceSettingParams{
+		ID: parseTestUUID(t, f.WorkspaceID), Key: "turn_end_router_mode", Value: []byte(`"shadow"`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	task := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
+	d := svc.DecideFailedIssueRun(context.Background(), task)
+	if d.Outcome != "shadow:would_queue" {
+		t.Fatalf("shadow failure outcome = %q, want shadow:would_queue", d.Outcome)
+	}
+	if got := continuePendingCount(t, f, issue); got != 0 {
+		t.Fatalf("shadow mode queued %d tasks, want none", got)
+	}
+	if got := f.Count(t, "SELECT count(*) FROM activity_log WHERE issue_id=$1 AND action='turn_end_router_shadow'", issue); got != 1 {
+		t.Fatalf("persisted shadow decisions = %d, want 1", got)
+	}
+}
+
+func TestTurnEndRouterDedupesRecentRunAndDailyCap(t *testing.T) {
+	t.Run("recent run", func(t *testing.T) {
+		f, svc, issue, agent := continueFixture(t, "in_progress")
+		seedID := seedTurnEndRouterRun(t, f, issue, agent, "continuation", "seed")
+		f.Exec(t, "UPDATE agent_task_queue SET created_at=now()-interval '1 minute' WHERE id=$1", seedID)
+		task := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
+		if d := svc.DecideContinueUnfinishedStep(context.Background(), task); d.Outcome != "suppressed:dedupe_2m" {
+			t.Fatalf("recent duplicate outcome = %q", d.Outcome)
+		}
+	})
+	t.Run("daily cap", func(t *testing.T) {
+		f, svc, issue, agent := continueFixture(t, "in_progress")
+		for i := 0; i < maxDerivedRunsPerIssue24h; i++ {
+			seedTurnEndRouterRun(t, f, issue, agent, "continuation", fmt.Sprintf("seed-%d", i))
+		}
+		task := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
+		if d := svc.DecideContinueUnfinishedStep(context.Background(), task); d.Outcome != "suppressed:daily_cap" {
+			t.Fatalf("daily-cap outcome = %q", d.Outcome)
+		}
+	})
+}
+
+func TestGreenPullRequestRoutesArchitectOrArmsWakeup(t *testing.T) {
+	for _, connected := range []bool{false, true} {
+		t.Run(fmt.Sprintf("github app connected=%t", connected), func(t *testing.T) {
+			f, svc, issue, agent := continueFixture(t, "in_progress")
+			pr := f.Insert(t, "github_pull_request", testutil.Cols{
+				"workspace_id": f.WorkspaceID, "installation_id": 987654321,
+				"repo_owner": "fixture", "repo_name": "router", "pr_number": 41,
+				"title": "Green PR", "state": "open", "html_url": "https://example.test/pr/41",
+				"pr_created_at": testutil.Raw("now() - interval '1 hour'"), "pr_updated_at": testutil.Raw("now()"),
+				"head_sha": "head-1", "snapshot_head_sha": "head-1", "checks_rollup_state": "SUCCESS",
+			})
+			f.Cleanup(t, "DELETE FROM issue_pull_request WHERE pull_request_id=$1", pr)
+			f.Exec(t, "INSERT INTO issue_pull_request(issue_id,pull_request_id) VALUES($1,$2)", issue, pr)
+			f.Cleanup(t, "DELETE FROM github_pull_request_check_run WHERE pr_id=$1", pr)
+			f.Exec(t, `INSERT INTO github_pull_request_check_run(pr_id,head_sha,ordinal,name,status,conclusion)
+				VALUES($1,'head-1',1,'ci','completed','success')`, pr)
+			if connected {
+				f.Insert(t, "github_installation", testutil.Cols{
+					"workspace_id": f.WorkspaceID, "installation_id": 987654321,
+					"account_login": "fixture", "account_type": "Organization",
+				})
+			}
+			task := continueCompletedRun(t, f, issue, agent, "in_progress", pgtype.UUID{}, pgtype.UUID{})
+			d := svc.DecideContinueUnfinishedStep(context.Background(), task)
+			if connected && d.Outcome != "queued:architect" {
+				t.Fatalf("connected PR review outcome = %q, want queued:architect", d.Outcome)
+			}
+			if !connected && d.Outcome != "wakeup:pr_checks" {
+				t.Fatalf("fallback PR review outcome = %q, want wakeup:pr_checks", d.Outcome)
+			}
+		})
+	}
+}
+
+func seedTurnEndRouterRun(t *testing.T, f principalFixture, issue pgtype.UUID, agent, destination, stateHash string) string {
+	t.Helper()
+	id := f.Task(t, agent, testutil.Cols{
+		"issue_id":      util.UUIDToString(issue),
+		"runtime_id":    testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agent + "')"),
+		"status":        "completed",
+		"created_at":    testutil.Raw("now() - interval '3 minutes'"),
+		"workflow_step": "in_progress",
+	})
+	if err := f.q.SetTaskTurnEndRouterContext(context.Background(), db.SetTaskTurnEndRouterContextParams{
+		ID: parseTestUUID(t, id), Reason: "seed", Destination: destination, StateHash: stateHash,
+		BaselineStatus: "in_progress", BaselineCommentCount: 0, BaselineHeadSha: "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func TestContinueUnfinishedRacesWakeupDispatch(t *testing.T) {

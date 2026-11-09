@@ -400,12 +400,43 @@ SET context = COALESCE(context, '{}'::jsonb) || jsonb_build_object(
     'turn_end_router', jsonb_build_object(
         'origin', 'derived',
         'reason', sqlc.arg('reason')::text,
+        'destination', sqlc.arg('destination')::text,
+        'state_hash', sqlc.arg('state_hash')::text,
         'baseline_status', sqlc.arg('baseline_status')::text,
         'baseline_comment_count', sqlc.arg('baseline_comment_count')::bigint,
         'baseline_head_sha', sqlc.arg('baseline_head_sha')::text
     )
 )
 WHERE id = sqlc.arg('id');
+
+-- name: HasTurnEndRouterStateHash :one
+-- Dedupe a repeated role handoff for the same state, while allowing escalation
+-- from a continuation to the Orchestrator and then to the Leader on that state.
+SELECT EXISTS (
+    SELECT 1 FROM agent_task_queue
+    WHERE issue_id = sqlc.arg('issue_id')
+      AND context -> 'turn_end_router' ->> 'origin' = 'derived'
+      AND context -> 'turn_end_router' ->> 'state_hash' = sqlc.arg('state_hash')::text
+      AND context -> 'turn_end_router' ->> 'destination' = sqlc.arg('destination')::text
+) AS exists;
+
+-- name: HasTurnEndRouterReviewForHead :one
+SELECT EXISTS (
+    SELECT 1 FROM agent_task_queue
+    WHERE issue_id = sqlc.arg('issue_id')
+      AND context -> 'turn_end_router' ->> 'origin' = 'derived'
+      AND context -> 'turn_end_router' ->> 'destination' = 'architect'
+      AND context -> 'turn_end_router' ->> 'baseline_head_sha' = sqlc.arg('head_sha')::text
+) AS exists;
+
+-- name: HasTurnEndRouterPRWakeup :one
+SELECT EXISTS (
+    SELECT 1 FROM issue_wakeup
+    WHERE issue_id = sqlc.arg('issue_id') AND agent_id = sqlc.arg('agent_id')
+      AND enabled AND disabled_at IS NULL
+      AND condition ->> 'type' = 'pull_request'
+      AND condition ->> 'event' = 'checks_finished'
+) AS exists;
 
 -- name: SetTaskTurnEndRouterProductive :exec
 UPDATE agent_task_queue
@@ -422,6 +453,7 @@ WHERE id = sqlc.arg('id')
 SELECT count(*)::bigint
 FROM agent_task_queue
 WHERE issue_id = sqlc.arg('issue_id')
+  AND id <> sqlc.arg('source_task_id')
   AND context -> 'turn_end_router' ->> 'origin' = 'derived'
   AND created_at >= now() - interval '2 minutes';
 
@@ -434,6 +466,40 @@ FROM agent_task_queue
 WHERE issue_id = sqlc.arg('issue_id')
   AND context -> 'turn_end_router' ->> 'origin' = 'derived'
   AND created_at >= now() - interval '24 hours';
+
+-- name: ListTurnEndRouterReasonMetrics :many
+SELECT COALESCE(context -> 'turn_end_router' ->> 'reason', '')::text AS reason,
+       COALESCE(context -> 'turn_end_router' ->> 'destination', '')::text AS destination,
+       count(*)::bigint AS run_count,
+       count(*) FILTER (WHERE (context -> 'turn_end_router' ->> 'productive')::boolean = true)::bigint AS productive_count
+FROM agent_task_queue task
+JOIN issue i ON i.id = task.issue_id
+WHERE i.workspace_id = sqlc.arg('workspace_id')
+  AND context -> 'turn_end_router' ->> 'origin' = 'derived'
+  AND task.created_at >= sqlc.arg('since')::timestamptz
+GROUP BY reason, destination
+ORDER BY reason, destination;
+
+-- name: ListTurnEndRouterIssueRunHistogram :many
+SELECT run_count::bigint AS runs_per_issue, count(*)::bigint AS issue_count
+FROM (
+    SELECT task.issue_id, count(*) AS run_count
+    FROM agent_task_queue task
+    JOIN issue i ON i.id = task.issue_id
+    WHERE i.workspace_id = sqlc.arg('workspace_id')
+      AND task.context -> 'turn_end_router' ->> 'origin' = 'derived'
+      AND task.created_at >= sqlc.arg('since')::timestamptz
+    GROUP BY task.issue_id
+) per_issue
+GROUP BY run_count
+ORDER BY run_count;
+
+-- name: CountTurnEndRouterShadowWouldQueueSince :one
+SELECT count(*)::bigint
+FROM activity_log
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND action = 'turn_end_router_shadow'
+  AND created_at >= sqlc.arg('since')::timestamptz;
 
 -- name: CountWorkspaceTurnEndRouterRunsSince :one
 SELECT count(*)::bigint AS run_count,
@@ -1893,6 +1959,14 @@ WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_l
 -- task already exists (natural dedup).
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
 WHERE context->>'wakeup_id' IS NULL AND issue_id = $1 AND status IN ('queued', 'dispatched');
+
+-- name: HasActiveTurnEndRouterTaskForIssue :one
+SELECT EXISTS (
+    SELECT 1 FROM agent_task_queue
+    WHERE issue_id = sqlc.arg('issue_id')
+      AND id <> sqlc.arg('source_task_id')
+      AND status IN ('queued','deferred','dispatched','running','waiting_local_directory')
+) AS exists;
 
 -- name: HasPendingTaskForIssueAndAgent :one
 -- Returns true if a specific agent already has a queued or dispatched task

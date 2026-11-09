@@ -16,16 +16,14 @@ import (
 	"log/slog"
 )
 
-// Continuation policy (M-279). A handed-off run that ends "ok" without moving
-// the issue or arming a wakeup gets follow-up runs instead of sitting idle:
-// at most maxContinuationsPerEpisode continuations per (issue, step episode),
-// each deferred by continuationDelay. A continuation that produces no new
-// comment, PR link, or status change stops the chain: the issue moves to
-// blocked with a system comment naming the runs. Returning to a status starts
-// a fresh episode, bounded by the latest activity entering that status.
+// Continuation policy (M-279/M-300). A handed-off run that ends "ok" without
+// moving the issue or arming a wakeup gets up to two silent continuations in a
+// status episode, each deferred by continuationDelay. Continued silence then
+// routes to the Orchestrator; it never changes the issue's status.
 const (
-	maxContinuationsPerEpisode = 3
-	continuationDelay          = 2 * time.Minute
+	maxSilentContinuationsPerEpisode = 2
+	maxDerivedRunsPerIssue24h        = 6
+	continuationDelay                = 2 * time.Minute
 )
 
 // continuationHandoffNote is the one line every continuation run reads. It
@@ -38,14 +36,14 @@ const continuationHandoffNote = "Your previous run ended without moving the issu
 // task is pending, it queues a single continuation run (deferred by
 // continuationDelay). Otherwise it is a no-op. Outcome counters ride the slog
 // lines the Architect asked for (M-279 verdict item 1): continuation_queued /
-// suppressed / no_progress_blocked. Failures are logged, never returned to the
+// suppressed / routed. Failures are logged, never returned to the
 // caller. The signature stays stable: M-291 builds on it.
 func (s *TaskService) MaybeContinueUnfinishedStep(ctx context.Context, task db.AgentTaskQueue) {
-	s.decideContinueUnfinished(ctx, task)
+	s.decideTurnEndRouter(ctx, task, false)
 }
 
 // ContinuationDecision is the hook's decision for one completed run: the
-// outcome (queued / no_progress_blocked / suppressed:<clause> / skipped:<fast
+// outcome (queued / queued:<role> / suppressed:<clause> / skipped:<fast
 // precheck>) plus the reminder text for run-end surfaces. Reminder is set
 // exactly when the run left its handed-off step without a status move or
 // wakeup AND the hook queued nothing behind it (suppressed or failed): that
@@ -60,25 +58,43 @@ type ContinuationDecision struct {
 // DecideContinueUnfinishedStep runs the hook and reports what it did, for
 // run-end surfaces (CLI status/update, daemon completion logging).
 func (s *TaskService) DecideContinueUnfinishedStep(ctx context.Context, task db.AgentTaskQueue) ContinuationDecision {
-	return s.decideContinueUnfinished(ctx, task)
+	return s.decideTurnEndRouter(ctx, task, false)
+}
+
+// DecideFailedIssueRun routes a terminal failed issue task to the Orchestrator
+// after the task's retry transaction has committed. A pending retry suppresses
+// the route through the same pending-task guard as clean completion.
+func (s *TaskService) DecideFailedIssueRun(ctx context.Context, task db.AgentTaskQueue) ContinuationDecision {
+	return s.decideTurnEndRouter(ctx, task, true)
 }
 
 // decideContinueUnfinished holds the shared fast prechecks, transaction, and
 // outcome logging.
-func (s *TaskService) decideContinueUnfinished(ctx context.Context, task db.AgentTaskQueue) ContinuationDecision {
+func (s *TaskService) decideTurnEndRouter(ctx context.Context, task db.AgentTaskQueue, failed bool) ContinuationDecision {
 	if task.IssueID.Valid {
 		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
 			s.recordTurnEndRouterProductivity(ctx, task, issue)
 		}
 	}
-	if !task.WorkflowStep.Valid || task.WorkflowStep.String == "" {
+	step := ""
+	if task.WorkflowStep.Valid {
+		step = task.WorkflowStep.String
+	}
+	if step == "" && task.IssueID.Valid {
+		// Wakeup and comment-triggered runs may not carry a workflow_step. Bind
+		// their turn-end decision to the issue's current status at completion.
+		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
+			step = issue.Status
+		}
+	}
+	if step == "" {
 		return ContinuationDecision{Outcome: "skipped:no_step"}
 	}
-	if task.IsLeaderTask || task.SquadID.Valid {
+	_, routerDestination := turnEndRouterTaskRouting(task)
+	if task.SquadID.Valid || (task.IsLeaderTask && routerDestination != "leader") {
 		// squad runs belong to the leader/member protocol, not to this hook.
 		return ContinuationDecision{Outcome: "skipped:squad"}
 	}
-	step := task.WorkflowStep.String
 	switch step {
 	case "done", "cancelled", "in_review", "wait_for_decision", "blocked":
 		return ContinuationDecision{Outcome: "skipped:terminal_step"}
@@ -86,7 +102,7 @@ func (s *TaskService) decideContinueUnfinished(ctx context.Context, task db.Agen
 	var outcome, continuationID string
 	err := s.runInTx(ctx, func(qtx *db.Queries) error {
 		var err error
-		outcome, continuationID, err = s.continueUnfinishedInTx(ctx, qtx, task, step)
+		outcome, continuationID, err = s.continueUnfinishedInTx(ctx, qtx, task, step, failed)
 		return err
 	})
 	if err != nil {
@@ -98,9 +114,6 @@ func (s *TaskService) decideContinueUnfinished(ctx context.Context, task db.Agen
 	case "queued":
 		d.Reminder = ContinuationReminderForOutcome(outcome)
 		slog.Info("continue-unfinished: queued continuation", "task_id", util.UUIDToString(task.ID), "continuation", continuationID, "metric", "continuation_queued")
-	case "no_progress_blocked":
-		d.Reminder = ContinuationReminderForOutcome(outcome)
-		slog.Info("continue-unfinished: no progress, issue blocked", "task_id", util.UUIDToString(task.ID), "metric", "no_progress_blocked")
 	default:
 		slog.Info("continue-unfinished: suppressed", "task_id", util.UUIDToString(task.ID), "reason", outcome, "metric", "continuation_suppressed")
 		d.Reminder = ContinuationReminderForOutcome(outcome)
@@ -112,9 +125,9 @@ func (s *TaskService) decideContinueUnfinished(ctx context.Context, task db.Agen
 // takes the issue row FOR NO KEY UPDATE, so a concurrent wakeup dispatch or a
 // second completion sees the continuation task or the blocked status before
 // deciding — exactly one follow-up wins the race. Returns (outcome,
-// continuationID, nil) with outcome queued / no_progress_blocked /
+// continuationID, nil) with outcome queued / queued:<role> /
 // suppressed:<clause>.
-func (s *TaskService) continueUnfinishedInTx(ctx context.Context, qtx *db.Queries, task db.AgentTaskQueue, step string) (string, string, error) {
+func (s *TaskService) continueUnfinishedInTx(ctx context.Context, qtx *db.Queries, task db.AgentTaskQueue, step string, failed bool) (string, string, error) {
 	issue, err := qtx.LockWakeupIssue(ctx, task.IssueID)
 	if err != nil {
 		return "", "", fmt.Errorf("lock issue: %w", err)
@@ -130,10 +143,11 @@ func (s *TaskService) continueUnfinishedInTx(ctx context.Context, qtx *db.Querie
 	if mode == "off" {
 		return "suppressed:mode_off", "", nil
 	}
-	if !issue.AssigneeID.Valid || issue.AssigneeID != task.AgentID {
+	_, sourceDestination := turnEndRouterTaskRouting(task)
+	if sourceDestination == "" && task.WorkflowStep.Valid && task.WorkflowStep.String != "" && (!issue.AssigneeID.Valid || issue.AssigneeID != task.AgentID) {
 		return "suppressed:reassigned", "", nil
 	}
-	if pending, err := qtx.HasPendingTaskForIssue(ctx, issue.ID); err != nil {
+	if pending, err := qtx.HasActiveTurnEndRouterTaskForIssue(ctx, db.HasActiveTurnEndRouterTaskForIssueParams{IssueID: issue.ID, SourceTaskID: task.ID}); err != nil {
 		return "", "", fmt.Errorf("pending task check: %w", err)
 	} else if pending {
 		// HasPendingTaskForIssue only sees queued/dispatched rows; the hook runs
@@ -170,11 +184,34 @@ func (s *TaskService) continueUnfinishedInTx(ctx context.Context, qtx *db.Querie
 	} else if !ok {
 		return "suppressed:switch_off", "", nil
 	}
-	chain := continuationChain(ctx, qtx, issue, step, task)
-	if len(chain) >= maxContinuationsPerEpisode {
-		return "suppressed:cap_reached", "", nil
+	if !failed {
+		if routed, outcome, id, err := s.maybeRouteGreenPRInTx(ctx, qtx, issue, task, step); routed || err != nil {
+			return outcome, id, err
+		}
 	}
-	recentCount, err := qtx.CountRecentTurnEndRouterRuns(ctx, issue.ID)
+	if failed {
+		return s.routeOrchestratorInTx(ctx, qtx, issue, task, step, "run_failed")
+	}
+	_, destination := turnEndRouterTaskRouting(task)
+	switch destination {
+	case "orchestrator":
+		if !progressSince(ctx, qtx, issue, task) {
+			return s.routeLeaderInTx(ctx, qtx, issue, task, step, "orchestrator_exhausted")
+		}
+		return "handled:orchestrator_progress", "", nil
+	case "leader":
+		if !progressSince(ctx, qtx, issue, task) {
+			if err := s.recordTurnEndRouterAudit(ctx, qtx, issue, step, task); err != nil {
+				return "", "", err
+			}
+			return "audit:leader_no_progress", "", nil
+		}
+		return "handled:leader_progress", "", nil
+	case "architect":
+		return "handled:architect_reviewed", "", nil
+	}
+	chain := continuationChain(ctx, qtx, issue, step, task)
+	recentCount, err := qtx.CountRecentTurnEndRouterRuns(ctx, db.CountRecentTurnEndRouterRunsParams{IssueID: issue.ID, SourceTaskID: task.ID})
 	if err != nil {
 		return "", "", fmt.Errorf("recent derived-run guard: %w", err)
 	}
@@ -185,19 +222,28 @@ func (s *TaskService) continueUnfinishedInTx(ctx context.Context, qtx *db.Querie
 	if err != nil {
 		return "", "", fmt.Errorf("daily derived-run cap: %w", err)
 	}
-	if dayCount.RunCount >= maxContinuationsPerEpisode {
+	if dayCount.RunCount >= maxDerivedRunsPerIssue24h {
 		return "suppressed:daily_cap", "", nil
 	}
-	if mode == "shadow" {
-		slog.Info("turn-end-router: would queue same-agent continuation", "issue_id", util.UUIDToString(issue.ID), "reason", "same_step_no_pending_work")
-		return "shadow:would_queue", "", nil
+	if continuationSilenceCount(ctx, qtx, issue, chain, task) >= maxSilentContinuationsPerEpisode {
+		return s.routeOrchestratorInTx(ctx, qtx, issue, task, step, "cap_reached")
 	}
-	if len(chain) > 0 && !progressSince(ctx, qtx, issue, chain[len(chain)-1]) {
-		if err := blockForNoProgress(ctx, qtx, issue, chain, task); err != nil {
+	availability, err := isAssignedRouterAgentAvailable(ctx, qtx, issue, task.AgentID)
+	if err != nil {
+		return "suppressed:" + availability, "", err
+	}
+	if availability != "available" {
+		if availability == "quota_ledger_unavailable" {
+			return "suppressed:quota_ledger_unavailable", "", nil
+		}
+		return s.routeOrchestratorInTx(ctx, qtx, issue, task, step, "assigned_agent_"+availability)
+	}
+	if mode == "shadow" {
+		if err := s.recordShadowDecision(ctx, qtx, issue, "same_step_no_pending_work", "continuation"); err != nil {
 			return "", "", err
 		}
-		s.broadcastIssueUpdated(ctx, issue, issue.Status)
-		return "no_progress_blocked", "", nil
+		slog.Info("turn-end-router: would queue same-agent continuation", "issue_id", util.UUIDToString(issue.ID), "reason", "same_step_no_pending_work")
+		return "shadow:would_queue", "", nil
 	}
 	cont, err := s.enqueueContinuationInTx(ctx, qtx, issue, task, step, chain)
 	if err != nil {
@@ -206,9 +252,35 @@ func (s *TaskService) continueUnfinishedInTx(ctx context.Context, qtx *db.Querie
 	return "queued", util.UUIDToString(cont.ID), nil
 }
 
+func continuationSilenceCount(ctx context.Context, q *db.Queries, issue db.Issue, chain []db.AgentTaskQueue, current db.AgentTaskQueue) int {
+	if current.RerunOfTaskID.Valid {
+		found := false
+		for _, run := range chain {
+			if run.ID == current.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			chain = append(chain, current)
+		}
+	}
+	count := 0
+	for i := len(chain) - 1; i >= 0; i-- {
+		if progressSince(ctx, q, issue, chain[i]) {
+			break
+		}
+		count++
+	}
+	return count
+}
+
 type turnEndRouterTaskContext struct {
 	TurnEndRouter struct {
 		Origin               string `json:"origin"`
+		Reason               string `json:"reason"`
+		Destination          string `json:"destination"`
+		StateHash            string `json:"state_hash"`
 		BaselineStatus       string `json:"baseline_status"`
 		BaselineCommentCount int64  `json:"baseline_comment_count"`
 		BaselineHeadSHA      string `json:"baseline_head_sha"`
@@ -399,40 +471,6 @@ func progressSince(ctx context.Context, qtx *db.Queries, issue db.Issue, prev db
 	return false
 }
 
-// blockForNoProgress moves the issue to blocked with one system comment naming
-// the runs, so the card stops costing runs and waits for a human. The cap check
-// runs first, so the chain cannot exceed its configured maximum.
-func blockForNoProgress(ctx context.Context, qtx *db.Queries, issue db.Issue, chain []db.AgentTaskQueue, task db.AgentTaskQueue) error {
-	var names []string
-	for _, t := range chain {
-		names = append(names, util.UUIDToString(t.ID))
-	}
-	names = append(names, util.UUIDToString(task.ID))
-	content := fmt.Sprintf("Continuation stopped: %d runs at step %q produced no new comment, PR, or status change (runs %s). A human needs to unblock this.",
-		len(names), issue.Status, strings.Join(names, ", "))
-	if _, err := qtx.CreateComment(ctx, db.CreateCommentParams{
-		IssueID:     issue.ID,
-		WorkspaceID: issue.WorkspaceID,
-		AuthorType:  "system",
-		AuthorID:    pgtype.UUID{Valid: true},
-		Content:     content,
-		Type:        "system",
-	}); err != nil {
-		return fmt.Errorf("no-progress comment: %w", err)
-	}
-	if _, err := qtx.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
-		ID:          issue.ID,
-		Status:      "blocked",
-		WorkspaceID: issue.WorkspaceID,
-	}); err != nil {
-		return fmt.Errorf("no-progress block: %w", err)
-	}
-	if _, err := StopClosedIssueWakeups(ctx, qtx, issue); err != nil {
-		return fmt.Errorf("no-progress wakeup cleanup: %w", err)
-	}
-	return nil
-}
-
 // enqueueContinuationInTx queues the next continuation: deferred by
 // continuationDelay (the sweeper promotes it, so the 2-min delay needs no
 // timer), rerun_of_task_id pointing at the completed run for the chain, the
@@ -466,7 +504,8 @@ func (s *TaskService) enqueueContinuationInTx(ctx context.Context, qtx *db.Queri
 		return db.AgentTaskQueue{}, fmt.Errorf("stamp workflow step: %w", err)
 	}
 	if err := qtx.SetTaskTurnEndRouterContext(ctx, db.SetTaskTurnEndRouterContextParams{
-		ID: cont.ID, Reason: "same_step_no_pending_work", BaselineStatus: issue.Status,
+		ID: cont.ID, Reason: "same_step_no_pending_work", Destination: "continuation",
+		StateHash: turnEndRouterStateHash(issue, commentCount, headSHA, false), BaselineStatus: issue.Status,
 		BaselineCommentCount: commentCount, BaselineHeadSha: headSHA,
 	}); err != nil {
 		return db.AgentTaskQueue{}, fmt.Errorf("stamp router context: %w", err)
@@ -484,22 +523,48 @@ func ContinuationReminderForOutcome(outcome string) string {
 	switch outcome {
 	case "queued":
 		return "A continuation run is queued for about two minutes from now."
-	case "no_progress_blocked":
-		return "No continuation was queued; the issue was blocked after a run made no measurable progress."
+	case "queued:orchestrator":
+		return "The Orchestrator was queued to resume or reroute this issue."
+	case "queued:leader":
+		return "The Leader was queued to make one final routing decision for this issue."
+	case "queued:architect":
+		return "The Architect was queued to review the linked pull request."
+	case "wakeup:pr_checks":
+		return "A PR checks wakeup is armed; the Architect will be routed when checks finish."
+	case "wakeup:pr_checks_already_armed":
+		return "A PR checks wakeup is already armed for the Architect."
+	case "shadow:would_queue":
+		return "Shadow mode recorded the routing decision; no follow-up run was queued."
+	case "audit:leader_no_progress":
+		return "The Leader made no measurable progress; an audit comment was recorded and automatic routing stopped."
+	case "handled:orchestrator_progress", "handled:leader_progress", "handled:architect_reviewed":
+		return "The issue changed while the routed agent worked; no additional run was queued."
 	case "suppressed:pending_task":
-		return "No continuation was queued because another task is already pending for this issue."
+		return "No follow-up was queued because another task is already pending for this issue."
 	case "suppressed:waiting_wakeup", "suppressed:wakeup_race":
-		return "No continuation was queued because a wakeup is already armed for this issue."
+		return "No follow-up was queued because a wakeup is already armed for this issue."
+	case "suppressed:mode_off":
+		return "No follow-up was queued because turn-end routing is off for this workspace."
 	case "suppressed:cap_reached":
-		return "No continuation was queued because this issue reached its continuation cap."
+		return "The silent-continuation cap was reached; the router attempted to send this issue to the Orchestrator."
+	case "suppressed:daily_cap":
+		return "No follow-up was queued because this issue reached the 24-hour derived-run cap."
+	case "suppressed:dedupe_2m":
+		return "No follow-up was queued because the router recently handled this issue."
+	case "suppressed:duplicate_state":
+		return "No follow-up was queued because this issue state was already routed."
+	case "suppressed:quota_cooled", "suppressed:assigned_agent_quota_cooled":
+		return "No follow-up was queued because the available account is in cooldown."
+	case "suppressed:quota_ledger_unavailable":
+		return "No follow-up was queued because the quota ledger could not be read."
 	case "suppressed:switch_off":
-		return "No continuation was queued because the workflow has continuation disabled."
+		return "No follow-up was queued because the workflow has continuation disabled."
 	case "suppressed:status_moved", "suppressed:reassigned":
-		return "No continuation was queued because the issue moved to another step or assignee."
+		return "No follow-up was queued because the issue moved to another step or assignee."
 	case "error":
-		return "The router could not decide whether to queue a continuation; check the issue's task history."
+		return "The router could not decide the next action; check the issue's task history."
 	default:
-		return "No continuation was queued. Move the issue into a handled step or arm a wakeup when work should resume later."
+		return "No follow-up run was queued. Check the issue's task history for the routing outcome."
 	}
 }
 

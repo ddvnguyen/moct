@@ -5842,6 +5842,7 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
 		writeJSON(w, http.StatusOK, taskToResponse(*task, workspaceID))
 		return
 	}
+	routerDecision := h.TaskService.DecideFailedIssueRun(r.Context(), *task)
 	h.TaskService.NotifyTaskFinished(*task)
 
 	// Best-effort revoke of the mat_ task token minted at claim. Same
@@ -5852,7 +5853,9 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
 	}
 
 	slog.Info("task failed", "task_id", taskID, "agent_id", uuidToString(task.AgentID), "task_error", req.Error, "failure_reason", req.FailureReason)
-	writeJSON(w, http.StatusOK, taskToResponse(*task, workspaceID))
+	response := taskToResponse(*task, workspaceID)
+	response.ContinuationReminder = routerDecision.Reminder
+	writeJSON(w, http.StatusOK, response)
 }
 
 // Task Messages (live agent output)

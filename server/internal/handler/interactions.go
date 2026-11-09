@@ -26,13 +26,16 @@ package handler
 //     other.
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"math"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -110,12 +113,30 @@ type UpdateMoctSettingsRequest struct {
 
 // TurnEndRouterSettingsResponse exposes the workspace's turn-end routing mode.
 type TurnEndRouterSettingsResponse struct {
-	Mode               string  `json:"mode"`
-	ModeSet            bool    `json:"mode_set"`
-	Editable           bool    `json:"editable"`
-	Runs24h            int64   `json:"runs_24h"`
-	ProductiveRuns24h  int64   `json:"productive_runs_24h"`
-	ProductiveRatio24h float64 `json:"productive_ratio_24h"`
+	Mode                       string                        `json:"mode"`
+	ModeSet                    bool                          `json:"mode_set"`
+	Editable                   bool                          `json:"editable"`
+	Runs24h                    int64                         `json:"runs_24h"`
+	ProductiveRuns24h          int64                         `json:"productive_runs_24h"`
+	ProductiveRatio24h         float64                       `json:"productive_ratio_24h"`
+	ShadowWouldQueue24h        int64                         `json:"shadow_would_queue_24h"`
+	RunsByReasonDestination24h []TurnEndRouterReasonMetric   `json:"runs_by_reason_destination_24h"`
+	RunsPerIssue24h            []TurnEndRouterIssueRunBucket `json:"runs_per_issue_24h"`
+	RunsPerIssue7d             []TurnEndRouterIssueRunBucket `json:"runs_per_issue_7d"`
+}
+
+type TurnEndRouterReasonMetric struct {
+	Reason          string  `json:"reason"`
+	Destination     string  `json:"destination"`
+	Runs            int64   `json:"runs"`
+	RunShare        float64 `json:"run_share"`
+	ProductiveRuns  int64   `json:"productive_runs"`
+	ProductiveRatio float64 `json:"productive_ratio"`
+}
+
+type TurnEndRouterIssueRunBucket struct {
+	RunsPerIssue int64 `json:"runs_per_issue"`
+	IssueCount   int64 `json:"issue_count"`
 }
 
 type UpdateTurnEndRouterSettingsRequest struct {
@@ -152,17 +173,12 @@ func (h *Handler) GetTurnEndRouterSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	mode, set := turnEndRouterMode(ws.Settings)
-	response := TurnEndRouterSettingsResponse{Mode: mode, ModeSet: set, Editable: isWorkspaceAdmin(member)}
-	stats, err := h.Queries.CountWorkspaceTurnEndRouterRunsSince(r.Context(), wsUUID)
+	response, err := h.turnEndRouterMetrics(r.Context(), wsUUID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load turn-end router metrics")
 		return
 	}
-	response.Runs24h = stats.RunCount
-	response.ProductiveRuns24h = stats.ProductiveCount
-	if stats.RunCount > 0 {
-		response.ProductiveRatio24h = float64(stats.ProductiveCount) / float64(stats.RunCount)
-	}
+	response.Mode, response.ModeSet, response.Editable = mode, set, isWorkspaceAdmin(member)
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -181,7 +197,7 @@ func (h *Handler) UpdateTurnEndRouterSettings(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "mode must be off, shadow, or on")
 		return
 	}
-	stats, err := h.Queries.CountWorkspaceTurnEndRouterRunsSince(r.Context(), parseUUID(workspaceID))
+	response, err := h.turnEndRouterMetrics(r.Context(), parseUUID(workspaceID))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load turn-end router metrics")
 		return
@@ -193,14 +209,63 @@ func (h *Handler) UpdateTurnEndRouterSettings(w http.ResponseWriter, r *http.Req
 		return
 	}
 	h.publishWorkspaceSettingsChanged(r, updated)
-	ratio := float64(0)
-	if stats.RunCount > 0 {
-		ratio = float64(stats.ProductiveCount) / float64(stats.RunCount)
+	response.Mode, response.ModeSet, response.Editable = mode, true, true
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) turnEndRouterMetrics(ctx context.Context, workspaceID pgtype.UUID) (TurnEndRouterSettingsResponse, error) {
+	response := TurnEndRouterSettingsResponse{
+		RunsByReasonDestination24h: []TurnEndRouterReasonMetric{},
+		RunsPerIssue24h:            []TurnEndRouterIssueRunBucket{},
+		RunsPerIssue7d:             []TurnEndRouterIssueRunBucket{},
 	}
-	writeJSON(w, http.StatusOK, TurnEndRouterSettingsResponse{
-		Mode: mode, ModeSet: true, Editable: true,
-		Runs24h: stats.RunCount, ProductiveRuns24h: stats.ProductiveCount, ProductiveRatio24h: ratio,
-	})
+	now := time.Now()
+	dayAgo := pgtype.Timestamptz{Time: now.Add(-24 * time.Hour), Valid: true}
+	weekAgo := pgtype.Timestamptz{Time: now.Add(-7 * 24 * time.Hour), Valid: true}
+	stats, err := h.Queries.CountWorkspaceTurnEndRouterRunsSince(ctx, workspaceID)
+	if err != nil {
+		return response, err
+	}
+	response.Runs24h, response.ProductiveRuns24h = stats.RunCount, stats.ProductiveCount
+	if stats.RunCount > 0 {
+		response.ProductiveRatio24h = float64(stats.ProductiveCount) / float64(stats.RunCount)
+	}
+	response.ShadowWouldQueue24h, err = h.Queries.CountTurnEndRouterShadowWouldQueueSince(ctx, db.CountTurnEndRouterShadowWouldQueueSinceParams{WorkspaceID: workspaceID, Since: dayAgo})
+	if err != nil {
+		return response, err
+	}
+	reasons, err := h.Queries.ListTurnEndRouterReasonMetrics(ctx, db.ListTurnEndRouterReasonMetricsParams{WorkspaceID: workspaceID, Since: dayAgo})
+	if err != nil {
+		return response, err
+	}
+	for _, row := range reasons {
+		metric := TurnEndRouterReasonMetric{Reason: row.Reason, Destination: row.Destination, Runs: row.RunCount, ProductiveRuns: row.ProductiveCount}
+		if row.RunCount > 0 {
+			metric.ProductiveRatio = float64(row.ProductiveCount) / float64(row.RunCount)
+		}
+		if stats.RunCount > 0 {
+			metric.RunShare = float64(row.RunCount) / float64(stats.RunCount)
+		}
+		response.RunsByReasonDestination24h = append(response.RunsByReasonDestination24h, metric)
+	}
+	response.RunsPerIssue24h, err = h.turnEndRouterIssueHistogram(ctx, workspaceID, dayAgo)
+	if err != nil {
+		return response, err
+	}
+	response.RunsPerIssue7d, err = h.turnEndRouterIssueHistogram(ctx, workspaceID, weekAgo)
+	return response, err
+}
+
+func (h *Handler) turnEndRouterIssueHistogram(ctx context.Context, workspaceID pgtype.UUID, since pgtype.Timestamptz) ([]TurnEndRouterIssueRunBucket, error) {
+	rows, err := h.Queries.ListTurnEndRouterIssueRunHistogram(ctx, db.ListTurnEndRouterIssueRunHistogramParams{WorkspaceID: workspaceID, Since: since})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]TurnEndRouterIssueRunBucket, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, TurnEndRouterIssueRunBucket{RunsPerIssue: row.RunsPerIssue, IssueCount: row.IssueCount})
+	}
+	return result, nil
 }
 
 // settingNumber reads one numeric key out of a settings object. A value that is

@@ -2272,12 +2272,18 @@ const countRecentTurnEndRouterRuns = `-- name: CountRecentTurnEndRouterRuns :one
 SELECT count(*)::bigint
 FROM agent_task_queue
 WHERE issue_id = $1
+  AND id <> $2
   AND context -> 'turn_end_router' ->> 'origin' = 'derived'
   AND created_at >= now() - interval '2 minutes'
 `
 
-func (q *Queries) CountRecentTurnEndRouterRuns(ctx context.Context, issueID pgtype.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countRecentTurnEndRouterRuns, issueID)
+type CountRecentTurnEndRouterRunsParams struct {
+	IssueID      pgtype.UUID `json:"issue_id"`
+	SourceTaskID pgtype.UUID `json:"source_task_id"`
+}
+
+func (q *Queries) CountRecentTurnEndRouterRuns(ctx context.Context, arg CountRecentTurnEndRouterRunsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countRecentTurnEndRouterRuns, arg.IssueID, arg.SourceTaskID)
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
@@ -2320,6 +2326,26 @@ func (q *Queries) CountTurnEndRouterRunsSince(ctx context.Context, issueID pgtyp
 	var i CountTurnEndRouterRunsSinceRow
 	err := row.Scan(&i.RunCount, &i.ProductiveCount)
 	return i, err
+}
+
+const countTurnEndRouterShadowWouldQueueSince = `-- name: CountTurnEndRouterShadowWouldQueueSince :one
+SELECT count(*)::bigint
+FROM activity_log
+WHERE workspace_id = $1
+  AND action = 'turn_end_router_shadow'
+  AND created_at >= $2::timestamptz
+`
+
+type CountTurnEndRouterShadowWouldQueueSinceParams struct {
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Since       pgtype.Timestamptz `json:"since"`
+}
+
+func (q *Queries) CountTurnEndRouterShadowWouldQueueSince(ctx context.Context, arg CountTurnEndRouterShadowWouldQueueSinceParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countTurnEndRouterShadowWouldQueueSince, arg.WorkspaceID, arg.Since)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const countWorkspaceTurnEndRouterRunsSince = `-- name: CountWorkspaceTurnEndRouterRunsSince :one
@@ -5042,6 +5068,27 @@ func (q *Queries) HasActiveTaskForIssueAndAgentInThread(ctx context.Context, arg
 	return has_active, err
 }
 
+const hasActiveTurnEndRouterTaskForIssue = `-- name: HasActiveTurnEndRouterTaskForIssue :one
+SELECT EXISTS (
+    SELECT 1 FROM agent_task_queue
+    WHERE issue_id = $1
+      AND id <> $2
+      AND status IN ('queued','deferred','dispatched','running','waiting_local_directory')
+) AS exists
+`
+
+type HasActiveTurnEndRouterTaskForIssueParams struct {
+	IssueID      pgtype.UUID `json:"issue_id"`
+	SourceTaskID pgtype.UUID `json:"source_task_id"`
+}
+
+func (q *Queries) HasActiveTurnEndRouterTaskForIssue(ctx context.Context, arg HasActiveTurnEndRouterTaskForIssueParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasActiveTurnEndRouterTaskForIssue, arg.IssueID, arg.SourceTaskID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const hasPendingTaskForIssue = `-- name: HasPendingTaskForIssue :one
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
 WHERE context->>'wakeup_id' IS NULL AND issue_id = $1 AND status IN ('queued', 'dispatched')
@@ -5273,6 +5320,75 @@ SELECT EXISTS (SELECT 1 FROM agent_task_queue WHERE issue_id = $1)
 // treats even a terminal task as proof that ownership moved downstream.
 func (q *Queries) HasTaskForIssue(ctx context.Context, issueID pgtype.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, hasTaskForIssue, issueID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const hasTurnEndRouterPRWakeup = `-- name: HasTurnEndRouterPRWakeup :one
+SELECT EXISTS (
+    SELECT 1 FROM issue_wakeup
+    WHERE issue_id = $1 AND agent_id = $2
+      AND enabled AND disabled_at IS NULL
+      AND condition ->> 'type' = 'pull_request'
+      AND condition ->> 'event' = 'checks_finished'
+) AS exists
+`
+
+type HasTurnEndRouterPRWakeupParams struct {
+	IssueID pgtype.UUID `json:"issue_id"`
+	AgentID pgtype.UUID `json:"agent_id"`
+}
+
+func (q *Queries) HasTurnEndRouterPRWakeup(ctx context.Context, arg HasTurnEndRouterPRWakeupParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasTurnEndRouterPRWakeup, arg.IssueID, arg.AgentID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const hasTurnEndRouterReviewForHead = `-- name: HasTurnEndRouterReviewForHead :one
+SELECT EXISTS (
+    SELECT 1 FROM agent_task_queue
+    WHERE issue_id = $1
+      AND context -> 'turn_end_router' ->> 'origin' = 'derived'
+      AND context -> 'turn_end_router' ->> 'destination' = 'architect'
+      AND context -> 'turn_end_router' ->> 'baseline_head_sha' = $2::text
+) AS exists
+`
+
+type HasTurnEndRouterReviewForHeadParams struct {
+	IssueID pgtype.UUID `json:"issue_id"`
+	HeadSha string      `json:"head_sha"`
+}
+
+func (q *Queries) HasTurnEndRouterReviewForHead(ctx context.Context, arg HasTurnEndRouterReviewForHeadParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasTurnEndRouterReviewForHead, arg.IssueID, arg.HeadSha)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const hasTurnEndRouterStateHash = `-- name: HasTurnEndRouterStateHash :one
+SELECT EXISTS (
+    SELECT 1 FROM agent_task_queue
+    WHERE issue_id = $1
+      AND context -> 'turn_end_router' ->> 'origin' = 'derived'
+      AND context -> 'turn_end_router' ->> 'state_hash' = $2::text
+      AND context -> 'turn_end_router' ->> 'destination' = $3::text
+) AS exists
+`
+
+type HasTurnEndRouterStateHashParams struct {
+	IssueID     pgtype.UUID `json:"issue_id"`
+	StateHash   string      `json:"state_hash"`
+	Destination string      `json:"destination"`
+}
+
+// Dedupe a repeated role handoff for the same state, while allowing escalation
+// from a continuation to the Orchestrator and then to the Leader on that state.
+func (q *Queries) HasTurnEndRouterStateHash(ctx context.Context, arg HasTurnEndRouterStateHashParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasTurnEndRouterStateHash, arg.IssueID, arg.StateHash, arg.Destination)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -6770,6 +6886,102 @@ func (q *Queries) ListTasksByIssue(ctx context.Context, issueID pgtype.UUID) ([]
 			&i.IssueSnapshot,
 			&i.WorkflowStep,
 			&i.AccountID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTurnEndRouterIssueRunHistogram = `-- name: ListTurnEndRouterIssueRunHistogram :many
+SELECT run_count::bigint AS runs_per_issue, count(*)::bigint AS issue_count
+FROM (
+    SELECT task.issue_id, count(*) AS run_count
+    FROM agent_task_queue task
+    JOIN issue i ON i.id = task.issue_id
+    WHERE i.workspace_id = $1
+      AND task.context -> 'turn_end_router' ->> 'origin' = 'derived'
+      AND task.created_at >= $2::timestamptz
+    GROUP BY task.issue_id
+) per_issue
+GROUP BY run_count
+ORDER BY run_count
+`
+
+type ListTurnEndRouterIssueRunHistogramParams struct {
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Since       pgtype.Timestamptz `json:"since"`
+}
+
+type ListTurnEndRouterIssueRunHistogramRow struct {
+	RunsPerIssue int64 `json:"runs_per_issue"`
+	IssueCount   int64 `json:"issue_count"`
+}
+
+func (q *Queries) ListTurnEndRouterIssueRunHistogram(ctx context.Context, arg ListTurnEndRouterIssueRunHistogramParams) ([]ListTurnEndRouterIssueRunHistogramRow, error) {
+	rows, err := q.db.Query(ctx, listTurnEndRouterIssueRunHistogram, arg.WorkspaceID, arg.Since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTurnEndRouterIssueRunHistogramRow{}
+	for rows.Next() {
+		var i ListTurnEndRouterIssueRunHistogramRow
+		if err := rows.Scan(&i.RunsPerIssue, &i.IssueCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTurnEndRouterReasonMetrics = `-- name: ListTurnEndRouterReasonMetrics :many
+SELECT COALESCE(context -> 'turn_end_router' ->> 'reason', '')::text AS reason,
+       COALESCE(context -> 'turn_end_router' ->> 'destination', '')::text AS destination,
+       count(*)::bigint AS run_count,
+       count(*) FILTER (WHERE (context -> 'turn_end_router' ->> 'productive')::boolean = true)::bigint AS productive_count
+FROM agent_task_queue task
+JOIN issue i ON i.id = task.issue_id
+WHERE i.workspace_id = $1
+  AND context -> 'turn_end_router' ->> 'origin' = 'derived'
+  AND task.created_at >= $2::timestamptz
+GROUP BY reason, destination
+ORDER BY reason, destination
+`
+
+type ListTurnEndRouterReasonMetricsParams struct {
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Since       pgtype.Timestamptz `json:"since"`
+}
+
+type ListTurnEndRouterReasonMetricsRow struct {
+	Reason          string `json:"reason"`
+	Destination     string `json:"destination"`
+	RunCount        int64  `json:"run_count"`
+	ProductiveCount int64  `json:"productive_count"`
+}
+
+func (q *Queries) ListTurnEndRouterReasonMetrics(ctx context.Context, arg ListTurnEndRouterReasonMetricsParams) ([]ListTurnEndRouterReasonMetricsRow, error) {
+	rows, err := q.db.Query(ctx, listTurnEndRouterReasonMetrics, arg.WorkspaceID, arg.Since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTurnEndRouterReasonMetricsRow{}
+	for rows.Next() {
+		var i ListTurnEndRouterReasonMetricsRow
+		if err := rows.Scan(
+			&i.Reason,
+			&i.Destination,
+			&i.RunCount,
+			&i.ProductiveCount,
 		); err != nil {
 			return nil, err
 		}
@@ -9420,16 +9632,20 @@ SET context = COALESCE(context, '{}'::jsonb) || jsonb_build_object(
     'turn_end_router', jsonb_build_object(
         'origin', 'derived',
         'reason', $1::text,
-        'baseline_status', $2::text,
-        'baseline_comment_count', $3::bigint,
-        'baseline_head_sha', $4::text
+        'destination', $2::text,
+        'state_hash', $3::text,
+        'baseline_status', $4::text,
+        'baseline_comment_count', $5::bigint,
+        'baseline_head_sha', $6::text
     )
 )
-WHERE id = $5
+WHERE id = $7
 `
 
 type SetTaskTurnEndRouterContextParams struct {
 	Reason               string      `json:"reason"`
+	Destination          string      `json:"destination"`
+	StateHash            string      `json:"state_hash"`
 	BaselineStatus       string      `json:"baseline_status"`
 	BaselineCommentCount int64       `json:"baseline_comment_count"`
 	BaselineHeadSha      string      `json:"baseline_head_sha"`
@@ -9441,6 +9657,8 @@ type SetTaskTurnEndRouterContextParams struct {
 func (q *Queries) SetTaskTurnEndRouterContext(ctx context.Context, arg SetTaskTurnEndRouterContextParams) error {
 	_, err := q.db.Exec(ctx, setTaskTurnEndRouterContext,
 		arg.Reason,
+		arg.Destination,
+		arg.StateHash,
 		arg.BaselineStatus,
 		arg.BaselineCommentCount,
 		arg.BaselineHeadSha,
