@@ -302,6 +302,10 @@ func (h *Handler) taskFromRequestHeader(r *http.Request) (db.AgentTaskQueue, boo
 // (run counts, activity histograms, task snapshots) that need to filter out
 // private / non-allow-listed agents the member can't access. Returns nil and
 // false on error.
+// ctxKeyAgentAccessCache carries a per-request memo cache in the context,
+// following the same pattern as SetMemberContext in the middleware package.
+type ctxKeyAgentAccessCache struct{}
+
 type agentAccessCacheEntry struct {
 	allowed  map[string]struct{}
 	ok       bool
@@ -313,20 +317,52 @@ type agentAccessCache struct {
 	m  map[string]agentAccessCacheEntry
 }
 
-var requestAgentAccessCaches sync.Map
+// agentAccessCaches is a weak-keyed fallback so direct unit tests (and any
+// code path that did not inject a cache via middleware) still memoize within
+// a single request context without leaking across the process lifetime.
+var agentAccessCaches sync.Map
 
 func agentAccessCacheFor(ctx context.Context) *agentAccessCache {
-	if v, ok := requestAgentAccessCaches.Load(ctx); ok {
+	if v := ctx.Value(ctxKeyAgentAccessCache{}); v != nil {
+		if c, ok := v.(*agentAccessCache); ok {
+			return c
+		}
+	}
+	if v, ok := agentAccessCaches.Load(ctx); ok {
 		return v.(*agentAccessCache)
 	}
 	c := &agentAccessCache{m: map[string]agentAccessCacheEntry{}}
-	actual, _ := requestAgentAccessCaches.LoadOrStore(ctx, c)
+	actual, _ := agentAccessCaches.LoadOrStore(ctx, c)
 	return actual.(*agentAccessCache)
+}
+
+// WithAgentAccessCache injects a fresh per-request memo cache into ctx.
+func WithAgentAccessCache(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxKeyAgentAccessCache{}, &agentAccessCache{m: map[string]agentAccessCacheEntry{}})
+}
+
+// AgentAccessCacheFromContext returns the cache injected in ctx, if any.
+func AgentAccessCacheFromContext(ctx context.Context) *agentAccessCache {
+	if v := ctx.Value(ctxKeyAgentAccessCache{}); v != nil {
+		if c, ok := v.(*agentAccessCache); ok {
+			return c
+		}
+	}
+	return nil
 }
 
 // resetAgentAccessCacheFor is used by tests to drop cached state for a ctx.
 func resetAgentAccessCacheFor(ctx context.Context) {
-	requestAgentAccessCaches.Delete(ctx)
+	agentAccessCaches.Delete(ctx)
+}
+
+// AgentAccessCacheMiddleware injects a per-request memo cache into the
+// request context for all downstream handlers.
+func AgentAccessCacheMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := WithAgentAccessCache(r.Context())
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func (h *Handler) accessibleAgentIDs(ctx context.Context, workspaceID, actorType, actorID, role string) (map[string]struct{}, bool) {
@@ -335,8 +371,12 @@ func (h *Handler) accessibleAgentIDs(ctx context.Context, workspaceID, actorType
 
 	cache.mu.Lock()
 	if e, ok := cache.m[key]; ok && e.computed {
+		out := make(map[string]struct{}, len(e.allowed))
+		for k := range e.allowed {
+			out[k] = struct{}{}
+		}
 		cache.mu.Unlock()
-		return e.allowed, e.ok
+		return out, e.ok
 	}
 	cache.mu.Unlock()
 
@@ -374,7 +414,11 @@ func (h *Handler) accessibleAgentIDs(ctx context.Context, workspaceID, actorType
 	cache.mu.Lock()
 	cache.m[key] = agentAccessCacheEntry{allowed: allowed, ok: true, computed: true}
 	cache.mu.Unlock()
-	return allowed, true
+	out := make(map[string]struct{}, len(allowed))
+	for k := range allowed {
+		out[k] = struct{}{}
+	}
+	return out, true
 }
 
 // restrictedAgentIDs returns the ids of agents that EXIST in the workspace but

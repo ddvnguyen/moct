@@ -1471,6 +1471,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 	// Global middleware
 	r.Use(chimw.RequestID)
+	r.Use(handler.AgentAccessCacheMiddleware)
 	r.Use(middleware.ClientMetadata)
 	r.Use(middleware.RequestLogger)
 	if opts.HTTPMetrics != nil {
