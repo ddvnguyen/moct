@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -81,13 +84,13 @@ func ResolveWorkspaceIDFromRequest(r *http.Request, queries *db.Queries) string 
 		return id
 	}
 	if slug := r.Header.Get("X-Workspace-Slug"); slug != "" {
-		if ws, err := queries.GetWorkspaceBySlug(r.Context(), slug); err == nil {
-			return util.UUIDToString(ws.ID)
+		if id, err := ResolveWorkspaceSlug(r.Context(), queries, slug); err == nil {
+			return id
 		}
 	}
 	if slug := r.URL.Query().Get("workspace_slug"); slug != "" {
-		if ws, err := queries.GetWorkspaceBySlug(r.Context(), slug); err == nil {
-			return util.UUIDToString(ws.ID)
+		if id, err := ResolveWorkspaceSlug(r.Context(), queries, slug); err == nil {
+			return id
 		}
 	}
 	if id := r.Header.Get("X-Workspace-ID"); id != "" {
@@ -127,18 +130,18 @@ func resolveWorkspaceUUID(queries *db.Queries) workspaceResolver {
 		}
 		// Slug path (preferred — frontend sends this after the URL refactor)
 		if slug := r.URL.Query().Get("workspace_slug"); slug != "" {
-			ws, err := queries.GetWorkspaceBySlug(r.Context(), slug)
+			id, err := ResolveWorkspaceSlug(r.Context(), queries, slug)
 			if err != nil {
-				return "", errWorkspaceNotFound
+				return "", err
 			}
-			return util.UUIDToString(ws.ID), nil
+			return id, nil
 		}
 		if slug := r.Header.Get("X-Workspace-Slug"); slug != "" {
-			ws, err := queries.GetWorkspaceBySlug(r.Context(), slug)
+			id, err := ResolveWorkspaceSlug(r.Context(), queries, slug)
 			if err != nil {
-				return "", errWorkspaceNotFound
+				return "", err
 			}
-			return util.UUIDToString(ws.ID), nil
+			return id, nil
 		}
 		// UUID fallback (CLI, daemon, legacy clients)
 		if id := r.URL.Query().Get("workspace_id"); id != "" {
@@ -264,4 +267,87 @@ func buildMiddleware(queries *db.Queries, resolve workspaceResolver, roles []str
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// Slug cache: slug → UUID. Slug is immutable (UpdateWorkspace does not touch
+// slug), so a successful lookup can be cached for a while. Misses are cached
+// for a short time to absorb repeated bad-slug traffic without hammering the
+// DB.
+
+const (
+	slugCacheHitTTL  = 5 * time.Minute
+	slugCacheMissTTL = 5 * time.Second
+)
+
+type slugCacheEntry struct {
+	uuid    string
+	err     error
+	expires time.Time
+}
+
+type slugCache struct {
+	mu sync.RWMutex
+	m  map[string]slugCacheEntry
+}
+
+var workspaceSlugCache = &slugCache{m: map[string]slugCacheEntry{}}
+
+// resetWorkspaceSlugCache is used by tests to drop cached state.
+func resetWorkspaceSlugCache() {
+	workspaceSlugCache.mu.Lock()
+	defer workspaceSlugCache.mu.Unlock()
+	workspaceSlugCache.m = map[string]slugCacheEntry{}
+}
+
+// InvalidateWorkspaceSlug drops a cached slug→UUID entry. Call when a
+// workspace with that slug is deleted or recreated so stale UUIDs are
+// never served.
+func InvalidateWorkspaceSlug(slug string) {
+	workspaceSlugCache.mu.Lock()
+	defer workspaceSlugCache.mu.Unlock()
+	delete(workspaceSlugCache.m, slug)
+}
+
+// ResolveWorkspaceSlug resolves a workspace slug to its UUID, using an
+// in-process cache (5 min hit TTL, few-second miss TTL). It is the single
+// slug→UUID resolver shared by the middleware, task-token checks, and the
+// realtime websocket path.
+func ResolveWorkspaceSlug(ctx context.Context, queries *db.Queries, slug string) (string, error) {
+	if slug == "" {
+		return "", errWorkspaceNotFound
+	}
+	if v, err, ok := workspaceSlugCache.get(slug); ok {
+		return v, err
+	}
+	ws, err := queries.GetWorkspaceBySlug(ctx, slug)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			workspaceSlugCache.set(slug, "", errWorkspaceNotFound, slugCacheMissTTL)
+			return "", errWorkspaceNotFound
+		}
+		// Real DB error: do not cache; surface to caller.
+		return "", err
+	}
+	id := util.UUIDToString(ws.ID)
+	workspaceSlugCache.set(slug, id, nil, slugCacheHitTTL)
+	return id, nil
+}
+
+func (c *slugCache) get(slug string) (string, error, bool) {
+	c.mu.RLock()
+	e, ok := c.m[slug]
+	c.mu.RUnlock()
+	if !ok {
+		return "", nil, false
+	}
+	if time.Now().After(e.expires) {
+		return "", nil, false
+	}
+	return e.uuid, e.err, true
+}
+
+func (c *slugCache) set(slug, uuid string, err error, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[slug] = slugCacheEntry{uuid: uuid, err: err, expires: time.Now().Add(ttl)}
 }

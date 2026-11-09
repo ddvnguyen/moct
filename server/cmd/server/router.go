@@ -1471,6 +1471,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 	// Global middleware
 	r.Use(chimw.RequestID)
+	r.Use(handler.AgentAccessCacheMiddleware)
 	r.Use(middleware.ClientMetadata)
 	r.Use(middleware.RequestLogger)
 	if opts.HTTPMetrics != nil {
@@ -1518,11 +1519,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	hub.SetMembershipChecker(mc)
 	pr := &patResolver{queries: queries, cache: patCache}
 	slugResolver := realtime.SlugResolver(func(ctx context.Context, slug string) (string, error) {
-		ws, err := queries.GetWorkspaceBySlug(ctx, slug)
-		if err != nil {
-			return "", err
-		}
-		return util.UUIDToString(ws.ID), nil
+		return middleware.ResolveWorkspaceSlug(ctx, queries, slug)
 	})
 	r.Get("/ws", func(w http.ResponseWriter, r *http.Request) {
 		realtime.HandleWebSocket(hub, mc, pr, slugResolver, w, r)
