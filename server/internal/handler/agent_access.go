@@ -317,24 +317,13 @@ type agentAccessCache struct {
 	m  map[string]agentAccessCacheEntry
 }
 
-// agentAccessCaches is a strong-ref fallback for code paths that did not
-// inject a cache via middleware (e.g. direct unit tests). It is not used on
-// the production HTTP path, where AgentAccessCacheMiddleware injects the
-// cache into the request context.
-var agentAccessCaches sync.Map
-
 func agentAccessCacheFor(ctx context.Context) *agentAccessCache {
 	if v := ctx.Value(ctxKeyAgentAccessCache{}); v != nil {
 		if c, ok := v.(*agentAccessCache); ok {
 			return c
 		}
 	}
-	if v, ok := agentAccessCaches.Load(ctx); ok {
-		return v.(*agentAccessCache)
-	}
-	c := &agentAccessCache{m: map[string]agentAccessCacheEntry{}}
-	actual, _ := agentAccessCaches.LoadOrStore(ctx, c)
-	return actual.(*agentAccessCache)
+	return nil
 }
 
 // WithAgentAccessCache injects a fresh per-request memo cache into ctx.
@@ -352,11 +341,6 @@ func AgentAccessCacheFromContext(ctx context.Context) *agentAccessCache {
 	return nil
 }
 
-// resetAgentAccessCacheFor is used by tests to drop cached state for a ctx.
-func resetAgentAccessCacheFor(ctx context.Context) {
-	agentAccessCaches.Delete(ctx)
-}
-
 // AgentAccessCacheMiddleware injects a per-request memo cache into the
 // request context for all downstream handlers.
 func AgentAccessCacheMiddleware(next http.Handler) http.Handler {
@@ -370,36 +354,44 @@ func (h *Handler) accessibleAgentIDs(ctx context.Context, workspaceID, actorType
 	cache := agentAccessCacheFor(ctx)
 	key := workspaceID + "|" + actorType + "|" + actorID + "|" + role
 
-	cache.mu.Lock()
-	if e, ok := cache.m[key]; ok && e.computed {
-		out := make(map[string]struct{}, len(e.allowed))
-		for k := range e.allowed {
-			out[k] = struct{}{}
+	if cache != nil {
+		cache.mu.Lock()
+		if e, ok := cache.m[key]; ok && e.computed {
+			out := make(map[string]struct{}, len(e.allowed))
+			for k := range e.allowed {
+				out[k] = struct{}{}
+			}
+			cache.mu.Unlock()
+			return out, e.ok
 		}
 		cache.mu.Unlock()
-		return out, e.ok
 	}
-	cache.mu.Unlock()
 
 	wsUUID, err := util.ParseUUID(workspaceID)
 	if err != nil {
-		cache.mu.Lock()
-		cache.m[key] = agentAccessCacheEntry{allowed: nil, ok: false, computed: true}
-		cache.mu.Unlock()
+		if cache != nil {
+			cache.mu.Lock()
+			cache.m[key] = agentAccessCacheEntry{allowed: nil, ok: false, computed: true}
+			cache.mu.Unlock()
+		}
 		return nil, false
 	}
 	agents, err := h.Queries.ListAllAgents(ctx, wsUUID)
 	if err != nil {
-		cache.mu.Lock()
-		cache.m[key] = agentAccessCacheEntry{allowed: nil, ok: false, computed: true}
-		cache.mu.Unlock()
+		if cache != nil {
+			cache.mu.Lock()
+			cache.m[key] = agentAccessCacheEntry{allowed: nil, ok: false, computed: true}
+			cache.mu.Unlock()
+		}
 		return nil, false
 	}
 	targetsByAgent, ok := h.loadInvocationTargetsByAgent(ctx, agents)
 	if !ok {
-		cache.mu.Lock()
-		cache.m[key] = agentAccessCacheEntry{allowed: nil, ok: false, computed: true}
-		cache.mu.Unlock()
+		if cache != nil {
+			cache.mu.Lock()
+			cache.m[key] = agentAccessCacheEntry{allowed: nil, ok: false, computed: true}
+			cache.mu.Unlock()
+		}
 		return nil, false
 	}
 	allowed := make(map[string]struct{}, len(agents))
@@ -412,9 +404,11 @@ func (h *Handler) accessibleAgentIDs(ctx context.Context, workspaceID, actorType
 		allowed[uuidToString(a.ID)] = struct{}{}
 	}
 
-	cache.mu.Lock()
-	cache.m[key] = agentAccessCacheEntry{allowed: allowed, ok: true, computed: true}
-	cache.mu.Unlock()
+	if cache != nil {
+		cache.mu.Lock()
+		cache.m[key] = agentAccessCacheEntry{allowed: allowed, ok: true, computed: true}
+		cache.mu.Unlock()
+	}
 	out := make(map[string]struct{}, len(allowed))
 	for k := range allowed {
 		out[k] = struct{}{}
