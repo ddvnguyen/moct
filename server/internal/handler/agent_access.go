@@ -317,9 +317,10 @@ type agentAccessCache struct {
 	m  map[string]agentAccessCacheEntry
 }
 
-// agentAccessCaches is a weak-keyed fallback so direct unit tests (and any
-// code path that did not inject a cache via middleware) still memoize within
-// a single request context without leaking across the process lifetime.
+// agentAccessCaches is a strong-ref fallback for code paths that did not
+// inject a cache via middleware (e.g. direct unit tests). It is not used on
+// the production HTTP path, where AgentAccessCacheMiddleware injects the
+// cache into the request context.
 var agentAccessCaches sync.Map
 
 func agentAccessCacheFor(ctx context.Context) *agentAccessCache {
