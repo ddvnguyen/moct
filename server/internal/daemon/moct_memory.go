@@ -311,17 +311,11 @@ func moctRecordUsage(ctx context.Context, baseURL string, task Task, sessionID s
 		}
 		fmt.Fprintf(&b, "- %s: input=%d output=%d cache_read=%d cache_write=%d\n", model, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
 	}
+	// moct-be whitelists decision attrs to decidedBy/sourceRef/date
+	// (moct src/team-room/memory.ts checkAttrs) and 400s anything else, so
+	// the machine-readable payload lives in the body above — attrs carry
+	// only the two refs moct-be requires.
 	attrs := map[string]any{
-		"session_ref": sessionID,
-		"task_id":     task.ID,
-		"issue_id":    task.IssueID,
-		"usage":       usagePayload,
-		"totals": map[string]any{
-			"input_tokens":       totalInput,
-			"output_tokens":     totalOutput,
-			"cache_read_tokens":  totalCacheRead,
-			"cache_write_tokens": totalCacheWrite,
-		},
 		"decidedBy": moct.ExpertRef(task.AgentID),
 		"sourceRef": moct.IssueRef(task.IssueID),
 	}
