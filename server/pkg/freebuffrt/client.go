@@ -140,14 +140,14 @@ type LoginState struct {
 }
 
 // ThreadProbe verifies the orchestrator serves the local thread routes the
-// task bridge drives. GET /api/events answers 200 with the event stream on
+// task bridge drives. GET /api/projects answers 200 with the project list on
 // builds that serve threads, and 404 {"error":"not found"} on builds whose
 // router dropped those routes (e.g. a hosted-workspace-only build passes
 // /api/auth/status but 404s POST /api/threads on every run). Only 404 fails
 // the probe; any other outcome (200 stream, 401 without a launch token, 403
 // forbidden origin) means the route exists.
 func (c *Client) ThreadProbe(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/events", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/projects", nil)
 	if err != nil {
 		return err
 	}

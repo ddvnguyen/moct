@@ -156,3 +156,44 @@ func TestDesktopReservationWaitsForRestart(t *testing.T) {
 	<-done
 	<-reserved
 }
+
+func TestDesktopSyncRejectsThreadlessEngine(t *testing.T) {
+	fx := newFreebuffFixture(t)
+	rt := Runtime{ID: "sync-threadless"}
+	key := freebuffDesktopLoginKey(rt.ID, "a")
+	t.Cleanup(func() { freebuffAccountPins.Delete(key) })
+	fx.pending = `{"pins":{"a":"1"},"accounts":[]}`
+	if fx.daemon.freebuffDesktopFailedPins == nil {
+		fx.daemon.freebuffDesktopFailedPins = make(map[string]string)
+	}
+	fx.daemon.freebuffDesktopFailedPins[key] = "0"
+	threadless := &fakeAccount{statuses: []freebuffrt.AuthStatus{signedIn("x")}, noThreads: true}
+	prev := startFreebuffAccount
+	startFreebuffAccount = func(context.Context, string, string) (freebuffAccount, func(), error) {
+		return threadless, func() {}, nil
+	}
+	t.Cleanup(func() { startFreebuffAccount = prev })
+	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
+	if _, ok := fx.daemon.freebuffDesktopInstances.Load(key); ok {
+		t.Fatal("threadless instance was published")
+	}
+	reports := fx.accountReports()
+	if len(reports) == 0 || reports[len(reports)-1]["state"] != "failed" {
+		t.Fatalf("reports=%v", reports)
+	}
+	good := &fakeAccount{statuses: []freebuffrt.AuthStatus{signedIn("x")}}
+	startFreebuffAccount = func(context.Context, string, string) (freebuffAccount, func(), error) {
+		return good, func() {}, nil
+	}
+	fx.daemon.freebuffDesktopFailedPins[key] = "0"
+	fx.pending = `{"pins":{"a":"1"},"accounts":[]}`
+	fx.daemon.syncFreebuffDesktopRuntime(context.Background(), rt)
+	if _, ok := fx.daemon.freebuffDesktopInstances.Load(key); !ok {
+		t.Fatal("good instance not published")
+	}
+	reports = fx.accountReports()
+	last := reports[len(reports)-1]
+	if last["state"] != "connected" {
+		t.Fatalf("reports=%v", reports)
+	}
+}

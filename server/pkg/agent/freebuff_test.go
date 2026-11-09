@@ -26,6 +26,7 @@ type fakeFreebuff struct {
 	posted      string
 	createCwd   string
 	createModel string
+	createErr   error
 	holdTurn    bool
 }
 
@@ -46,6 +47,9 @@ func (f *fakeFreebuff) CreateThreadWithModel(_ context.Context, cwd, model strin
 	defer f.mu.Unlock()
 	f.createCwd = cwd
 	f.createModel = model
+	if f.createErr != nil {
+		return freebuffrt.Thread{}, f.createErr
+	}
 	var modelPtr *string
 	if model != "" {
 		modelPtr = new(model)
@@ -147,6 +151,15 @@ func TestFreebuffRunRequiresSignedInAccount(t *testing.T) {
 	f.authed = false
 	res, _ := runFake(t, f, ExecOptions{Cwd: "/work"})
 	if res.Status != "failed" || !strings.Contains(res.Error, "not signed in") {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+func TestFreebuffRunReportsThreadlessEngine(t *testing.T) {
+	f := newFakeFreebuff()
+	f.createErr = &freebuffrt.APIError{Status: 404, Message: "not found"}
+	res, _ := runFake(t, f, ExecOptions{Cwd: "/work", Model: "m"})
+	if res.Status != "failed" || !strings.Contains(res.Error, "no local thread API") {
 		t.Fatalf("result = %+v", res)
 	}
 }

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -59,7 +60,7 @@ func (d *Daemon) ensureFreebuffDesktopInstance(ctx context.Context, rt Runtime, 
 			d.freebuffDesktopFailedPins = make(map[string]string)
 		}
 		d.freebuffDesktopFailedPins[key] = freebuffAccountEngineVersion(rt.ID, accountID)
-		return nil, errors.New("managed Freebuff Desktop account is not task-ready (thread routes unavailable); check the pinned engine version")
+		return nil, fmt.Errorf("engine %s has no local thread API; pin <=0.0.190", freebuffAccountEngineVersion(rt.ID, accountID))
 	}
 	delete(d.freebuffDesktopFailedPins, key)
 	d.freebuffDesktopInstances.Store(key, &freebuffDesktopInstance{client: client, stop: stop, pin: freebuffAccountEngineVersion(rt.ID, accountID)})
@@ -226,6 +227,28 @@ func (d *Daemon) syncFreebuffDesktopRuntime(ctx context.Context, rt Runtime) {
 		st, err := client.AuthStatus(statusCtx)
 		cancel()
 		replacement := &freebuffDesktopInstance{client: client, stop: stop, pin: desired}
+		threadless := false
+		if err == nil && st.Authed {
+			if probe, ok := client.(interface {
+				ThreadProbe(ctx context.Context) error
+			}); ok {
+				probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+				if perr := probe.ThreadProbe(probeCtx); perr != nil {
+					threadless = true
+				}
+				probeCancel()
+			}
+		}
+		if threadless {
+			stop()
+			if d.freebuffDesktopFailedPins == nil {
+				d.freebuffDesktopFailedPins = make(map[string]string)
+			}
+			d.freebuffDesktopFailedPins[key] = desired
+			d.publishFreebuffDesktopLocked()
+			reports = append(reports, map[string]any{"id": id, "state": "failed", "error": fmt.Sprintf("engine %s has no local thread API; pin <=0.0.190", desired)})
+			continue
+		}
 		if err == nil && st.Authed {
 			replacement.connected = true
 			replacement.label = freebuffAccountLabel(st.User)

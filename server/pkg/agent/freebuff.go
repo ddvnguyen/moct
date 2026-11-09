@@ -322,6 +322,10 @@ func (b *freebuffBackend) run(ctx context.Context, c freebuffClient, prompt stri
 	if !resumed {
 		t, err := c.CreateThreadWithModel(ctx, opts.Cwd, opts.Model)
 		if err != nil {
+			var apiErr *freebuffAPIError
+			if errors.As(err, &apiErr) && apiErr.Status == 404 {
+				return fail("failed", "freebuff orchestrator has no local thread API (engine too new); pin engine <=0.0.190")
+			}
 			return fail("failed", "freebuff create thread: %v", err)
 		}
 		threadID = t.ID
