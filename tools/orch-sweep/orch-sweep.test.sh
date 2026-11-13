@@ -140,5 +140,63 @@ EOF
 check_main "main-default-prints-json"
 check_main "main-stuck-list-prints-hash" --stuck-list
 
+# M-328: freeq_matches + freeq_has_ask_card, no network. Pure-function cases:
+# trailing "?", Owner-decision phrases, and the three exclusions (WAKEUP
+# marker, evidence block, fenced-code tail). Ask-card cases: a question_answer
+# run within 15 min or sharing the comment's source_task_id exempts.
+check_freeq() { # check_freeq <name> <content-json> <want-flagged>
+  local name="$1" content="$2" want="$3"
+  if python3 - "$name" "$content" "$want" <<'EOF'; then
+import importlib.machinery, importlib.util, json, sys
+path = "./orch-sweep"
+loader = importlib.machinery.SourceFileLoader("s", path)
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+name, content, want = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3] == "1"
+got, signal = s.freeq_matches(content)
+ok = (bool(got) == want)
+detail = repr(signal[:80])
+print(("PASS " if ok else "FAIL ") + name + " :: flagged=" + str(bool(got)) + " " + detail)
+sys.exit(0 if ok else 1)
+EOF
+    npass=$((npass+1)); echo "ok - $name"
+  else
+    nfail=$((nfail+1)); echo "not ok - $name"
+  fi
+}
+check_freeq "fq-trailing-question" '"Status update.\n\nCould we test on dsh-z and multica-main?"' 1
+check_freeq "fq-owner-decision" '"Plan v2 ready.\n\nOne decision for the Owner: approve Plan v2 so M-285 can be built."' 1
+check_freeq "fq-which-option" '"Two paths forward. Owner, please decide which option to take."' 1
+check_freeq "fq-statement" '"Merged, NOT deployed. Evidence block posted on the card."' 0
+check_freeq "fq-wakeup" '"[WAKEUP] armed: resume check at 18:30Z"' 0
+check_freeq "fq-fenced-code" '"Run this:\n```\nfoo?\n```\nDone."' 0
+check_freeq "fq-empty" '""' 0
+check_askcard() { # check_askcard <name> <runs-json> <comment-json> <want-exempt>
+  local name="$1" runs="$2" comment="$3" want="$4"
+  if python3 - "$name" "$runs" "$comment" "$want" <<'EOF'; then
+import importlib.machinery, importlib.util, json, sys
+path = "./orch-sweep"
+loader = importlib.machinery.SourceFileLoader("s", path)
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+name = sys.argv[1]
+runs, comment, want = json.loads(sys.argv[2]), json.loads(sys.argv[3]), sys.argv[4] == "1"
+got = s.freeq_has_ask_card(runs, comment)
+ok = (bool(got) == want)
+detail = "exempt=" + str(bool(got))
+print(("PASS " if ok else "FAIL ") + name + " :: " + detail)
+sys.exit(0 if ok else 1)
+EOF
+    npass=$((npass+1)); echo "ok - $name"
+  else
+    nfail=$((nfail+1)); echo "not ok - $name"
+  fi
+}
+ASKRUN='[{"id":"r1","created_at":"2026-11-08T13:36:26Z","trigger_comment_id":null,"attribution":{"evidence":{"kind":"question_answer","ref_id":"card1"}}}]'
+check_askcard "fq-ask-nearby-run" "$ASKRUN" '{"id":"c1","created_at":"2026-11-08T13:33:34Z","source_task_id":"r9"}' 1
+check_askcard "fq-ask-same-run" "$ASKRUN" '{"id":"c1","created_at":"2026-11-08T10:00:00Z","source_task_id":"r1"}' 1
+check_askcard "fq-no-ask" "$ASKRUN" '{"id":"c9","created_at":"2026-11-08T10:00:00Z","source_task_id":"r9"}' 0
+check_askcard "fq-empty-runs" "[]" '{"id":"c1","created_at":"2026-11-08T13:33:34Z","source_task_id":"r9"}' 0
+
 echo "# passed=$npass failed=$nfail"
 [ "$nfail" -eq 0 ]

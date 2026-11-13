@@ -848,6 +848,114 @@ def build_stuck_list(board, issues, t, resume_map):
     triggers = sorted({x["trigger"].split(":")[0] for x in items})
     return {"hash": digest, "triggers": triggers, "items": items}
 
+# --------------------------------------------- M-328 free-questions (Owner)
+# Flags agent comments that read as free-text questions to the Owner with no
+# ask card from the same run. Heuristic only, no LLM call:
+#   * agent-authored, type "comment" (system / progress_update never count);
+#   * created within the window (--hours N, default 24);
+#   * body has no [WAKEUP] marker and is not an evidence block;
+#   * last non-empty line ends in "?" or names an Owner decision
+#     ("owner, please decide", "which option", "approve plan v<N>");
+#   * no ask card live on the issue from the same run: no run whose
+#     trigger_comment_id is this comment, or whose attribution evidence is a
+#     question_answer/question_card ref created after this comment.
+# Chat-mode tasks (runs without an issue / trigger_comment) are exempt: there
+# is no thread to park a card in (M-325 decision), the human is live.
+FREEQ_DEFAULT_HOURS = 24
+FREEQ_DECISION_RES = [
+    re.compile(r"owner[,\s]+please decide", re.I),
+    re.compile(r"which option", re.I),
+    re.compile(r"approve plan v\d+", re.I),
+    re.compile(r"one decision for the owner", re.I),
+]
+
+
+def freeq_last_line(content):
+    """Last non-empty line with fenced code stripped; "" when none."""
+    body = re.sub(r"```.*?```", "", content or "", flags=re.S)
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    last = re.sub(r"^#+\s*", "", lines[-1])  # tolerate a heading tail
+    return last
+
+
+def freeq_matches(content):
+    """(flagged, signal): signal is the matched tail or decision phrase."""
+    if not content or "[WAKEUP]" in content:
+        return False, ""
+    tail = freeq_last_line(content)
+    if not tail or len(tail) < 3:
+        return False, ""
+    low = tail.lower()
+    if "evidence block" in low or "merged, not deployed" in low:
+        return False, ""
+    if tail.rstrip().endswith("?"):
+        return True, tail[:160]
+    for rx in FREEQ_DECISION_RES:
+        m = rx.search(content)
+        if m:
+            return True, m.group(0)[:160]
+    return False, ""
+
+
+def freeq_has_ask_card(runs, comment, names=None):
+    """True when a run on this issue already carries an ask from the comment's
+    run: the comment is (or answers) a parked ask. Runs arrive newest-first."""
+    cid = (comment.get("id") or "")
+    cts = parse_ts(comment.get("created_at"))
+    sid = comment.get("source_task_id") or ""
+    for r in runs or []:
+        if (r.get("trigger_comment_id") or "") == cid and cid:
+            return True
+        ev = ((r.get("attribution") or {}).get("evidence") or {})
+        if ev.get("kind") in ("question_answer", "question_card") and ev.get("ref_id"):
+            rts = parse_ts(r.get("created_at"))
+            if sid and (r.get("id") or "") == sid:
+                return True
+            if cts and rts and abs((rts - cts).total_seconds()) <= 15 * 60:
+                return True
+    return False
+
+
+def scan_free_questions(issues, hours, names=None):
+    """One --since pass per board issue; returns {checked, offenders[]}.
+    offenders carry {card, comment, agent, created_at, signal}: the daily
+    ticket paste (issue, comment id, agent), once per comment."""
+    cutoff = now() - timedelta(hours=hours)
+    since = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    offenders, checked, seen = [], 0, set()
+    for i in issues or []:
+        key = i.get("identifier") or i.get("id")
+        d = sh_json(["multica", "issue", "comment", "list", i.get("id"),
+                     "--since", since, "--compact", "--output", "json"], timeout=120)
+        rows = d if isinstance(d, list) else d.get("comments", []) if isinstance(d, dict) else []
+        if isinstance(d, dict) and "__error__" in d:
+            continue
+        runs = card_runs(i.get("id"))
+        if isinstance(runs, dict) and "__error__" in runs:
+            runs = []
+        for c in rows or []:
+            if c.get("author_type") != "agent" or (c.get("type") or "") != "comment":
+                continue
+            cts = parse_ts(c.get("created_at"))
+            if not cts or cts < cutoff:
+                continue
+            ok, signal = freeq_matches(c.get("content") or "")
+            if not ok or freeq_has_ask_card(runs, c, names):
+                continue
+            if c.get("id") in seen:
+                continue
+            seen.add(c.get("id"))
+            checked += 1
+            aid = c.get("author_id")
+            offenders.append({"card": key, "comment": (c.get("id") or "")[:8],
+                              "comment_id": c.get("id"), "agent": (names or {}).get(aid, {}).get("name") if isinstance(names, dict) else aid,
+                              "agent_id": aid, "created_at": c.get("created_at"), "signal": signal})
+    offenders.sort(key=lambda o: (o.get("card") or "", o.get("created_at") or ""))
+    return {"hours": hours, "issues_scanned": len(issues or []),
+            "comments_flagged": checked, "offenders": offenders}
+
 
 
 # --------------------------------------------------------------------- main
@@ -858,6 +966,19 @@ def main():
     max_cards = 0
     if "--max-cards" in args:
         max_cards = int(args[args.index("--max-cards") + 1])
+    hours = FREEQ_DEFAULT_HOURS
+    if "--hours" in args:
+        hours = int(args[args.index("--hours") + 1])
+
+    if "--free-questions" in args:
+        fq_names = agent_names()
+        fq_d = fetch_issues()
+        fq_issues = fq_d if isinstance(fq_d, list) else fq_d.get("issues", [])
+        fq = scan_free_questions(fq_issues, hours, fq_names)
+        print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "tool": "orch-sweep", "mode": "free-questions",
+                          **fq}, indent=1, ensure_ascii=False))
+        return 0
 
     names = agent_names()
     prs = fetch_prs()
@@ -866,7 +987,6 @@ def main():
     if seed or led_err:
         seed_ledger(seeded)
         ledger, led_err = read_ledger()
-
     result = sweep(ledger, names, all_prs=prs, apply_cooldown=apply_cooldown, max_cards=max_cards)
     if "--stuck-list" in args:
         print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
