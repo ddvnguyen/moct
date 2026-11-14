@@ -191,7 +191,7 @@ done <<< "$PATCH_APPLIERS"
 # npm pack, so the tarball is exactly what the lane installs.
 install_deps() {
   log "installing the plugins repo dependencies (pnpm install --frozen-lockfile)"
-  ( cd "$PLUGINS_ROOT" && pnpm install --frozen-lockfile ) || die "pnpm install failed in $PLUGINS_ROOT"
+  ( cd "$PLUGINS_ROOT" && pnpm install --frozen-lockfile --store-dir /mnt/workspace/cache/pnpm-store ) || die "pnpm install failed in $PLUGINS_ROOT"
 }
 
 # The profile's lockfile pins the integrity of every installed tarball. A
@@ -522,14 +522,14 @@ rollback() {
     || log "FATAL: could not drop the current-state lock"
   if [ -f "$BACKUP_DIR/pnpm-lock.yaml" ]; then
     cp "$BACKUP_DIR/pnpm-lock.yaml" "$PROFILE_DIR/pnpm-lock.yaml" || log "FATAL: could not restore pnpm-lock.yaml"
-    ( cd "$PROFILE_DIR" && pnpm install --frozen-lockfile ) \
+    ( cd "$PROFILE_DIR" && pnpm install --frozen-lockfile --store-dir /mnt/workspace/cache/pnpm-store ) \
       || log "FATAL: the rollback install failed - the profile must be repaired by hand"
   else
     # The profile had no lockfile before this run: the one the failed install
     # wrote describes the new tarballs and no longer matches the restored
     # package.json, so it goes away with them.
     rm -f "$PROFILE_DIR/pnpm-lock.yaml"
-    ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) \
+    ( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile --store-dir /mnt/workspace/cache/pnpm-store ) \
       || log "FATAL: the rollback install failed - the profile must be repaired by hand"
   fi
   # The rollback is only as good as what it left behind, so it asserts the
@@ -712,7 +712,7 @@ while IFS=$'\t' read -r name _rest; do
   fi
 done <<< "$PACKED"
 log "installing the profile"
-( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile ) || die "pnpm install failed in $PROFILE_DIR"
+( cd "$PROFILE_DIR" && pnpm install --no-frozen-lockfile --store-dir /mnt/workspace/cache/pnpm-store ) || die "pnpm install failed in $PROFILE_DIR"
 
 # The proof that the lane runs the build this deploy produced is the
 # CONTENT: the installed package must carry the bytes of the artifact it was
