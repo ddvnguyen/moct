@@ -10,8 +10,7 @@
   "patches": [
     {
       "target": "@michengai/dsh-codex-ui",
-      "script": "scripts/codex-ui-sidebar-patch/apply.mjs",
-      "maxVersionExclusive": "2.0.0"
+      "script": "scripts/codex-ui-sidebar-patch/apply.mjs"
     },
     {
       "target": "dshmarket",
