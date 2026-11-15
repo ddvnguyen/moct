@@ -80,6 +80,7 @@ jobs:
       BUN_INSTALL_CACHE_DIR: /mnt/workspace/cache/bun
       PLAYWRIGHT_BROWSERS_PATH: /mnt/workspace/cache/playwright
       npm_config_store_dir: /mnt/workspace/cache/pnpm-store
+      DSH_PNPM_STORE_DIR: /mnt/workspace/cache/pnpm-store
     steps:
       - name: Checkout the train owner (this repo)
         uses: actions/checkout@v4
