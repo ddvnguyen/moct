@@ -7,9 +7,10 @@ Run by the tick as a SINGLE tool call; all internal multica/gh calls are the
 script's own subprocesses, they do not count against the tick's tool-call
 budget (tick contract: at most 6 tool calls plus one per action).
 
-Read-only by default. `--apply-cooldown` additionally writes confirmed quota
-cooldowns to M-86 metadata key `quota_ledger`. It never touches card status,
-assignments, comments or PRs — acting on the output stays the agent's job.
+Read-only by default. `--apply-cooldown` writes confirmed quota cooldowns to
+M-86 metadata key `quota_ledger`; `--apply-incomplete-turns` writes the
+incomplete-turn dedupe ledger. Neither flag touches card status, assignments,
+comments or PRs — acting on detector actions stays the Orchestrator's job.
 
 `--stuck-list` prints only the compact committee slice:
   {at, tool:"orch-sweep", mode:"stuck-list", hash, triggers, items}
@@ -60,6 +61,10 @@ VERDICT_WAIT_MIN = 30  # M-268 (a): green PR, no verdict on SHA, waiting this lo
 STUCK_IDLE_MIN = 120  # M-268 (b): card idle this long after a resume was tried
 BLOCKED_STUCK_MIN = 240  # M-268 (c): card blocked this long
 SHARED_CODE_MIN = 3  # M-268 (d): this many cards sharing one failure_class/reason
+INCOMPLETE_TURNS_KEY = "incomplete_turns"
+INCOMPLETE_TURNS_MAX_ISSUES = 40
+INCOMPLETE_WORKING_STATUSES = {"in_progress", "planing_2"}
+INCOMPLETE_LEADER_ID = "bd7b7aae-88e9-4260-a7b5-301993757e59"
 # in_progress child states an agent (or reviewer) can still move forward.
 # Anything else open (in_review waits on the Owner, wait_for_decision on the
 # Owner/Architect, blocked on a fix) never auto-fires children_done.
@@ -232,16 +237,19 @@ def fetch_issues():
     # One call per status: a single list caps at 50 rows and the managed board
     # (in_progress + gate-waiting + assigned todos + blocked for the M-268
     # stuck-list) can exceed that. Still cheap: 4 list calls for the sweep.
-    issues, seen = [], set()
+    issues, seen, errors = [], set(), []
     for st in ("in_progress", "planing_2", "todo", "blocked"):
         d = sh_json(["multica", "issue", "list", "--output", "json", "--status", st,
                      "--fields", "identifier,id,status,assignee_id,updated_at,last_activity_at,priority,title"])
+        if isinstance(d, dict) and "__error__" in d:
+            errors.append({"status": st, "error": d["__error__"]})
+            continue
         rows = d if isinstance(d, list) else d.get("issues", [])
         for i in rows:
             if i.get("id") not in seen:
                 seen.add(i.get("id"))
                 issues.append(i)
-    return {"issues": issues, "has_more": False}
+    return {"issues": issues, "has_more": False, "errors": errors}
 
 
 def card_runs(card_id):
@@ -522,13 +530,16 @@ def seed_ledger(applied):
 
 
 # -------------------------------------------------------------------- board
-def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=260):
+def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=260,
+          apply_incomplete_turns=False):
     t_start = now()
     issues_d = fetch_issues()
     if isinstance(issues_d, list):
         issues = issues_d
+        issue_errors = []
     else:
         issues = issues_d.get("issues", [])
+        issue_errors = issues_d.get("errors", [])
     # note: one list call per status; page covers the small managed board.
     # has_more=True would need deeper pagination later — the tick report prints
     # counts so nothing truncates silently.
@@ -745,8 +756,18 @@ def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=26
         "loop_seconds": round((now() - t_start).total_seconds(), 1),
     }
     stuck = build_stuck_list(board, issues, t_start, baseline_resume())
+    incomplete_turns = collect_incomplete_turns(issues, issue_errors=issue_errors)
+    if apply_incomplete_turns and incomplete_turns.get("state") is not None:
+        saved, save_error = save_incomplete_turns_state(incomplete_turns["state"])
+        incomplete_turns["state_saved"] = saved
+        if save_error:
+            incomplete_turns["state_write_error"] = save_error
+            incomplete_turns["actions"] = []
+            incomplete_turns.setdefault("skipped", []).append(
+                {"reason": "ledger_write_failed", "detail": save_error})
     return {"board": board, "gate_waiting": gate_waiting, "todo_reroutes": todo_reroutes,
             "cooldown_writes": cooldown_writes, "counts": counts, "stuck": stuck,
+            "incomplete_turns": incomplete_turns,
             "queues": fetch_queues(t_start),
             "wip_breaches": wip_breaches, "seats": seats,
             "eligible": {"engineers": pool_eligibility(ENGINEERS_ORDER, "engineer"),
@@ -764,6 +785,288 @@ def read_baseline():
         return json.loads(val) if isinstance(val, str) else val
     except json.JSONDecodeError:
         return {}
+
+
+# ---------------------------------------------- M-393 incomplete-turn detector
+INCOMPLETE_REMINDER = (
+    "Your previous run ended without an issue-state result. Continue the task, "
+    "then finish by handing off, advancing the issue with evidence, sending a "
+    "native ask/plan, or arming an expiring wakeup. Do not end with a progress "
+    "note or ‘standing by’."
+)
+
+
+def incomplete_turns_default_state():
+    return {"last_sweep_at": None, "processed_run_ids": [], "counts": {}}
+
+
+def load_incomplete_turns_state():
+    d = sh_json(["multica", "issue", "metadata", "get", M86_ID,
+                 "--key", INCOMPLETE_TURNS_KEY])
+    if not isinstance(d, dict) or "__error__" in d:
+        error = d.get("__error__", "unreadable metadata") if isinstance(d, dict) else "bad metadata response"
+        if "not found on issue" in error.lower():
+            return incomplete_turns_default_state(), None
+        return None, error
+    value = d.get("value")
+    if value in (None, ""):
+        return incomplete_turns_default_state(), None
+    try:
+        state = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, json.JSONDecodeError):
+        return None, "invalid metadata JSON"
+    if not isinstance(state, dict) or not isinstance(state.get("counts", {}), dict):
+        return None, "invalid metadata shape"
+    try:
+        if any(int(value) < 0 or int(value) > 2 for value in state.get("counts", {}).values()):
+            return None, "invalid occurrence count"
+    except (TypeError, ValueError):
+        return None, "invalid occurrence count"
+    if (not isinstance(state.get("processed_run_ids", []), list) or
+            any(not isinstance(rid, str) for rid in state.get("processed_run_ids", []))):
+        return None, "invalid processed run IDs"
+    state.setdefault("last_sweep_at", None)
+    state.setdefault("processed_run_ids", [])
+    state.setdefault("counts", {})
+    return state, None
+
+
+def save_incomplete_turns_state(state):
+    payload = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
+    if len(payload.encode("utf-8")) >= 4000:
+        return False, "incomplete-turn ledger exceeds 4KB"
+    rc, _, err = sh(["multica", "issue", "metadata", "set", M86_ID,
+                     "--key", INCOMPLETE_TURNS_KEY, "--value", payload,
+                     "--type", "string"])
+    return rc == 0, err.strip()[:200] if rc != 0 else None
+
+
+def timestamp_in_run(value, run):
+    event_at = parse_ts(value)
+    started = parse_ts(run.get("started_at"))
+    completed = parse_ts(run.get("completed_at"))
+    return bool(event_at and started and completed and event_at.tzinfo and
+                started.tzinfo and completed.tzinfo and
+                started <= event_at <= completed)
+
+
+def history_has_ambiguous_timestamps(activities, comments, wakeups):
+    """History reads are complete records; an unknown event time cannot prove no delta."""
+    for rows in (activities, comments, wakeups):
+        for row in rows:
+            event_at = parse_ts(row.get("created_at"))
+            if event_at is None or event_at.tzinfo is None:
+                return True
+    return False
+
+
+def run_has_incomplete_turn_delta(run, activities, comments, wakeups):
+    """Whether this completed run made one of the D6 state changes."""
+    for event in activities:
+        if event.get("action") in ("status_changed", "assignee_changed") and \
+           timestamp_in_run(event.get("created_at"), run):
+            return True
+    for comment in comments:
+        if comment.get("author_id") == run.get("agent_id") and \
+           timestamp_in_run(comment.get("created_at"), run):
+            return True
+    for wakeup in wakeups:
+        if timestamp_in_run(wakeup.get("created_at"), run):
+            return True
+    return False
+
+
+def classify_incomplete_turns(issues, histories, activities, comments, wakeups,
+                              state, t=None, max_issues=INCOMPLETE_TURNS_MAX_ISSUES):
+    """Pure D6 classifier. Inputs are snapshots keyed by issue id; unreadable
+    snapshots are represented by an error string and fail closed. The returned
+    state is safe to persist only after the caller has handled every action."""
+    t = t or now()
+    state = json.loads(json.dumps(state or incomplete_turns_default_state()))
+    previous_sweep = parse_ts(state.get("last_sweep_at"))
+    processed = set(state.get("processed_run_ids") or [])
+    counts = state.setdefault("counts", {})
+    actions, skipped, processed_now = [], [], []
+    working = [i for i in (issues or [])
+               if i.get("status") in INCOMPLETE_WORKING_STATUSES and i.get("assignee_id")]
+    working.sort(key=lambda i: i.get("identifier") or i.get("id") or "")
+    cursor = state.get("cursor")
+    if cursor and working:
+        split = next((n + 1 for n, item in enumerate(working)
+                      if (item.get("identifier") or item.get("id") or "") > cursor), len(working))
+        working = working[split:] + working[:split]
+    selected = working[:max(0, max_issues)]
+    truncated = len(working) > len(selected)
+    failures = False
+
+    for issue in selected:
+        iid = issue.get("id")
+        if iid not in histories or isinstance(histories.get(iid), dict):
+            failures = True
+            skipped.append({"issue": issue.get("identifier"), "reason": "runs_unreadable"})
+            continue
+        runs = histories.get(iid) or []
+        candidates = []
+        for run in runs:
+            completed = parse_ts(run.get("completed_at"))
+            started = parse_ts(run.get("started_at"))
+            rid = run.get("id")
+            if (run.get("status") != "completed" or not completed or not started or
+                    not rid or rid in processed or
+                    (previous_sweep and completed <= previous_sweep)):
+                continue
+            candidates.append(run)
+        if not candidates:
+            continue
+        if (iid not in activities or iid not in comments or iid not in wakeups or
+                any(isinstance(rows, dict) for rows in
+                    (activities.get(iid), comments.get(iid), wakeups.get(iid)))):
+            failures = True
+            skipped.append({"issue": issue.get("identifier"), "reason": "history_unreadable"})
+            continue
+        candidates.sort(key=lambda r: (r.get("completed_at") or "", r.get("id") or ""))
+        issue_events = activities[iid]
+        issue_comments = comments[iid]
+        issue_wakeups = wakeups[iid]
+        if history_has_ambiguous_timestamps(issue_events, issue_comments, issue_wakeups):
+            failures = True
+            skipped.append({"issue": issue.get("identifier"), "reason": "ambiguous_history_timestamp"})
+            continue
+        for run in candidates:
+            rid, aid = run["id"], run.get("agent_id")
+            if not aid:
+                failures = True
+                skipped.append({"issue": issue.get("identifier"), "reason": "run_agent_missing"})
+                continue
+            key = f"{issue.get('identifier') or iid}:{aid}"
+            if run_has_incomplete_turn_delta(run, issue_events, issue_comments, issue_wakeups):
+                counts.pop(key, None)
+                processed_now.append(rid)
+                continue
+            if (issue.get("status") not in INCOMPLETE_WORKING_STATUSES or
+                    issue.get("assignee_id") != aid):
+                counts.pop(key, None)
+                processed_now.append(rid)
+                continue
+            count = int(counts.get(key) or 0)
+            if count >= 2:
+                processed_now.append(rid)
+                continue
+            if count < 2:
+                count += 1
+            counts[key] = count
+            processed_now.append(rid)
+            if aid == INCOMPLETE_LEADER_ID:
+                action = "leader_noop"
+                target = aid
+            elif count == 1:
+                action = "requeue_same_agent"
+                target = aid
+            elif count == 2:
+                action = "assign_leader"
+                target = INCOMPLETE_LEADER_ID
+            else:
+                continue
+            actions.append({"issue": issue.get("identifier"), "issue_id": iid,
+                            "run_id": rid, "agent_id": aid, "occurrence": count,
+                            "action": action, "target_agent_id": target,
+                            "reminder": INCOMPLETE_REMINDER})
+
+    processed_ids = list(dict.fromkeys((state.get("processed_run_ids") or []) + processed_now))
+    state["processed_run_ids"] = processed_ids[-40:]
+    state["counts"] = dict(list(counts.items())[-40:])
+    # An unreadable issue keeps the old boundary so its candidate runs are retried.
+    if truncated:
+        skipped.append({"reason": "issue_cap", "uninspected": len(working) - len(selected)})
+        if selected:
+            state["cursor"] = selected[-1].get("identifier") or selected[-1].get("id")
+    elif not failures:
+        state["last_sweep_at"] = t.isoformat().replace("+00:00", "Z")
+        state.pop("cursor", None)
+    return {"checked_issues": len(selected), "eligible_issues": len(working),
+            "actions": actions, "skipped": skipped, "state": state}
+
+
+def collect_incomplete_turns(issues, max_issues=INCOMPLETE_TURNS_MAX_ISSUES, issue_errors=None):
+    if issue_errors:
+        return {"checked_issues": 0, "eligible_issues": 0, "actions": [],
+                "skipped": [{"reason": "issue_list_unreadable", "errors": issue_errors}],
+                "state": None}
+    state, state_error = load_incomplete_turns_state()
+    if state_error:
+        return {"checked_issues": 0, "eligible_issues": 0, "actions": [],
+                "skipped": [{"reason": "ledger_unreadable", "detail": state_error}],
+                "state": None}
+    t = now()
+    last_sweep = parse_ts(state.get("last_sweep_at"))
+    if state.get("last_sweep_at") and (last_sweep is None or last_sweep.tzinfo is None):
+        return {"checked_issues": 0, "eligible_issues": 0, "actions": [],
+                "skipped": [{"reason": "ledger_unreadable", "detail": "ambiguous last_sweep_at"}],
+                "state": None}
+    if last_sweep is None:
+        # Establish a baseline rather than reprocessing the issue's full history.
+        state["last_sweep_at"] = t.isoformat().replace("+00:00", "Z")
+        last_sweep = t
+    working = [i for i in (issues or [])
+               if i.get("status") in INCOMPLETE_WORKING_STATUSES and i.get("assignee_id")]
+    working.sort(key=lambda i: i.get("identifier") or i.get("id") or "")
+    cursor = state.get("cursor")
+    if cursor and working:
+        split = next((n + 1 for n, item in enumerate(working)
+                      if (item.get("identifier") or item.get("id") or "") > cursor), len(working))
+        working = working[split:] + working[:split]
+    selected = working[:max(0, max_issues)]
+    histories, activities, comments, wakeups = {}, {}, {}, {}
+    for issue in selected:
+        iid = issue.get("id")
+        runs = sh_json(["multica", "issue", "runs", iid, "--output", "json"])
+        if isinstance(runs, dict) and "__error__" in runs:
+            histories[iid] = runs
+            continue
+        if isinstance(runs, dict):
+            runs = runs.get("runs", [])
+        histories[iid] = runs if isinstance(runs, list) and all(isinstance(r, dict) for r in runs) else {"__error__": "bad run response"}
+        if isinstance(histories[iid], dict):
+            continue
+        new_runs = []
+        bad_run_timestamp = False
+        for run in histories[iid]:
+            if run.get("status") != "completed" or run.get("id") in (state.get("processed_run_ids") or []):
+                continue
+            if not run.get("id") or not run.get("agent_id"):
+                bad_run_timestamp = True
+                break
+            completed = parse_ts(run.get("completed_at"))
+            started = parse_ts(run.get("started_at"))
+            if completed is None or started is None or completed.tzinfo is None or started.tzinfo is None:
+                bad_run_timestamp = True
+                break
+            if not last_sweep or completed > last_sweep:
+                new_runs.append(run)
+        if bad_run_timestamp:
+            histories[iid] = {"__error__": "ambiguous run timestamp"}
+            continue
+        if not new_runs:
+            continue
+        starts = [parse_ts(r.get("started_at")) for r in new_runs]
+        if not all(starts):
+            activities[iid] = {"__error__": "ambiguous run timestamp"}
+            continue
+        since = min(starts).isoformat().replace("+00:00", "Z")
+        acts = sh_json(["multica", "issue", "timeline", iid, "--action",
+                        "status_changed,assignee_changed", "--activity-only",
+                        "--since", since, "--output", "json"])
+        comms = sh_json(["multica", "issue", "comment", "list", iid,
+                         "--since", since, "--output", "json"])
+        wakes = sh_json(["multica", "issue", "wakeup", "list", iid, "--output", "json"])
+        activities[iid] = acts if isinstance(acts, list) else acts.get("activities", acts.get("events", [])) if isinstance(acts, dict) and "__error__" not in acts else {"__error__": "unreadable timeline"}
+        comments[iid] = comms if isinstance(comms, list) else comms.get("comments", []) if isinstance(comms, dict) and "__error__" not in comms else {"__error__": "unreadable comments"}
+        wakeups[iid] = wakes if isinstance(wakes, list) else wakes.get("wakeups", []) if isinstance(wakes, dict) and "__error__" not in wakes else {"__error__": "unreadable wakeups"}
+        if any(not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+               for rows in (activities[iid], comments[iid], wakeups[iid])):
+            activities[iid] = {"__error__": "malformed history"}
+    return classify_incomplete_turns(issues, histories, activities, comments,
+                                     wakeups, state, t=t, max_issues=max_issues)
 
 
 def baseline_resume():
@@ -962,6 +1265,7 @@ def scan_free_questions(issues, hours, names=None):
 def main():
     args = sys.argv[1:]
     apply_cooldown = "--apply-cooldown" in args
+    apply_incomplete_turns = "--apply-incomplete-turns" in args and "--stuck-list" not in args
     seed = "--seed" in args
     max_cards = 0
     if "--max-cards" in args:
@@ -987,7 +1291,8 @@ def main():
     if seed or led_err:
         seed_ledger(seeded)
         ledger, led_err = read_ledger()
-    result = sweep(ledger, names, all_prs=prs, apply_cooldown=apply_cooldown, max_cards=max_cards)
+    result = sweep(ledger, names, all_prs=prs, apply_cooldown=apply_cooldown,
+                   max_cards=max_cards, apply_incomplete_turns=apply_incomplete_turns)
     if "--stuck-list" in args:
         print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                           "tool": "orch-sweep", "mode": "stuck-list",
