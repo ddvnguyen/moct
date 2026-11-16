@@ -428,6 +428,20 @@ spec = importlib.util.spec_from_loader("s", loader)
 s = importlib.util.module_from_spec(spec); loader.exec_module(s)
 T = s.parse_ts("2026-11-17T03:00:00Z")
 day = s.budget_day(T)
+# The platform rejects a wakeup with no event and no `at` delay
+# ("select at least one supported event"); the stub enforces that so a
+# malformed flag set can never pass here again.
+def platform_wakeup_ok(args):
+    kind = args[args.index("--kind") + 1] if "--kind" in args else "event"
+    if any(a.startswith("--until-") for a in args):
+        return kind == "event"
+    if kind == "at":
+        return "--after" in args or "--at" in args
+    if kind == "event":
+        return "--event" in args
+    return False
+
+
 state = {"budget": {"d": day, "n": 5}}
 calls, fail_create = [], [False]
 def fake_sh(args, timeout=90):
@@ -438,6 +452,7 @@ def fake_sh(args, timeout=90):
         state["budget"] = json.loads(args[args.index("--value") + 1])
         return 0, "", ""
     if args[0:4] == ["multica", "issue", "wakeup", "create"]:
+        assert platform_wakeup_ok(args), "platform: select at least one supported event " + repr(args)
         if fail_create[0]:
             return 1, "", "boom"
         return 0, json.dumps({"id": "w1"}), ""
@@ -507,6 +522,19 @@ s.children_statuses = lambda key: None
 s.target_status = lambda ref: None
 budget_state = {}
 calls = []
+
+
+def platform_wakeup_ok(args):
+    kind = args[args.index("--kind") + 1] if "--kind" in args else "event"
+    if any(a.startswith("--until-") for a in args):
+        return kind == "event"
+    if kind == "at":
+        return "--after" in args or "--at" in args
+    if kind == "event":
+        return "--event" in args
+    return False
+
+
 def fake_sh(args, timeout=90):
     calls.append(args)
     if args[0:4] == ["multica", "issue", "metadata", "get"]:
@@ -517,6 +545,7 @@ def fake_sh(args, timeout=90):
         budget_state.clear(); budget_state.update(json.loads(args[args.index("--value") + 1]))
         return 0, "", ""
     if args[0:4] == ["multica", "issue", "wakeup", "create"]:
+        assert platform_wakeup_ok(args), "platform: select at least one supported event " + repr(args)
         return 0, json.dumps({"id": "w1"}), ""
     if args[0:3] == ["multica", "issue", "get"]:
         return 0, "", ""
@@ -538,10 +567,31 @@ applied = s.sweep_v2(issues, T, {}, [], apply=True, limit=6, card_cap=40,
                      agent_row={}, todos=[], wip={})
 w = WRITES()
 assert len([c for c in w if c[0:4] == ["multica", "issue", "wakeup", "create"]]) == 1, w
+create = next(c for c in w if c[0:4] == ["multica", "issue", "wakeup", "create"])
+assert create[create.index("--kind") + 1] == "at" and create[create.index("--after") + 1] == "1m", create
 assert len([c for c in w if c[0:4] == ["multica", "issue", "metadata", "set"]]) == 1, w
 assert applied["actions"][0]["armed"] and applied["actions"][0]["budget_after"] == 1
 assert budget_state.get("n") == 1, budget_state
 assert applied["violators_after"] == []
+
+# Coverage must be real. A failed create is an escalation, never coverage.
+s.arm_wake = lambda *a, **k: {"card": "M-1", "cause": "resume", "armed": False,
+                              "budget_before": 0, "budget_after": 0,
+                              "error": "Invalid request: bad wakeup"}
+failed = s.sweep_v2(issues, T, {}, [], apply=True, limit=6, card_cap=40,
+                    agent_row={}, todos=[], wip={})
+assert failed["violators_after"] == ["M-1"], failed["violators_after"]
+assert failed["escalations"][0]["reason"] == "wakeup-create-failed", failed["escalations"]
+
+# ...and a Leader queue that never left the box covers nothing either.
+s.arm_wake = lambda *a, **k: {"card": "M-2", "cause": "resume", "armed": True,
+                              "wakeup_kind": "after", "budget_before": 0,
+                              "budget_after": 1}
+wfd = [dict(issues[0], identifier="M-2", status="wait_for_decision")]
+undelivered = s.sweep_v2(wfd, T, {}, [], apply=True, limit=6, card_cap=40,
+                         agent_row={}, todos=[], wip={})
+assert undelivered["leader_ping"]["arm"] is False, undelivered["leader_ping"]
+assert undelivered["violators_after"] == ["M-2"], undelivered["violators_after"]
 
 # An idle engineer with no todo yields exactly ONE batched cut_next; with a
 # todo on the board the Leader is not asked to cut.
@@ -569,9 +619,23 @@ issues = [{"id": "epic", "identifier": s.LEADER_CARD, "status": "in_progress"}]
 q = {"owner_asks": [{"cluster": "PR#200", "cards": ["M-31"]}], "decisions": [],
      "plans": [], "reassign": [], "verdicts": [], "cut_next": [], "items": 1}
 calls, wakeups = [], [[]]
+
+
+def platform_wakeup_ok(args):
+    kind = args[args.index("--kind") + 1] if "--kind" in args else "event"
+    if any(a.startswith("--until-") for a in args):
+        return kind == "event"
+    if kind == "at":
+        return "--after" in args or "--at" in args
+    if kind == "event":
+        return "--event" in args
+    return False
+
+
 def fake_sh(args, timeout=90):
     calls.append(args)
     if args[0:4] == ["multica", "issue", "wakeup", "create"]:
+        assert platform_wakeup_ok(args), "platform: select at least one supported event " + repr(args)
         return 0, json.dumps({"id": "lw1"}), ""
     raise AssertionError("unexpected call " + repr(args))
 s.sh = fake_sh
@@ -588,6 +652,7 @@ ping = s.ping_leader(q, issues, T, True, {}, {})
 assert ping["arm"] is True and ping["reason"] == "armed"
 arm = next(c for c in calls if c[0:4] == ["multica", "issue", "wakeup", "create"])
 assert arm[4] == "epic" and arm[arm.index("--agent-id") + 1] == lead, arm
+assert arm[arm.index("--kind") + 1] == "at", arm
 assert "Leader queue from orch-sweep" in arm[arm.index("--instruction") + 1]
 
 # a pending Leader wakeup means the queue is already delivered

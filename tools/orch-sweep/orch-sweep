@@ -1287,6 +1287,11 @@ def arm_wake(card, card_id, cause, flags, apply, limit, t, agent_id=None):
             if werr:
                 act["escalation_write_error"] = werr
         return act
+    # A delay is the platform's `at` kind: the default kind (event) rejects
+    # `--after` with "select at least one supported event". Conditions
+    # (`--until-*`) are event rules and need nothing added here.
+    if "--after" in flags and "--kind" not in flags:
+        flags = ["--kind", "at"] + list(flags)
     instruction = CAUSE_INSTRUCTION.get(cause, "{card}: continue.").format(card=card)
     # A repeating rule must stop itself: one-shot conditions need nothing, an
     # event/every/cron cause gets a fire cap on top of its expiry.
@@ -1606,7 +1611,8 @@ def ping_leader(queue, issues, t, apply, agent_row, names):
             cards = [x.get("card") or x.get("agent") or "idle-engineers" for x in queue[k]]
             bits.append(f"{k} {len(queue[k])} ({', '.join(str(c) for c in cards[:4])})")
     text = f"Leader queue from orch-sweep (1 tick): {queue['items']} items - " + "; ".join(bits)
-    flags = ["--agent-id", lead, "--after", "1m", "--instruction", text[:600]]
+    flags = ["--agent-id", lead, "--kind", "at", "--after", "1m",
+             "--instruction", text[:600]]
     ping.update({"instruction": text[:600], "dry_run": not apply})
     if not apply:
         ping["reason"] = "would-arm"
@@ -1675,14 +1681,26 @@ def sweep_v2(issues, t, names, all_prs, apply, limit, card_cap, agent_row, todos
     queue = leader_queue_for(facts, blocked, inv, idle, len(todos), agent_row, names)
     ping = ping_leader(queue, issues, t, apply, agent_row, names)
     kinds = {k: sum(1 for b in blocked if b["kind"] == k) for k in BLOCK_KINDS + ("unverified",)}
-    post_violators = [v["card"] for v in inv["violators"] if v["card"] not in covered]
-    return {"checked": inv["checked"], "scope": inv["scope"], "cap": card_cap or None,
-            "satisfied_by": inv["satisfied_by"], "violators": inv["violators"],
-            "violators_after": post_violators, "covered": covered,
-            "actions": actions, "escalations": escalations,
-            "blocked": blocked, "blocked_kinds": kinds,
-            "idle_engineers": idle, "leader_queue": queue, "leader_ping": ping,
-            "wake_limit": limit, "applied": bool(apply)}
+    # Coverage must be real. A refused budget, a failed create, an unreadable
+    # card, or a Leader queue that never left the box leaves the card undriven;
+    # only an armed wake, or a queue the ping actually delivered, counts.
+    leader_delivered = (not apply) or bool(ping.get("arm"))
+
+    def covered_for(card):
+        tag = covered.get(card) or ""
+        if tag.startswith("wakeup:"):
+            return True
+        return tag == "leader-queue" and leader_delivered
+
+    post_violators = [v["card"] for v in inv["violators"] if not covered_for(v["card"])]
+    v2_out = {"checked": inv["checked"], "scope": inv["scope"], "cap": card_cap or None,
+              "satisfied_by": inv["satisfied_by"], "violators": inv["violators"],
+              "violators_after": post_violators, "covered": covered,
+              "actions": actions, "escalations": escalations,
+              "blocked": blocked, "blocked_kinds": kinds,
+              "idle_engineers": idle, "leader_queue": queue, "leader_ping": ping,
+              "wake_limit": limit, "applied": bool(apply)}
+    return v2_out
 
 
 # --------------------------------------------- M-328 free-questions (Owner)
