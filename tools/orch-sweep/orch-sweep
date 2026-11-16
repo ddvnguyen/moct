@@ -9,8 +9,20 @@ budget (tick contract: at most 6 tool calls plus one per action).
 
 Read-only by default. `--apply-cooldown` writes confirmed quota cooldowns to
 M-86 metadata key `quota_ledger`; `--apply-incomplete-turns` writes the
-incomplete-turn dedupe ledger. Neither flag touches card status, assignments,
-comments or PRs — acting on detector actions stays the Orchestrator's job.
+incomplete-turn dedupe ledger; `--apply` arms the M-392 v2 wakes and their
+per-card `wake_budget`. No flag touches card status, assignments, comments or
+PRs — acting on detector actions stays the Orchestrator's job.
+
+M-392 v2 (`v2` in the full output):
+  --invariant        D2: every non-terminal card has a run, a live wakeup or
+                     an open ask; prints violators + the driver each gets.
+  --blocked-kinds    D3: every `blocked` card with owner/dependency/agent kind,
+                     kind_source and driver (no parking, no 2-resume cap).
+  --apply            D4: arm the wakes (one-shot/expiring, 6 per card per ICT
+                     day) and the single batched Leader ping on M-256.
+`--stuck-list` keeps the M-268 hash slice as a deprecated alias for one
+release; it never runs or writes v2. See tick-prompt-delta.md for the
+Orchestrator prompt half that must ship with this.
 
 `--stuck-list` prints only the compact committee slice:
   {at, tool:"orch-sweep", mode:"stuck-list", hash, triggers, items}
@@ -109,6 +121,35 @@ GITHUB_REPOS = ["ddvnguyen/moct", "ddvnguyen/moct-dsh-team-room",
 ACTIVE_RUN_STATUSES = {"running", "queued", "dispatched", "waiting_local_directory", "started"}
 
 ICT = timezone(timedelta(hours=7))  # Asia/Ho_Chi_Minh
+
+# --- M-392 v2 knobs (D2 invariant / D3 blocked kinds / D4 event wakes) -----
+V2_STATUSES = {"in_progress", "planing_2", "todo", "blocked",
+               "wait_for_decision", "agent_review_deploy"}
+BLOCK_KINDS = ("owner", "dependency", "agent")
+WAKE_BUDGET_KEY = "wake_budget"  # per-card: {d: YYYY-MM-DD (ICT), n, last, esc}
+WAKE_LIMIT_DEFAULT = 6
+INVARIANT_CARDS_DEFAULT = 60  # the managed board is ~46 in-scope cards; blocked are kept first
+DEP_WAIT_EXPIRES = "72h"
+CHILDREN_WAIT_EXPIRES = "72h"
+PR_WAIT_EXPIRES = "24h"
+LEADER_PING_MIN = 60
+WAKE_MAX_FIRES_DEFAULT = 3  # repeating event/every/cron rules stop themselves
+LEADER_CARD = "M-256"  # epic the batched Leader queue is delivered on
+PLAN_GATE_MIN = 60     # planing_2 idle this long with no driver -> Leader queue
+WAKE_KIND_FLAGS = ("after", "at", "until-pr", "until-issue", "until-children-done",
+                   "until-status", "every", "cron")
+CAUSE_INSTRUCTION = {
+    "resume": "{card}: no live run and no live wakeup. Resume the task now, then hand off, "
+              "advance it with evidence, or arm an expiring wakeup.",
+    "start": "{card}: assigned todo with no run and no wakeup. Start it now.",
+    "deploy": "{card}: in agent_review_deploy with no run and no wakeup. Deploy, verify on "
+              "the lane, post the evidence block.",
+    "dependency": "{card}: its blocker reached in_review. Continue the task now.",
+    "verdict": "{card}: a newer CI result exists on its PR. Check the verdict; merge if "
+               "green and approved, otherwise fix.",
+    "children": "{card}: its child issues are closed. Continue the parent task.",
+    "plan": "{card}: approval path. If the plan is approved, move it to in_progress and start.",
+}
 
 
 # ---------------------------------------------------------------- utilities
@@ -235,12 +276,15 @@ def agent_names():
 
 def fetch_issues():
     # One call per status: a single list caps at 50 rows and the managed board
-    # (in_progress + gate-waiting + assigned todos + blocked for the M-268
-    # stuck-list) can exceed that. Still cheap: 4 list calls for the sweep.
+    # (in_progress + gate-waiting + assigned todos + blocked/waiting/review for
+    # the M-392 invariant pass) can exceed that. Still cheap: 6 list calls.
+    # `description` + `metadata` feed the v2 ref scan and `block_kind`; they
+    # ride this call instead of one `issue get` per card.
     issues, seen, errors = [], set(), []
-    for st in ("in_progress", "planing_2", "todo", "blocked"):
+    for st in ("in_progress", "planing_2", "todo", "blocked", "wait_for_decision",
+               "agent_review_deploy"):
         d = sh_json(["multica", "issue", "list", "--output", "json", "--status", st,
-                     "--fields", "identifier,id,status,assignee_id,updated_at,last_activity_at,priority,title"])
+                     "--fields", "identifier,id,status,assignee_id,updated_at,last_activity_at,priority,title,description,metadata"])
         if isinstance(d, dict) and "__error__" in d:
             errors.append({"status": st, "error": d["__error__"]})
             continue
@@ -531,7 +575,8 @@ def seed_ledger(applied):
 
 # -------------------------------------------------------------------- board
 def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=260,
-          apply_incomplete_turns=False):
+          apply_incomplete_turns=False, v2_enabled=True, v2_apply=False,
+          v2_cards=INVARIANT_CARDS_DEFAULT, wake_limit=WAKE_LIMIT_DEFAULT):
     t_start = now()
     issues_d = fetch_issues()
     if isinstance(issues_d, list):
@@ -765,8 +810,13 @@ def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=26
             incomplete_turns["actions"] = []
             incomplete_turns.setdefault("skipped", []).append(
                 {"reason": "ledger_write_failed", "detail": save_error})
+    v2 = None
+    if v2_enabled:
+        v2 = sweep_v2(issues, t_start, names, all_prs, v2_apply, wake_limit, v2_cards,
+                      agent_row, todos, wip)
     return {"board": board, "gate_waiting": gate_waiting, "todo_reroutes": todo_reroutes,
             "cooldown_writes": cooldown_writes, "counts": counts, "stuck": stuck,
+            "v2": v2,
             "incomplete_turns": incomplete_turns,
             "queues": fetch_queues(t_start),
             "wip_breaches": wip_breaches, "seats": seats,
@@ -1151,6 +1201,490 @@ def build_stuck_list(board, issues, t, resume_map):
     triggers = sorted({x["trigger"].split(":")[0] for x in items})
     return {"hash": digest, "triggers": triggers, "items": items}
 
+# --------------------- M-392 v2: invariant (D2), blocked kinds (D3), wakes (D4)
+# One pass that answers "is every open card driven?". A card is driven when it
+# has an active run, a live wakeup, or an open ask; anything else is a violator
+# with one concrete driver attached (wakeup, Leader queue item, or escalation).
+#
+# Boundaries, so nobody re-derives them:
+#   * `blocked` is never parked. It gets a kind (owner | dependency | agent |
+#     unverified) and a driver; the `after 2 failed resumes -> blocked` rule is
+#     gone from the tick (see tick-prompt-delta.md).
+#   * every armed wait is one-shot with `--expires-in`; repeating rules carry
+#     `--max-fires`. Budget is per card, per ICT day (`wake_budget` metadata),
+#     default 6, so one card cannot storm wakes.
+#   * the stuck-list hash and the global 4/day cap are no longer the tick's
+#     gate; the Leader is pinged once when the batched queue is non-empty and
+#     no Leader wakeup is pending, at most once per LEADER_PING_MIN.
+#   * `--apply` is the only mode that writes; every other mode is read-only.
+
+def blocked_kind(value):
+    return (value or "").strip().lower()
+
+
+def budget_day(t):
+    return t.astimezone(ICT).strftime("%Y-%m-%d")
+
+
+def read_wake_budget(card_id):
+    """Per-card wake budget; absent/unreadable degrades to n=0 with a label."""
+    d = sh_json(["multica", "issue", "metadata", "get", card_id, "--key", WAKE_BUDGET_KEY])
+    if isinstance(d, dict) and "__error__" in d:
+        err = d["__error__"]
+        return {}, ("absent" if "not found" in err.lower() else err[:120])
+    val = d.get("value") if isinstance(d, dict) else d
+    if val in (None, ""):
+        return {}, "absent"
+    try:
+        b = json.loads(val) if isinstance(val, str) else val
+    except json.JSONDecodeError:
+        return {}, "bad-json"
+    return (b, None) if isinstance(b, dict) else ({}, "bad-shape")
+
+
+def budget_used(budget, t):
+    """Wakes already armed for this card today (ICT day boundary)."""
+    try:
+        return int(budget.get("n") or 0) if budget.get("d") == budget_day(t) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def write_wake_budget(card_id, budget):
+    payload = json.dumps(budget, separators=(",", ":"), ensure_ascii=False)
+    rc, _, err = sh(["multica", "issue", "metadata", "set", card_id, "--key", WAKE_BUDGET_KEY,
+                     "--value", payload, "--type", "string"])
+    return rc == 0, (err.strip()[:150] if rc != 0 else None)
+
+
+def wake_kind_of(flags):
+    return next((f[2:] for f in flags if f.startswith("--") and f[2:] in WAKE_KIND_FLAGS), "?")
+
+
+def arm_wake(card, card_id, cause, flags, apply, limit, t, agent_id=None):
+    """The single arming path: budget check, then (only with --apply) one
+    `wakeup create` and the per-card budget write. Dry run writes nothing.
+    `agent_id` is the card's assignee: without it the platform would wake the
+    tick's own agent instead of the card owner."""
+    budget, b_err = read_wake_budget(card_id)
+    used = budget_used(budget, t)
+    act = {"card": card, "cause": cause, "wakeup_kind": wake_kind_of(flags),
+           "expires_in": (flags[flags.index("--expires-in") + 1]
+                          if "--expires-in" in flags else None),
+           "budget_before": used, "budget_after": used, "armed": False}
+    if b_err and b_err != "absent":
+        act["budget_error"] = b_err
+    if used >= limit:
+        esc_today = budget.get("esc") == budget_day(t)
+        act.update({"refused": "budget-exhausted", "escalate": not esc_today,
+                    "escalation_logged": False})
+        if apply and not esc_today:
+            nb = {"d": budget_day(t), "n": used, "esc": budget_day(t)}
+            if budget.get("last"):
+                nb["last"] = budget["last"]
+            ok, werr = write_wake_budget(card_id, nb)
+            act["escalation_logged"] = ok
+            if werr:
+                act["escalation_write_error"] = werr
+        return act
+    instruction = CAUSE_INSTRUCTION.get(cause, "{card}: continue.").format(card=card)
+    # A repeating rule must stop itself: one-shot conditions need nothing, an
+    # event/every/cron cause gets a fire cap on top of its expiry.
+    if ({"--event", "--every", "--cron"} & set(flags)) and "--max-fires" not in flags:
+        flags = flags + ["--max-fires", str(WAKE_MAX_FIRES_DEFAULT)]
+    if agent_id:
+        flags = flags + ["--agent-id", agent_id]
+    act["agent_id"] = agent_id
+    args = ["multica", "issue", "wakeup", "create", card_id] + flags + \
+           ["--instruction", instruction, "--output", "json"]
+    act["instruction"] = instruction
+    if not apply:
+        act.update({"dry_run": True, "command": " ".join(args[3:])})
+        return act
+    rc, out, err = sh(args, timeout=60)
+    if rc != 0:
+        act["error"] = (err.strip() or out.strip())[:200]
+        return act
+    act["armed"] = True
+    try:
+        act["wakeup_id"] = (json.loads(out).get("id") or "")[:8]
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    nb = {"d": budget_day(t), "n": used + 1, "last": t.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if budget.get("esc") == nb["d"]:
+        nb["esc"] = budget["esc"]
+    ok, werr = write_wake_budget(card_id, nb)
+    act["budget_after"] = used + 1
+    act["budget_written"] = ok
+    if werr:
+        act["budget_write_error"] = werr
+    return act
+
+
+def read_open_questions(card_id):
+    """(count, error): open structured asks are a card's driver (D2)."""
+    d = sh_json(["multica", "question", "list", card_id, "--status", "open",
+                 "--output", "json"], timeout=60)
+    if isinstance(d, dict) and "__error__" in d:
+        return None, d["__error__"][:120]
+    rows = d if isinstance(d, list) else (d.get("questions", []) if isinstance(d, dict) else [])
+    return len(rows or []), None
+
+
+def is_pr_ref(ref):
+    return bool(ref) and ("#" in ref or ref.lower().startswith("pr"))
+
+
+def target_moveable(ref, ref_status):
+    """A blocker still worth waiting on. Unread or PR refs count as moveable
+    (the armed wait is one-shot with an expiry, so a wrong guess costs one
+    wake, never a parked card); a known terminal blocker means stale parking."""
+    if is_pr_ref(ref):
+        return True
+    st = (ref_status or {}).get(ref)
+    if st is None:
+        return True
+    return st not in ("done", "cancelled", "in_review")
+
+
+def classify_blocked(fact):
+    """-> {card, kind, kind_source, block_on, cluster, driver}.
+    Metadata `block_kind` wins; otherwise a deterministic fallback. Ambiguous
+    metadata fails closed to `unverified` and no automatic action."""
+    md_kind = blocked_kind(fact.get("block_kind"))
+    block_on = (fact.get("block_on") or "").strip() or None
+    ref_status = fact.get("ref_status") or {}
+    live_refs = [k for k, st in ref_status.items() if target_moveable(k, ref_status)]
+    open_pr = fact.get("open_pr") or None
+    pr_ref = f"{open_pr.get('repo')}#{open_pr.get('n')}" if open_pr else None
+    reason = None
+
+    if md_kind in BLOCK_KINDS:
+        kind, source = md_kind, "metadata"
+    elif md_kind:
+        kind, source, reason = "unverified", "metadata", f"unknown block_kind {md_kind!r}"
+    elif fact.get("open_asks"):
+        kind, source = "owner", "heuristic:open-ask"
+    elif block_on and target_moveable(block_on, ref_status):
+        kind, source = "dependency", "heuristic:block_on"
+    elif live_refs:
+        kind, source = "dependency", "heuristic:issue-ref"
+    elif fact.get("children_progressible"):
+        kind, source = "dependency", "heuristic:children"
+    elif block_on:
+        kind, source = "agent", "heuristic:block_on-terminal"
+    elif open_pr:
+        kind, source = "dependency", "heuristic:open-pr"
+    else:
+        kind, source = "agent", "heuristic:no-blocker"
+
+    cluster = block_on or (",".join(sorted(ref_status)) or fact["card"])
+    target = None
+    if kind == "owner":
+        driver = {"action": "ask", "cluster": cluster, "batched": True}
+    elif kind == "dependency":
+        target = block_on or (live_refs[0] if live_refs else pr_ref)
+        if is_pr_ref(target) or (open_pr and not live_refs and not block_on):
+            driver = {"action": "wake", "cause": "verdict",
+                      "flags": ["--until-pr", "checks", "--expires-in", PR_WAIT_EXPIRES,
+                                "--on-timeout", "wake"]}
+            target = pr_ref or target
+        elif fact.get("children_progressible") and not target:
+            driver = {"action": "wake", "cause": "children",
+                      "flags": ["--until-children-done", "--expires-in", CHILDREN_WAIT_EXPIRES,
+                                "--on-timeout", "wake"]}
+            target = "children"
+        elif target:
+            driver = {"action": "wake", "cause": "dependency",
+                      "flags": ["--until-issue", target, "--until-issue-state", "in_review",
+                                "--expires-in", DEP_WAIT_EXPIRES, "--on-timeout", "wake"]}
+        else:
+            driver = {"action": "wake", "cause": "children",
+                      "flags": ["--until-children-done", "--expires-in", CHILDREN_WAIT_EXPIRES,
+                                "--on-timeout", "wake"]}
+            target = "children"
+    elif kind == "agent":
+        target = None
+        if fact.get("account_state") == "cooling":
+            driver = {"action": "reassign", "to": "next-eligible"}
+        else:
+            driver = {"action": "wake", "cause": "resume", "flags": ["--after", "1m"]}
+    else:
+        target = None
+        driver = {"action": "inspect", "why": reason}
+    out = {"card": fact["card"], "kind": kind, "kind_source": source,
+           "block_on": block_on, "cluster": cluster if kind == "owner" else None,
+           "idle_min": fact.get("idle_min"), "driver": driver}
+    if target:
+        out["driver"]["target"] = target
+    if reason:
+        out["reason"] = reason
+    return out
+
+
+def invariant_satisfier(fact):
+    """run > wakeup > ask, in that order; None means the card is undriven."""
+    if fact.get("active_run"):
+        return "run"
+    if fact.get("live_wakeups"):
+        return "wakeup"
+    if fact.get("open_asks"):
+        return "ask"
+    return None
+
+
+def propose_driver(fact):
+    """The one driver an undriven card gets, by status."""
+    if "runs" in (fact.get("errors") or []):
+        return {"action": "inspect", "why": "runs-unreadable"}
+    st = fact.get("status")
+    if st == "blocked":
+        return {"action": "blocked-kind"}
+    if st == "wait_for_decision":
+        return {"action": "ask", "clip": "decision"}
+    if st == "planing_2":
+        return {"action": "wake", "cause": "plan",
+                "flags": ["--until-status", "in_progress", "--expires-in", DEP_WAIT_EXPIRES]}
+    if st == "todo":
+        return {"action": "wake", "cause": "start", "flags": ["--after", "1m"]}
+    if st == "agent_review_deploy":
+        drv = {"action": "wake", "cause": "deploy", "flags": ["--after", "1m"]}
+    else:
+        drv = {"action": "wake", "cause": "resume", "flags": ["--after", "1m"]}
+    # D3 item 4: Leader-owned cards are resumed, not skipped; the wake targets
+    # the Leader because `--agent-id` is the assignee.
+    if fact.get("assignee_id") in LEAD_POOL:
+        drv["leader_owned"] = True
+    return drv
+
+
+def build_invariant(facts, scope_total=None):
+    """Pure D2 check over collected facts -> violators with a driver each."""
+    violators, satisfied = [], {}
+    for f in facts:
+        s = invariant_satisfier(f)
+        if s:
+            satisfied[f["card"]] = s
+            continue
+        violators.append({"card": f["card"], "status": f.get("status"),
+                          "assignee_id": f.get("assignee_id"),
+                          "idle_min": f.get("idle_min"), "satisfier": "none",
+                          "errors": f.get("errors") or [],
+                          "proposed": propose_driver(f)})
+    violators.sort(key=lambda v: (v.get("status") or "", -(v.get("idle_min") or 0)))
+    by = {k: sum(1 for v in satisfied.values() if v == k) for k in ("run", "wakeup", "ask")}
+    return {"checked": len(facts), "scope": scope_total if scope_total is not None else len(facts),
+            "satisfied_by": by, "violators": violators}
+
+
+def collect_v2_facts(issue, t, all_prs, tcache, chcache, agent_row):
+    """Per-card facts for D2/D3: run, live wakeups, open asks, refs, PRs."""
+    key, iid = issue.get("identifier"), issue.get("id")
+    f = {"card": key, "id": iid, "status": issue.get("status"),
+         "assignee_id": issue.get("assignee_id"),
+         "idle_min": idle_minutes(issue.get("last_activity_at")),
+         "active_run": False, "live_wakeups": 0, "open_asks": 0, "errors": [],
+         "prs": prs_for_card(key, all_prs), "refs": [], "ref_status": {},
+         "open_pr": None, "children_progressible": False}
+    md = issue.get("metadata") if isinstance(issue.get("metadata"), dict) else {}
+    f["block_kind"] = md.get("block_kind")
+    f["block_on"] = md.get("block_on")
+    row = agent_row.get(issue.get("assignee_id"), {})
+    f["account_state"] = row_state(row, t) if row else None
+
+    runs = card_runs(iid)
+    if isinstance(runs, dict) and "__error__" in runs:
+        f["errors"].append("runs")
+    else:
+        f["active_run"] = any((r.get("status") or "").lower() in ACTIVE_RUN_STATUSES
+                              for r in (runs or []) if isinstance(r, dict))
+    wakeups = card_wakeups(iid)
+    live, f["wakeup_detail"] = wakeup_liveness(wakeups, key, f["idle_min"], t, tcache, chcache)
+    f["live_wakeups"] = len(live)
+    if not f["active_run"] and not live:
+        n, qerr = read_open_questions(iid)
+        if qerr:
+            f["errors"].append("questions")
+        else:
+            f["open_asks"] = n
+    text = (issue.get("title") or "") + "\n" + (issue.get("description") or "")
+    f["refs"] = [r for r in sorted(set(CARD_KEY_RE.findall(text))) if r != key][:3]
+    for ref in f["refs"][:2]:
+        if ref not in tcache:
+            tcache[ref] = target_status(ref)
+        if tcache[ref]:
+            f["ref_status"][ref] = tcache[ref]
+    f["open_pr"] = next((p for p in f["prs"] if (p.get("state") or "").upper() == "OPEN"), None)
+    if f["status"] == "blocked":
+        if key not in chcache:
+            chcache[key] = children_statuses(key)
+        sts = chcache[key]
+        if sts:
+            open_sts = [s for s in sts if s not in ("done", "cancelled")]
+            f["children_progressible"] = bool(open_sts) and any(s in PROGRESSIBLE for s in open_sts)
+    return f
+
+
+def leader_queue_for(facts, blocked, inv, idle_engineers, todo_count, agent_row, names):
+    """Everything the Leader must judge, batched: asks, decisions, plans,
+    reassignments, verdicts, and one cut_next per idle engineer."""
+    q = {"owner_asks": [], "decisions": [], "plans": [], "reassign": [],
+         "verdicts": [], "cut_next": []}
+    clusters = {}
+    for b in blocked:
+        if b["kind"] == "owner":
+            clusters.setdefault(b["cluster"], []).append(b["card"])
+        elif b["kind"] == "agent" and b["driver"].get("action") == "reassign":
+            q["reassign"].append({"card": b["card"], "reason": b["kind_source"],
+                                  "from": next((f["assignee_id"] for f in facts
+                                                if f["card"] == b["card"]), None)})
+    for cluster, cards in sorted(clusters.items()):
+        q["owner_asks"].append({"cluster": cluster, "cards": sorted(cards),
+                                "ask": "one ask per cluster, never one per card"})
+    by_card = {f["card"]: f for f in facts}
+    for v in inv["violators"]:
+        f = by_card.get(v["card"]) or {}
+        if v["proposed"].get("action") == "ask" and v.get("status") == "wait_for_decision":
+            q["decisions"].append({"card": v["card"], "idle_min": v.get("idle_min")})
+        if v.get("status") == "planing_2" and (f.get("idle_min") or 0) > PLAN_GATE_MIN:
+            q["plans"].append({"card": v["card"], "idle_min": f.get("idle_min"),
+                               "assignee_id": f.get("assignee_id")})
+        for p in f.get("prs") or []:
+            if (p.get("state") or "").upper() != "OPEN" or p.get("verdict_on_head"):
+                continue
+            if not pr_checks_green(p):
+                continue
+            q["verdicts"].append({"card": v["card"],
+                                  "pr": f"{p.get('repo')}#{p.get('n')}@{p.get('head')}",
+                                  "updated_at": p.get("updated_at")})
+            break
+    if todo_count == 0 and idle_engineers:
+        # One item, not one per engineer: the Leader cuts one card and routes it.
+        q["cut_next"].append({"agents": list(idle_engineers),
+                              "names": [(names.get(a) or {}).get("name") for a in idle_engineers],
+                              "reason": "idle engineer(s), no todo on the board"})
+    q["items"] = sum(len(v) for v in q.values())
+    return q
+
+
+def ping_leader(queue, issues, t, apply, agent_row, names):
+    """One batched Leader wake. Replaces the stuck-hash gate and the global
+    4/day cap: arm when the queue is non-empty, no Leader wakeup is pending,
+    and the last one was at least LEADER_PING_MIN ago."""
+    ping = {"arm": False, "items": queue.get("items") or 0}
+    if not queue.get("items"):
+        ping["reason"] = "queue-empty"
+        return ping
+    lead = next((a for a in LEAD_POOL if row_state(agent_row.get(a) or {}, t) != "cooling"), None)
+    if not lead:
+        ping["reason"] = "no-live-leader"
+        return ping
+    ping["agent"] = lead
+    ping["agent_name"] = (names.get(lead) or {}).get("name")
+    card_id = next((i.get("id") for i in issues if i.get("identifier") == LEADER_CARD), None)
+    if not card_id:
+        d = sh_json(["multica", "issue", "get", LEADER_CARD, "--output", "json"])
+        card_id = d.get("id") if isinstance(d, dict) and "__error__" not in d else None
+    if not card_id:
+        ping["reason"] = "leader-card-unreadable"
+        return ping
+    ping["card"] = LEADER_CARD
+    mine = [w for w in card_wakeups(card_id) if w.get("agent_id") == lead]
+    pending = [w for w in mine if w.get("enabled") and not w.get("disabled_at")
+               and not (w.get("condition") or {}) and not w.get("event_types")]
+    if pending:
+        ping["reason"] = "leader-wake-pending"
+        return ping
+    ages = [(t - parse_ts(w.get("created_at"))).total_seconds() / 60.0 for w in mine
+            if parse_ts(w.get("created_at"))]
+    if ages and min(ages) < LEADER_PING_MIN:
+        ping.update({"reason": "spaced", "last_min_ago": round(min(ages), 1)})
+        return ping
+    bits = []
+    for k in ("owner_asks", "decisions", "plans", "reassign", "verdicts", "cut_next"):
+        if queue.get(k):
+            cards = [x.get("card") or x.get("agent") or "idle-engineers" for x in queue[k]]
+            bits.append(f"{k} {len(queue[k])} ({', '.join(str(c) for c in cards[:4])})")
+    text = f"Leader queue from orch-sweep (1 tick): {queue['items']} items - " + "; ".join(bits)
+    flags = ["--agent-id", lead, "--after", "1m", "--instruction", text[:600]]
+    ping.update({"instruction": text[:600], "dry_run": not apply})
+    if not apply:
+        ping["reason"] = "would-arm"
+        return ping
+    rc, out, err = sh(["multica", "issue", "wakeup", "create", card_id] + flags +
+                      ["--output", "json"], timeout=60)
+    ping["arm"] = rc == 0
+    ping["reason"] = "armed" if rc == 0 else "arm-failed"
+    if rc != 0:
+        ping["error"] = (err.strip() or out.strip())[:200]
+    return ping
+
+
+def sweep_v2(issues, t, names, all_prs, apply, limit, card_cap, agent_row, todos, wip):
+    """D2 + D3 + D4 in one pass, bounded by card_cap (oldest idle first)."""
+    tcache, chcache = {}, {}
+    scope = [i for i in issues if i.get("status") in V2_STATUSES]
+    scope.sort(key=lambda i: i.get("last_activity_at") or "")
+    if card_cap:
+        # A cap must never hide the D3 acceptance set: keep every blocked card,
+        # then the oldest idle of the rest.
+        blocked_rows = [i for i in scope if i.get("status") == "blocked"]
+        rest = [i for i in scope if i.get("status") != "blocked"]
+        selected = blocked_rows + rest[:max(0, card_cap - len(blocked_rows))]
+        selected.sort(key=lambda i: i.get("last_activity_at") or "")
+    else:
+        selected = scope
+    facts = [collect_v2_facts(i, t, all_prs, tcache, chcache, agent_row) for i in selected]
+    inv = build_invariant(facts, scope_total=len(scope))
+    blocked = [classify_blocked(f) for f in facts if f["status"] == "blocked"]
+    blocked_by_card = {b["card"]: b for b in blocked}
+
+    actions, escalations, covered = [], [], {}
+    for v in inv["violators"]:
+        f = next((x for x in facts if x["card"] == v["card"]), {})
+        drv = v["proposed"]
+        if drv.get("action") == "blocked-kind":
+            drv = (blocked_by_card.get(v["card"]) or {}).get("driver") or \
+                  {"action": "inspect", "why": "blocked-kind-missing"}
+        if drv.get("action") == "wake":
+            a = arm_wake(v["card"], f.get("id"), drv.get("cause"), drv.get("flags") or [],
+                         apply, limit, t, agent_id=f.get("assignee_id"))
+            actions.append(a)
+            if a.get("refused"):
+                escalations.append({"card": v["card"], "cause": a.get("cause"),
+                                    "reason": "budget-exhausted",
+                                    "logged": bool(a.get("escalation_logged")),
+                                    "budget_before": a.get("budget_before")})
+                covered[v["card"]] = "escalation:budget-exhausted"
+            elif a.get("armed") or a.get("dry_run"):
+                covered[v["card"]] = "wakeup:" + str(a.get("wakeup_kind"))
+            else:
+                escalations.append({"card": v["card"], "cause": a.get("cause"),
+                                    "reason": "wakeup-create-failed",
+                                    "error": a.get("error")})
+                covered[v["card"]] = "escalation:create-failed"
+        elif drv.get("action") in ("ask", "reassign", "inspect"):
+            covered[v["card"]] = "leader-queue" if drv.get("action") != "inspect" else "inspect"
+            if drv.get("action") == "inspect":
+                escalations.append({"card": v["card"], "reason": drv.get("why"),
+                                    "driver": drv})
+
+    idle = [a for a in ENGINEERS_ORDER
+            if wip.get(a, 0) == 0 and (names.get(a) or {}).get("status") != "archived"
+            and row_state(agent_row.get(a) or {}, t) != "cooling"]
+    queue = leader_queue_for(facts, blocked, inv, idle, len(todos), agent_row, names)
+    ping = ping_leader(queue, issues, t, apply, agent_row, names)
+    kinds = {k: sum(1 for b in blocked if b["kind"] == k) for k in BLOCK_KINDS + ("unverified",)}
+    post_violators = [v["card"] for v in inv["violators"] if v["card"] not in covered]
+    return {"checked": inv["checked"], "scope": inv["scope"], "cap": card_cap or None,
+            "satisfied_by": inv["satisfied_by"], "violators": inv["violators"],
+            "violators_after": post_violators, "covered": covered,
+            "actions": actions, "escalations": escalations,
+            "blocked": blocked, "blocked_kinds": kinds,
+            "idle_engineers": idle, "leader_queue": queue, "leader_ping": ping,
+            "wake_limit": limit, "applied": bool(apply)}
+
+
 # --------------------------------------------- M-328 free-questions (Owner)
 # Flags agent comments that read as free-text questions to the Owner with no
 # ask card from the same run. Heuristic only, no LLM call:
@@ -1265,11 +1799,21 @@ def scan_free_questions(issues, hours, names=None):
 def main():
     args = sys.argv[1:]
     apply_cooldown = "--apply-cooldown" in args
-    apply_incomplete_turns = "--apply-incomplete-turns" in args and "--stuck-list" not in args
+    stuck_list = "--stuck-list" in args
+    apply_incomplete_turns = "--apply-incomplete-turns" in args and not stuck_list
     seed = "--seed" in args
     max_cards = 0
     if "--max-cards" in args:
         max_cards = int(args[args.index("--max-cards") + 1])
+    # M-392 v2: `--apply` is the only write mode for the invariant/blocked/wake
+    # pass. `--stuck-list` keeps the M-268 slice and never runs or writes v2.
+    v2_apply = "--apply" in args and not stuck_list
+    v2_cards = INVARIANT_CARDS_DEFAULT
+    if "--max-invariant-cards" in args:
+        v2_cards = max(1, int(args[args.index("--max-invariant-cards") + 1]))
+    wake_limit = WAKE_LIMIT_DEFAULT
+    if "--max-wakes-per-card" in args:
+        wake_limit = max(1, int(args[args.index("--max-wakes-per-card") + 1]))
     hours = FREEQ_DEFAULT_HOURS
     if "--hours" in args:
         hours = int(args[args.index("--hours") + 1])
@@ -1292,11 +1836,28 @@ def main():
         seed_ledger(seeded)
         ledger, led_err = read_ledger()
     result = sweep(ledger, names, all_prs=prs, apply_cooldown=apply_cooldown,
-                   max_cards=max_cards, apply_incomplete_turns=apply_incomplete_turns)
-    if "--stuck-list" in args:
+                   max_cards=max_cards, apply_incomplete_turns=apply_incomplete_turns,
+                   v2_enabled=not stuck_list, v2_apply=v2_apply,
+                   v2_cards=v2_cards, wake_limit=wake_limit)
+    if stuck_list:
         print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                           "tool": "orch-sweep", "mode": "stuck-list",
                           **result["stuck"]}, indent=1, ensure_ascii=False))
+        return 0
+    v2 = result.get("v2") or {}
+    if "--invariant" in args:
+        keys = ("checked", "scope", "cap", "satisfied_by", "violators",
+                "violators_after", "escalations", "wake_limit", "applied")
+        print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "tool": "orch-sweep", "mode": "invariant",
+                          **{k: v2.get(k) for k in keys}}, indent=1, ensure_ascii=False))
+        return 0
+    if "--blocked-kinds" in args:
+        print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "tool": "orch-sweep", "mode": "blocked-kinds",
+                          "total": len(v2.get("blocked") or []),
+                          "kinds": v2.get("blocked_kinds"),
+                          "cards": v2.get("blocked")}, indent=1, ensure_ascii=False))
         return 0
     out = {
         "at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
