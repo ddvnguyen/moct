@@ -49,6 +49,15 @@ every one is one-shot or expiring. Budget is per card per ICT day: 6 wakes
 (`--max-wakes-per-card`, stored in card metadata `wake_budget` as
 `{d, n, last, esc}`). At the limit the sweep refuses, logs ONE escalation for
 that day (`esc`) and reports it; a failed `wakeup create` spends no budget.
+A delay (`--after`) is armed as the platform's `at` kind — with the default
+event kind the server rejects it with "select at least one supported event" —
+and the test stub enforces that rule plus "conditions use event kind" so a
+malformed flag set fails here instead of silently arming nothing.
+
+**Coverage is verified, not assumed.** `violators_after` drops a card only when
+its wake actually armed or its Leader queue was actually delivered by an armed
+ping. A create failure, a budget refusal, an unreadable card, or a ping that
+did not leave the box all stay listed, alongside their `escalations` entry.
 
 **Bound.** `--max-invariant-cards` (default 60) caps one pass, keeping every
 `blocked` card and then the oldest idle of the rest; `scope` reports the true
