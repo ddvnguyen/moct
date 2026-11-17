@@ -74,7 +74,7 @@ mkboard() { # mkboard <json-board> <json-issues> <json-resume>
 }
 
 echo "TAP version 13"
-echo "1..15"
+echo "1..50"
 npass=0; nfail=0
 check "a-fires"              "$(mkboard "[{\"card\":\"M-2\",\"activity_minutes\":10,\"active_run\":false,\"wakeup_pending\":false,\"prs\":[$GREEN_PR],\"failure_class\":null,\"reason\":\"fresh\"}]" "[]" "{}")"
 check "a-excludes-live-run"  "$(mkboard "[{\"card\":\"M-2\",\"activity_minutes\":10,\"active_run\":true,\"wakeup_pending\":false,\"prs\":[$GREEN_PR],\"failure_class\":null,\"reason\":\"run-live\"}]" "[]" "{}")"
@@ -127,6 +127,9 @@ except json.JSONDecodeError as e:
 if extra == ["--stuck-list"]:
     ok = rc == 0 and isinstance(d.get("hash"), str)
     detail = "keys=" + ",".join(sorted(d.keys()))
+elif extra[:1] == ["--illegal-endings"]:
+    ok = rc == 0 and d.get("mode") == "illegal-endings" and isinstance(d.get("offenders"), list) and isinstance(d.get("checked"), int)
+    detail = "keys=" + ",".join(sorted(d.keys()))
 else:
     ok = rc == 0 and all(k in d for k in ("board", "counts", "gate_waiting", "incomplete_turns"))
     detail = "keys=" + ",".join(sorted(d.keys()))
@@ -140,6 +143,7 @@ EOF
 }
 check_main "main-default-prints-json"
 check_main "main-stuck-list-prints-hash" --stuck-list
+check_main "main-illegal-endings-prints-mode" --illegal-endings
 
 # M-393: deterministic no-delta classification and consecutive sweeps.
 if python3 - <<'EOF'; then
@@ -300,6 +304,72 @@ check_askcard "fq-ask-same-run" "$ASKRUN" '{"id":"c1","created_at":"2026-11-08T1
 check_askcard "fq-no-ask" "$ASKRUN" '{"id":"c9","created_at":"2026-11-08T10:00:00Z","source_task_id":"r9"}' 0
 check_askcard "fq-empty-runs" "[]" '{"id":"c1","created_at":"2026-11-08T13:33:34Z","source_task_id":"r9"}' 0
 
+# M-391: illegal_endings_matches + illegal_has_same_run_driver, no network.
+# Pure-function cases: each illegal signal fires, and the M-328-style
+# exclusions (WAKEUP marker, evidence block, fenced-code body) stay silent.
+# Driver cases: a same-run wakeup or ask card exempts, a stale wakeup does not.
+check_illegal() { # check_illegal <name> <content-json> <want-flagged>
+  local name="$1" content="$2" want="$3"
+  if python3 - "$name" "$content" "$want" <<'EOF'; then
+import importlib.machinery, importlib.util, json, sys
+path = "./orch-sweep"
+loader = importlib.machinery.SourceFileLoader("s", path)
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+name, content, want = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3] == "1"
+got, signal = s.illegal_endings_matches(content)
+ok = (bool(got) == want)
+detail = repr(signal[:80])
+print(("PASS " if ok else "FAIL ") + name + " :: flagged=" + str(bool(got)) + " " + detail)
+sys.exit(0 if ok else 1)
+EOF
+    npass=$((npass+1)); echo "ok - $name"
+  else
+    nfail=$((nfail+1)); echo "not ok - $name"
+  fi
+}
+check_illegal "ie-standing-by" '"Work done. Standing by for next instructions."' 1
+check_illegal "ie-stand-by" '"Stand by for instructions."' 1
+check_illegal "ie-waiting-review" '"Done. Waiting for review."' 1
+check_illegal "ie-lane-operator-needed" '"Lane operator needed to proceed."' 1
+check_illegal "ie-architect-needed" '"Claude Architect needed for the verdict."' 1
+check_illegal "ie-next-unnamed" '"Next: verify the deploy on dsh-z."' 1
+check_illegal "ie-next-step" '"Next step is to confirm green CI."' 1
+check_illegal "ie-someone-should" '"Someone should check the logs."' 1
+check_illegal "ie-todo-for" '"To-do for follow-up: check the logs."' 1
+check_illegal "ie-clean-statement" '"Merged, NOT deployed. Evidence block posted on the card."' 0
+check_illegal "ie-evidence" '"Evidence block: done. Standing by for review."' 0
+check_illegal "ie-wakeup" '"[WAKEUP] armed: standing by until 18:30Z"' 0
+check_illegal "ie-fenced-code" '"Run this:\n```\nstanding by\n```\nDone."' 0
+check_illegal "ie-question-owner" '"Could you approve Plan v2, Owner?"' 0
+check_illegal "ie-next-named" '"Next: @owner please approve plan v2."' 0
+check_ildriver() { # check_ildriver <name> <runs-json> <wakeups-json> <comment-json> <want-exempt>
+  local name="$1" runs="$2" wakes="$3" comment="$4" want="$5"
+  if python3 - "$name" "$runs" "$wakes" "$comment" "$want" <<'EOF'; then
+import importlib.machinery, importlib.util, json, sys
+path = "./orch-sweep"
+loader = importlib.machinery.SourceFileLoader("s", path)
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+name = sys.argv[1]
+runs, wakes = json.loads(sys.argv[2]), json.loads(sys.argv[3])
+comment, want = json.loads(sys.argv[4]), sys.argv[5] == "1"
+got = s.illegal_has_same_run_driver(runs, wakes, comment)
+ok = (bool(got) == want)
+detail = "exempt=" + str(bool(got))
+print(("PASS " if ok else "FAIL ") + name + " :: " + detail)
+sys.exit(0 if ok else 1)
+EOF
+    npass=$((npass+1)); echo "ok - $name"
+  else
+    nfail=$((nfail+1)); echo "not ok - $name"
+  fi
+}
+SAMEWAKE='[{"id":"w1","enabled":true,"created_at":"2026-11-08T13:35:00Z"}]'
+STALEWAKE='[{"id":"w1","enabled":true,"created_at":"2026-11-08T10:00:00Z"}]'
+check_ildriver "ie-driver-wakeup-same-run" "[]" "$SAMEWAKE" '{"id":"c1","created_at":"2026-11-08T13:33:34Z","source_task_id":"r9"}' 1
+check_ildriver "ie-driver-wakeup-stale" "[]" "$STALEWAKE" '{"id":"c1","created_at":"2026-11-08T13:33:34Z","source_task_id":"r9"}' 0
+check_ildriver "ie-driver-ask-card" "$ASKRUN" "[]" '{"id":"c1","created_at":"2026-11-08T13:33:34Z","source_task_id":"r9"}' 1
 # M-392 v2: the invariant (D2) is a pure function over collected facts, so the
 # whole satisfier/driver matrix is testable without a board.
 if python3 - <<'EOF'; then

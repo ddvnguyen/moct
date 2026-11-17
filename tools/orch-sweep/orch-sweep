@@ -1812,6 +1812,136 @@ def scan_free_questions(issues, hours, names=None):
             "comments_flagged": checked, "offenders": offenders}
 
 
+# -------------------------------------- M-391 illegal-endings (turn-end text)
+# Flags agent comments that end a turn with language the turn-end contract
+# forbids: the run stops without handing off, advancing, asking, or arming a
+# wakeup. Text-pattern complement to the M-393 state-delta detector (which
+# looks at run/status/wakeup deltas, never at comment wording): this check
+# looks only at wording, never at deltas. Heuristic only, no LLM call:
+#   * agent-authored, type "comment" (system / progress_update never count);
+#   * created within the window (--hours N, default 24);
+#   * body has no [WAKEUP] marker and is not an evidence block (same
+#     exclusions as M-328: fenced code is stripped before matching);
+#   * body matches an illegal turn-ending signal (case-insensitive):
+#     "standing by" / "stand by", "waiting for review", "<role> needed"
+#     with no trigger (lane operator, claude/architect, leader, owner,
+#     operator, reviewer), "next:" / "next step" assigning work to an
+#     unnamed person, "someone should", "to-do for" an unnamed owner.
+# The "unnamed" signals (role-needed, next-unnamed, someone-should,
+# todo-for) are skipped when the comment names an owner (@mention or
+# mention:// link): naming someone IS a trigger. "standing by" and
+# "waiting for review" flag regardless.
+# Exempt when the comment's run already drove the turn: an open ask card
+# from the same run (M-328 freeq_has_ask_card) or an enabled wakeup armed
+# by the same run (same source_task_id / trigger_comment_id, or created
+# within 15 min after the comment). Read-only: never writes to cards.
+ILLEGAL_ENDINGS_DEFAULT_HOURS = 24
+ILLEGAL_WAKEUP_WINDOW_MIN = 15
+ILLEGAL_ENDINGS_RES = [
+    (re.compile(r"\bstand(?:ing)?\s+by\b", re.I), "standing-by"),
+    (re.compile(r"\bwaiting for review\b", re.I), "waiting-for-review"),
+    (re.compile(r"\b(?:lane operator|claude architect|opus architect|architect|leader|owner|operator|reviewer)\s+needed\b", re.I), "role-needed"),
+    (re.compile(r"\bnext(?:\s+step)?\s*:|\bnext\s+step\b", re.I), "next-unnamed"),
+    (re.compile(r"\bsomeone should\b", re.I), "someone-should"),
+    (re.compile(r"\bto-?do for\b", re.I), "todo-for-unnamed"),
+]
+# Signals that require an unnamed owner: skipped when the comment names one.
+ILLEGAL_NAMED_OWNER_RE = re.compile(r"@\S|mention://")
+ILLEGAL_UNNAMED_SIGNALS = {"role-needed", "next-unnamed", "someone-should",
+                           "todo-for-unnamed"}
+
+
+def illegal_endings_matches(content):
+    """(flagged, signal): first illegal turn-ending signal, or (False, "")
+    when clean or excluded (WAKEUP marker, evidence block, fenced-only)."""
+    if not content or "[WAKEUP]" in content:
+        return False, ""
+    low = content.lower()
+    if "evidence block" in low or "merged, not deployed" in low:
+        return False, ""
+    body = re.sub(r"```.*?```", "", content, flags=re.S)
+    if not body.strip():
+        return False, ""
+    named = bool(ILLEGAL_NAMED_OWNER_RE.search(body))
+    for rx, name in ILLEGAL_ENDINGS_RES:
+        m = rx.search(body)
+        if not m:
+            continue
+        if name in ILLEGAL_UNNAMED_SIGNALS and named:
+            continue  # names an owner: that IS the trigger
+        return True, "%s: %s" % (name, m.group(0).strip()[:120])
+    return False, ""
+
+
+def illegal_has_same_run_driver(runs, wakeups, comment):
+    """True when the comment's run already drove the turn: a parked ask card
+    (same-run M-328 exemption) or an enabled wakeup armed by the same run."""
+    if freeq_has_ask_card(runs, comment):
+        return True
+    cid = comment.get("id") or ""
+    cts = parse_ts(comment.get("created_at"))
+    sid = comment.get("source_task_id") or ""
+    for w in wakeups or []:
+        if not isinstance(w, dict) or "__error__" in w:
+            continue
+        if not (w.get("enabled") and not w.get("disabled_at")):
+            continue
+        if sid and w.get("source_task_id") == sid:
+            return True
+        if cid and w.get("trigger_comment_id") == cid:
+            return True
+        wts = parse_ts(w.get("created_at"))
+        if cts and wts:
+            delta = (wts - cts).total_seconds()
+            if 0 <= delta <= ILLEGAL_WAKEUP_WINDOW_MIN * 60:
+                return True
+    return False
+
+
+def scan_illegal_endings(issues, hours, names=None):
+    """One --since pass per board issue; returns {checked, offenders[]}.
+    offenders carry {card, comment, agent, created_at, signal}: the daily
+    ticket paste (issue, comment id, agent), once per comment."""
+    cutoff = now() - timedelta(hours=hours)
+    since = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    offenders, checked, scanned, seen = [], 0, 0, set()
+    for i in issues or []:
+        key = i.get("identifier") or i.get("id")
+        d = sh_json(["multica", "issue", "comment", "list", i.get("id"),
+                     "--since", since, "--compact", "--output", "json"], timeout=120)
+        rows = d if isinstance(d, list) else d.get("comments", []) if isinstance(d, dict) else []
+        if isinstance(d, dict) and "__error__" in d:
+            continue
+        runs = card_runs(i.get("id"))
+        if isinstance(runs, dict) and "__error__" in runs:
+            runs = []
+        wakes = card_wakeups(i.get("id"))
+        if isinstance(wakes, dict) and "__error__" in wakes:
+            wakes = []
+        for c in rows or []:
+            if c.get("author_type") != "agent" or (c.get("type") or "") != "comment":
+                continue
+            cts = parse_ts(c.get("created_at"))
+            if not cts or cts < cutoff:
+                continue
+            scanned += 1
+            ok, signal = illegal_endings_matches(c.get("content") or "")
+            if not ok or illegal_has_same_run_driver(runs, wakes, c):
+                continue
+            if c.get("id") in seen:
+                continue
+            seen.add(c.get("id"))
+            checked += 1
+            aid = c.get("author_id")
+            offenders.append({"card": key, "comment": (c.get("id") or "")[:8],
+                              "comment_id": c.get("id"), "agent": (names or {}).get(aid, {}).get("name") if isinstance(names, dict) else aid,
+                              "agent_id": aid, "created_at": c.get("created_at"), "signal": signal})
+    offenders.sort(key=lambda o: (o.get("card") or "", o.get("created_at") or ""))
+    return {"hours": hours, "issues_scanned": len(issues or []),
+            "checked": scanned, "comments_flagged": checked,
+            "offenders": offenders}
+
+
 
 # --------------------------------------------------------------------- main
 def main():
@@ -1844,6 +1974,16 @@ def main():
         print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                           "tool": "orch-sweep", "mode": "free-questions",
                           **fq}, indent=1, ensure_ascii=False))
+        return 0
+
+    if "--illegal-endings" in args:
+        ie_names = agent_names()
+        ie_d = fetch_issues()
+        ie_issues = ie_d if isinstance(ie_d, list) else ie_d.get("issues", [])
+        ie = scan_illegal_endings(ie_issues, hours, ie_names)
+        print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "tool": "orch-sweep", "mode": "illegal-endings",
+                          **ie}, indent=1, ensure_ascii=False))
         return 0
 
     names = agent_names()

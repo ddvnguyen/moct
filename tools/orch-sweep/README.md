@@ -11,13 +11,20 @@ live board (issues, runs, wakeups, PRs, quota ledger, committee seats, queues).
   `{at, tool, mode, hash, triggers, items}` (deprecated alias, one release);
   `--free-questions [--hours N]` (default 24) prints the M-328 slice
   `{at, tool, mode, hours, issues_scanned, comments_flagged, offenders[]}` for
-  the daily ticket. The full result also includes the M-393 `incomplete_turns`
-  report; `--apply-incomplete-turns` persists its run-ID ledger.
+  the daily ticket. `--illegal-endings [--hours N]` (default 24) prints the
+  M-391 slice `{at, tool, mode, hours, issues_scanned, checked,
+  comments_flagged, offenders[]}` for the daily ticket: agent comments with
+  illegal turn-ending language (`standing by`, `waiting for review`,
+  `<role> needed` with no trigger, `next:`/`next step` to nobody,
+  `someone should`, `to-do for` nobody). The full result also includes the
+  M-393 `incomplete_turns` report; `--apply-incomplete-turns` persists its
+  run-ID ledger.
 - `orch-sweep.test.sh` — seeded verification for the stuck-list mode
   (M-268 acceptance: fires once on a seeded case, silent on the same hash),
   the M-328 matcher/exemption cases (trailing `?`, Owner-decision phrases,
   WAKEUP/evidence/fenced-code exclusions, ask-card exemption), the M-393
-  incomplete-turn cases, and the M-392 v2 cases (invariant satisfiers, blocked
+  incomplete-turn cases, the M-391 illegal-endings cases (signals, exclusions,
+  same-run driver exemption), and the M-392 v2 cases (invariant satisfiers, blocked
   kinds, wake budget, dry-run zero writes, batched Leader ping).
 - `tick-prompt-delta.md` — the Orchestrator prompt text to apply with the
   deploy; without it the tick still carries the hash gate and v2 is inert.
@@ -97,6 +104,38 @@ Output `offenders[]` are `{card, comment, agent, created_at, signal}`: the
 daily-ticket paste (issue, comment id, agent), once per comment. The check
 never writes to cards. 7-day dry run: `m328-dry-run.md` (2 offenders on the
 board slice, FP rate 0/9 on all unique flagged comments).
+
+## Illegal-endings check (M-391, heuristic, no LLM call)
+
+Text-pattern complement to the M-393 state-delta incomplete-turn detector
+(M-393 looks at run/status/wakeup deltas, never at comment wording; this
+check looks only at wording, never at deltas). Flags agent comments that
+end a turn with language the turn-end contract forbids: the run stops
+without handing off, advancing the issue, asking, or arming a wakeup.
+Same one-`--since`-pass-per-issue architecture as M-328, read-only: no
+card writes, no metadata writes.
+
+Signals (case-insensitive, fenced code stripped before matching):
+
+- `standing-by`: `standing by` / `stand by`;
+- `waiting-for-review`: `waiting for review`;
+- `role-needed`: `<role> needed` with no trigger (lane operator,
+  claude/opus architect, architect, leader, owner, operator, reviewer);
+- `next-unnamed`: `next:` / `next step` assigning work to an unnamed person;
+- `someone-should`: `someone should`;
+- `todo-for-unnamed`: `to-do for` / `todo for` an unnamed owner.
+
+Exclusions (mirroring M-328): `[WAKEUP]` markers, evidence blocks, fenced
+code, and any comment on an issue that already has an open ask card
+(`freeq_has_ask_card`, same run) or an enabled wakeup armed by the same
+run (same `source_task_id` / `trigger_comment_id`, or created within
+15 min after the comment). The `role-needed` / `next-unnamed` /
+`someone-should` / `todo-for-unnamed` signals are additionally skipped
+when the comment names an owner (`@mention` or `mention://` link):
+naming someone IS a trigger.
+
+Output `offenders[]` are `{card, comment, agent, created_at, signal}`,
+sorted by `(card, created_at)`: the daily-ticket paste, once per comment.
 
 ## Incomplete-turn detector (M-393, D6)
 
