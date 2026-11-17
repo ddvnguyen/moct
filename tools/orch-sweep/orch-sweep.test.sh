@@ -74,7 +74,7 @@ mkboard() { # mkboard <json-board> <json-issues> <json-resume>
 }
 
 echo "TAP version 13"
-echo "1..45"
+echo "1..50"
 npass=0; nfail=0
 check "a-fires"              "$(mkboard "[{\"card\":\"M-2\",\"activity_minutes\":10,\"active_run\":false,\"wakeup_pending\":false,\"prs\":[$GREEN_PR],\"failure_class\":null,\"reason\":\"fresh\"}]" "[]" "{}")"
 check "a-excludes-live-run"  "$(mkboard "[{\"card\":\"M-2\",\"activity_minutes\":10,\"active_run\":true,\"wakeup_pending\":false,\"prs\":[$GREEN_PR],\"failure_class\":null,\"reason\":\"run-live\"}]" "[]" "{}")"
@@ -370,6 +370,384 @@ STALEWAKE='[{"id":"w1","enabled":true,"created_at":"2026-11-08T10:00:00Z"}]'
 check_ildriver "ie-driver-wakeup-same-run" "[]" "$SAMEWAKE" '{"id":"c1","created_at":"2026-11-08T13:33:34Z","source_task_id":"r9"}' 1
 check_ildriver "ie-driver-wakeup-stale" "[]" "$STALEWAKE" '{"id":"c1","created_at":"2026-11-08T13:33:34Z","source_task_id":"r9"}' 0
 check_ildriver "ie-driver-ask-card" "$ASKRUN" "[]" '{"id":"c1","created_at":"2026-11-08T13:33:34Z","source_task_id":"r9"}' 1
+# M-392 v2: the invariant (D2) is a pure function over collected facts, so the
+# whole satisfier/driver matrix is testable without a board.
+if python3 - <<'EOF'; then
+import importlib.machinery, importlib.util
+loader = importlib.machinery.SourceFileLoader("s", "./orch-sweep")
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+
+def fact(**kw):
+    base = {"card": "M-1", "id": "i1", "status": "in_progress", "assignee_id": "a",
+            "idle_min": 90, "active_run": False, "live_wakeups": 0, "open_asks": 0,
+            "errors": [], "prs": [], "refs": [], "ref_status": {}, "open_pr": None,
+            "children_progressible": False, "block_kind": None, "block_on": None,
+            "account_state": "ok"}
+    base.update(kw); return base
+
+# 1. Each of the three satisfiers satisfies, and is reported as such.
+for kw, want in (({"active_run": True}, "run"), ({"live_wakeups": 1}, "wakeup"),
+                 ({"open_asks": 1}, "ask")):
+    inv = s.build_invariant([fact(**kw)])
+    assert inv["violators"] == [] and inv["satisfied_by"][want] == 1, (kw, inv)
+
+# 2. Owner-held terminal statuses are out of scope, not violators.
+assert "in_review" not in s.V2_STATUSES and "done" not in s.V2_STATUSES
+
+# 3. Undriven in_progress -> one resume driver.
+v = s.build_invariant([fact()])["violators"][0]
+assert v["satisfier"] == "none" and v["proposed"]["cause"] == "resume"
+assert v["proposed"]["flags"] == ["--after", "1m"], v
+
+# 4. Unreadable runs fail closed to inspect, never silently satisfied.
+v = s.build_invariant([fact(errors=["runs"])])["violators"][0]
+assert v["proposed"]["action"] == "inspect", v
+
+# 5. Leader-owned idle card is still driven (by waking the Leader), not skipped.
+v = s.build_invariant([fact(assignee_id=s.LEAD_POOL[0])])["violators"][0]
+assert v["proposed"]["leader_owned"] is True and v["proposed"]["cause"] == "resume"
+assert s.build_invariant([fact(assignee_id="engineer")])["violators"][0]["proposed"].get("leader_owned") is None
+
+# 6. Per-status drivers: todo starts, plan gate waits on the approval flip with
+#    an expiry, wait_for_decision asks the Leader, deploy resumes the engineer.
+v = s.build_invariant([fact(status="planing_2")])["violators"][0]["proposed"]
+assert v["flags"][:2] == ["--until-status", "in_progress"] and "--expires-in" in v["flags"], v
+assert s.build_invariant([fact(status="wait_for_decision")])["violators"][0]["proposed"]["action"] == "ask"
+assert s.build_invariant([fact(status="todo")])["violators"][0]["proposed"]["cause"] == "start"
+assert s.build_invariant([fact(status="agent_review_deploy")])["violators"][0]["proposed"]["cause"] == "deploy"
+
+# 7. The pass is bounded and says so: scope total > checked cards, cap reported.
+facts = [fact(card=f"M-{n}") for n in range(3)]
+inv = s.build_invariant(facts, scope_total=9)
+assert inv["checked"] == 3 and inv["scope"] == 9, inv
+print("PASS v2 invariant: run/wakeup/ask satisfied, in_review exempt, driver per status, leader-owned, read-fail closed")
+EOF
+  npass=$((npass+1)); echo "ok - v2-invariant"
+else
+  nfail=$((nfail+1)); echo "not ok - v2-invariant"
+fi
+
+# M-392 D3: blocked kinds - metadata wins, deterministic fallback otherwise,
+# unverified fails closed, and Owner cards batch by cluster.
+if python3 - <<'EOF'; then
+import importlib.machinery, importlib.util
+loader = importlib.machinery.SourceFileLoader("s", "./orch-sweep")
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+
+def fact(**kw):
+    base = {"card": "M-1", "id": "i1", "status": "blocked", "assignee_id": "a",
+            "idle_min": 300, "active_run": False, "live_wakeups": 0, "open_asks": 0,
+            "errors": [], "prs": [], "refs": [], "ref_status": {}, "open_pr": None,
+            "children_progressible": False, "block_kind": None, "block_on": None,
+            "account_state": "ok"}
+    base.update(kw); return base
+
+b = s.classify_blocked
+# metadata is authoritative, in all three kinds
+for k in s.BLOCK_KINDS:
+    c = b(fact(block_kind=k))
+    assert c["kind"] == k and c["kind_source"] == "metadata", c
+# an unknown metadata kind never auto-acts
+c = b(fact(block_kind="someday"))
+assert c["kind"] == "unverified" and c["driver"]["action"] == "inspect", c
+# heuristic: open ask -> owner
+assert b(fact(open_asks=1))["kind"] == "owner"
+# heuristic: blocker still open -> dependency, one-shot wait with expiry
+c = b(fact(ref_status={"M-7": "in_progress"}))
+assert c["kind"] == "dependency" and c["driver"]["flags"][:2] == ["--until-issue", "M-7"], c
+assert "--expires-in" in c["driver"]["flags"] and c["driver"]["flags"][-2:] == ["--on-timeout", "wake"]
+# blocker already terminal -> stale parking, so the agent is the driver (no wait that never fires)
+c = b(fact(block_on="M-7", ref_status={"M-7": "done"}))
+assert c["kind"] == "agent" and c["kind_source"] == "heuristic:block_on-terminal", c
+# progressible children -> wait on children_done
+c = b(fact(children_progressible=True))
+assert c["kind"] == "dependency" and c["driver"]["cause"] == "children", c
+assert c["driver"]["flags"][:3] == ["--until-children-done", "--expires-in", s.CHILDREN_WAIT_EXPIRES]
+# open PR -> wait for the next CI result, never a silent poll
+pr = {"repo": "r", "n": 5, "state": "OPEN", "head": "abc", "verdict_on_head": None,
+      "checks": {"total": 1, "failing": []}, "updated_at": "2026-11-16T00:00:00Z"}
+c = b(fact(open_pr=pr, prs=[pr]))
+assert c["kind"] == "dependency" and c["driver"]["flags"][:2] == ["--until-pr", "checks"], c
+# dead account -> reassign; live-but-stuck assignee -> resume that assignee
+assert b(fact(account_state="cooling"))["driver"]["action"] == "reassign"
+assert b(fact())["kind"] == "agent" and b(fact())["driver"]["cause"] == "resume"
+
+# Owner cards sharing one blocker become ONE batched ask per cluster.
+facts = [fact(card="M-31", open_asks=1, block_on="PR#200"),
+         fact(card="M-42", open_asks=1, block_on="PR#200"),
+         fact(card="M-85", open_asks=1, block_on="M-325")]
+blocked = [b(f) for f in facts]
+q = s.leader_queue_for(facts, blocked, {"violators": []}, [], 1, {}, {})
+assert len(q["owner_asks"]) == 2, q["owner_asks"]
+assert [x["cards"] for x in q["owner_asks"] if x["cluster"] == "PR#200"] == [["M-31", "M-42"]]
+print("PASS v2 blocked kinds: metadata/heuristic/unverified, per-kind driver, owner asks batched by cluster")
+EOF
+  npass=$((npass+1)); echo "ok - v2-blocked-kinds"
+else
+  nfail=$((nfail+1)); echo "not ok - v2-blocked-kinds"
+fi
+
+# M-392 D4: per-card budget. 6th wake is allowed, 7th is refused and escalated
+# once that day; a create failure must not consume budget.
+if python3 - <<'EOF'; then
+import importlib.machinery, importlib.util, json
+loader = importlib.machinery.SourceFileLoader("s", "./orch-sweep")
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+T = s.parse_ts("2026-11-17T03:00:00Z")
+day = s.budget_day(T)
+# The platform rejects a wakeup with no event and no `at` delay
+# ("select at least one supported event"); the stub enforces that so a
+# malformed flag set can never pass here again.
+def platform_wakeup_ok(args):
+    kind = args[args.index("--kind") + 1] if "--kind" in args else "event"
+    if any(a.startswith("--until-") for a in args):
+        return kind == "event"
+    if kind == "at":
+        return "--after" in args or "--at" in args
+    if kind == "event":
+        return "--event" in args
+    return False
+
+
+state = {"budget": {"d": day, "n": 5}}
+calls, fail_create = [], [False]
+def fake_sh(args, timeout=90):
+    calls.append(args)
+    if args[0:4] == ["multica", "issue", "metadata", "get"]:
+        return 0, json.dumps({"value": json.dumps(state["budget"])}), ""
+    if args[0:4] == ["multica", "issue", "metadata", "set"]:
+        state["budget"] = json.loads(args[args.index("--value") + 1])
+        return 0, "", ""
+    if args[0:4] == ["multica", "issue", "wakeup", "create"]:
+        assert platform_wakeup_ok(args), "platform: select at least one supported event " + repr(args)
+        if fail_create[0]:
+            return 1, "", "boom"
+        return 0, json.dumps({"id": "w1"}), ""
+    raise AssertionError("unexpected call " + repr(args))
+s.sh = fake_sh
+
+# 6th wake of the day: allowed, budget 5 -> 6, and it targets the assignee.
+a = s.arm_wake("M-1", "i1", "resume", ["--after", "1m"], True, 6, T, agent_id="eng")
+assert a["armed"] and a["budget_before"] == 5 and a["budget_after"] == 6, a
+wake = next(c for c in calls if c[0:4] == ["multica", "issue", "wakeup", "create"])
+assert wake[wake.index("--agent-id") + 1] == "eng", wake
+assert "M-1: no live run" in wake[wake.index("--instruction") + 1]
+
+# 7th: refused, escalated exactly once, and no wakeup create is attempted.
+calls.clear()
+a = s.arm_wake("M-1", "i1", "resume", ["--after", "1m"], True, 6, T, agent_id="eng")
+assert a["refused"] == "budget-exhausted" and a["escalate"] is True, a
+assert a["escalation_logged"] is True, a
+assert not [c for c in calls if c[0:4] == ["multica", "issue", "wakeup", "create"]]
+assert state["budget"]["esc"] == day and state["budget"]["n"] == 6
+# second refusal the same day does not escalate again
+calls.clear()
+a = s.arm_wake("M-1", "i1", "resume", ["--after", "1m"], True, 6, T, agent_id="eng")
+assert a["escalate"] is False and a["escalation_logged"] is False
+assert not [c for c in calls if c[0:4] in (["multica", "issue", "wakeup", "create"],
+                                          ["multica", "issue", "metadata", "set"])], calls
+
+# A failed create spends no budget and reports the error.
+state["budget"] = {"d": day, "n": 1}
+fail_create[0] = True
+a = s.arm_wake("M-1", "i1", "resume", ["--after", "1m"], True, 6, T, agent_id="eng")
+assert not a["armed"] and a["error"] == "boom" and a["budget_after"] == 1 and state["budget"]["n"] == 1, a
+# A repeating rule gets a fire cap so it can never run unbounded.
+state["budget"] = {"d": day, "n": 0}
+calls.clear()
+a = s.arm_wake("M-1", "i1", "resume", ["--event", "comment.created", "--expires-in", "24h"],
+               True, 6, T, agent_id="eng")
+create = next(c for c in calls if c[0:4] == ["multica", "issue", "wakeup", "create"])
+assert "--max-fires" in create and create[create.index("--max-fires") + 1] == str(s.WAKE_MAX_FIRES_DEFAULT), create
+# Budget resets on a new ICT day.
+state["budget"] = {"d": "2026-11-16", "n": 6}
+fail_create[0] = False
+a = s.arm_wake("M-1", "i1", "resume", ["--after", "1m"], True, 6, T, agent_id="eng")
+assert a["armed"] and a["budget_before"] == 0 and a["budget_after"] == 1, a
+print("PASS v2 wake budget: 6th allowed, 7th refused+escalated once, failed create free, ICT-day reset")
+EOF
+  npass=$((npass+1)); echo "ok - v2-wake-budget"
+else
+  nfail=$((nfail+1)); echo "not ok - v2-wake-budget"
+fi
+
+# M-392: the whole pass. Dry run executes zero `wakeup create` / `metadata set`;
+# --apply arms one resume per undriven card and covers the violator list.
+if python3 - <<'EOF'; then
+import importlib.machinery, importlib.util, json
+loader = importlib.machinery.SourceFileLoader("s", "./orch-sweep")
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+T = s.parse_ts("2026-11-17T03:00:00Z")
+issues = [{"id": "i1", "identifier": "M-1", "status": "in_progress", "assignee_id": "a",
+           "last_activity_at": "2026-11-17T00:00:00Z", "title": "M-1 thing",
+           "description": "", "metadata": {}}]
+s.card_runs = lambda cid: []
+s.card_wakeups = lambda cid: []
+s.read_open_questions = lambda cid: (0, None)
+s.children_statuses = lambda key: None
+s.target_status = lambda ref: None
+budget_state = {}
+calls = []
+
+
+def platform_wakeup_ok(args):
+    kind = args[args.index("--kind") + 1] if "--kind" in args else "event"
+    if any(a.startswith("--until-") for a in args):
+        return kind == "event"
+    if kind == "at":
+        return "--after" in args or "--at" in args
+    if kind == "event":
+        return "--event" in args
+    return False
+
+
+def fake_sh(args, timeout=90):
+    calls.append(args)
+    if args[0:4] == ["multica", "issue", "metadata", "get"]:
+        if not budget_state:
+            return 1, "", "key not found on issue"
+        return 0, json.dumps({"value": json.dumps(budget_state)}), ""
+    if args[0:4] == ["multica", "issue", "metadata", "set"]:
+        budget_state.clear(); budget_state.update(json.loads(args[args.index("--value") + 1]))
+        return 0, "", ""
+    if args[0:4] == ["multica", "issue", "wakeup", "create"]:
+        assert platform_wakeup_ok(args), "platform: select at least one supported event " + repr(args)
+        return 0, json.dumps({"id": "w1"}), ""
+    if args[0:3] == ["multica", "issue", "get"]:
+        return 0, "", ""
+    raise AssertionError("unexpected call " + repr(args))
+s.sh = fake_sh
+WRITES = lambda: [c for c in calls if c[0:4] in
+                  (["multica", "issue", "wakeup", "create"],
+                   ["multica", "issue", "metadata", "set"])]
+
+dry = s.sweep_v2(issues, T, {}, [], apply=False, limit=6, card_cap=40,
+                 agent_row={}, todos=[], wip={})
+assert WRITES() == [], WRITES()
+assert dry["checked"] == 1 and len(dry["violators"]) == 1, dry["violators"]
+assert dry["actions"][0]["dry_run"] is True
+assert dry["violators_after"] == [] and dry["covered"]["M-1"].startswith("wakeup:"), dry["covered"]
+
+calls.clear()
+applied = s.sweep_v2(issues, T, {}, [], apply=True, limit=6, card_cap=40,
+                     agent_row={}, todos=[], wip={})
+w = WRITES()
+assert len([c for c in w if c[0:4] == ["multica", "issue", "wakeup", "create"]]) == 1, w
+create = next(c for c in w if c[0:4] == ["multica", "issue", "wakeup", "create"])
+assert create[create.index("--kind") + 1] == "at" and create[create.index("--after") + 1] == "1m", create
+assert len([c for c in w if c[0:4] == ["multica", "issue", "metadata", "set"]]) == 1, w
+assert applied["actions"][0]["armed"] and applied["actions"][0]["budget_after"] == 1
+assert budget_state.get("n") == 1, budget_state
+assert applied["violators_after"] == []
+
+# Coverage must be real. A failed create is an escalation, never coverage.
+s.arm_wake = lambda *a, **k: {"card": "M-1", "cause": "resume", "armed": False,
+                              "budget_before": 0, "budget_after": 0,
+                              "error": "Invalid request: bad wakeup"}
+failed = s.sweep_v2(issues, T, {}, [], apply=True, limit=6, card_cap=40,
+                    agent_row={}, todos=[], wip={})
+assert failed["violators_after"] == ["M-1"], failed["violators_after"]
+assert failed["escalations"][0]["reason"] == "wakeup-create-failed", failed["escalations"]
+
+# ...and a Leader queue that never left the box covers nothing either.
+s.arm_wake = lambda *a, **k: {"card": "M-2", "cause": "resume", "armed": True,
+                              "wakeup_kind": "after", "budget_before": 0,
+                              "budget_after": 1}
+wfd = [dict(issues[0], identifier="M-2", status="wait_for_decision")]
+undelivered = s.sweep_v2(wfd, T, {}, [], apply=True, limit=6, card_cap=40,
+                         agent_row={}, todos=[], wip={})
+assert undelivered["leader_ping"]["arm"] is False, undelivered["leader_ping"]
+assert undelivered["violators_after"] == ["M-2"], undelivered["violators_after"]
+
+# An idle engineer with no todo yields exactly ONE batched cut_next; with a
+# todo on the board the Leader is not asked to cut.
+assert len(applied["leader_queue"]["cut_next"]) == 1, applied["leader_queue"]
+with_todo = s.sweep_v2(issues, T, {}, [], apply=False, limit=6, card_cap=40,
+                       agent_row={}, todos=[{"identifier": "M-9"}], wip={})
+assert with_todo["leader_queue"]["cut_next"] == [], with_todo["leader_queue"]
+print("PASS v2 pass: dry run writes nothing, --apply arms one resume, cut_next batched once")
+EOF
+  npass=$((npass+1)); echo "ok - v2-pass-dry-run"
+else
+  nfail=$((nfail+1)); echo "not ok - v2-pass-dry-run"
+fi
+
+# M-392: the batched Leader ping replaces the hash gate - arm once when the
+# queue is non-empty and nothing is pending or recent, never on an empty queue.
+if python3 - <<'EOF'; then
+import importlib.machinery, importlib.util, json
+loader = importlib.machinery.SourceFileLoader("s", "./orch-sweep")
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+T = s.parse_ts("2026-11-17T03:00:00Z")
+lead = s.LEAD_POOL[0]
+issues = [{"id": "epic", "identifier": s.LEADER_CARD, "status": "in_progress"}]
+q = {"owner_asks": [{"cluster": "PR#200", "cards": ["M-31"]}], "decisions": [],
+     "plans": [], "reassign": [], "verdicts": [], "cut_next": [], "items": 1}
+calls, wakeups = [], [[]]
+
+
+def platform_wakeup_ok(args):
+    kind = args[args.index("--kind") + 1] if "--kind" in args else "event"
+    if any(a.startswith("--until-") for a in args):
+        return kind == "event"
+    if kind == "at":
+        return "--after" in args or "--at" in args
+    if kind == "event":
+        return "--event" in args
+    return False
+
+
+def fake_sh(args, timeout=90):
+    calls.append(args)
+    if args[0:4] == ["multica", "issue", "wakeup", "create"]:
+        assert platform_wakeup_ok(args), "platform: select at least one supported event " + repr(args)
+        return 0, json.dumps({"id": "lw1"}), ""
+    raise AssertionError("unexpected call " + repr(args))
+s.sh = fake_sh
+s.card_wakeups = lambda cid: wakeups[0]
+
+# empty queue: nothing armed, and no issue read either
+ping = s.ping_leader({"items": 0}, [], T, True, {}, {})
+assert ping["arm"] is False and ping["reason"] == "queue-empty" and calls == []
+
+# non-empty, nothing pending: one wake on the epic, addressed to the Leader
+dry = s.ping_leader(q, issues, T, False, {}, {})
+assert dry["arm"] is False and dry["reason"] == "would-arm" and calls == [], calls
+ping = s.ping_leader(q, issues, T, True, {}, {})
+assert ping["arm"] is True and ping["reason"] == "armed"
+arm = next(c for c in calls if c[0:4] == ["multica", "issue", "wakeup", "create"])
+assert arm[4] == "epic" and arm[arm.index("--agent-id") + 1] == lead, arm
+assert arm[arm.index("--kind") + 1] == "at", arm
+assert "Leader queue from orch-sweep" in arm[arm.index("--instruction") + 1]
+
+# a pending Leader wakeup means the queue is already delivered
+calls.clear()
+wakeups[0] = [{"id": "w", "agent_id": lead, "enabled": True, "disabled_at": None,
+               "condition": {}, "event_types": [], "created_at": "2026-11-17T02:59:00Z"}]
+ping = s.ping_leader(q, issues, T, True, {}, {})
+assert ping["arm"] is False and ping["reason"] == "leader-wake-pending" and calls == []
+
+# fired wakeups do not block, but the 60-min spacing does
+wakeups[0] = [{"id": "w", "agent_id": lead, "enabled": False, "disabled_at": None,
+               "condition": {}, "event_types": [], "created_at": "2026-11-17T02:30:00Z"}]
+ping = s.ping_leader(q, issues, T, True, {}, {})
+assert ping["arm"] is False and ping["reason"] == "spaced", ping
+wakeups[0] = [{"id": "w", "agent_id": lead, "enabled": False, "disabled_at": None,
+               "condition": {}, "event_types": [], "created_at": "2026-11-17T01:00:00Z"}]
+calls.clear()
+ping = s.ping_leader(q, issues, T, True, {}, {})
+assert ping["arm"] is True and len(calls) == 1, ping
+print("PASS v2 leader ping: batched, once per 60 min, skipped when pending or empty")
+EOF
+  npass=$((npass+1)); echo "ok - v2-leader-ping"
+else
+  nfail=$((nfail+1)); echo "not ok - v2-leader-ping"
+fi
 
 echo "# passed=$npass failed=$nfail"
 [ "$nfail" -eq 0 ]

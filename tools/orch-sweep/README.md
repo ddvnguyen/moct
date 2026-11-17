@@ -3,24 +3,74 @@
 Deterministic board sweep for the Multica Orchestrator tick: one pass over the
 live board (issues, runs, wakeups, PRs, quota ledger, committee seats, queues).
 
-- `orch-sweep` — the script. Run with no flags for the full tick JSON;
-  `--stuck-list` prints only the compact M-268 committee slice
-  `{at, tool, mode, hash, triggers, items}`; `--free-questions [--hours N]`
-  (default 24) prints the M-328 slice `{at, tool, mode, hours,
-  issues_scanned, comments_flagged, offenders[]}` for the daily ticket. The
-  full result also includes the M-393 `incomplete_turns` report;
-  `--apply-incomplete-turns` persists its run-ID ledger.
-  `--illegal-endings [--hours N]` (default 24) prints the M-391 slice
-  `{at, tool, mode, hours, issues_scanned, checked, comments_flagged,
-  offenders[]}` for the daily ticket: agent comments with illegal
-  turn-ending language (`standing by`, `waiting for review`,
+- `orch-sweep` — the script. Run with no flags for the full tick JSON,
+  including the `v2` block (invariant, blocked kinds, wakes, Leader queue).
+  `--apply` is the only mode that writes: it arms the v2 wakes and records the
+  per-card budget. `--invariant` and `--blocked-kinds` print those slices and
+  write nothing. `--stuck-list` prints the compact M-268 committee slice
+  `{at, tool, mode, hash, triggers, items}` (deprecated alias, one release);
+  `--free-questions [--hours N]` (default 24) prints the M-328 slice
+  `{at, tool, mode, hours, issues_scanned, comments_flagged, offenders[]}` for
+  the daily ticket. `--illegal-endings [--hours N]` (default 24) prints the
+  M-391 slice `{at, tool, mode, hours, issues_scanned, checked,
+  comments_flagged, offenders[]}` for the daily ticket: agent comments with
+  illegal turn-ending language (`standing by`, `waiting for review`,
   `<role> needed` with no trigger, `next:`/`next step` to nobody,
-  `someone should`, `to-do for` nobody).
+  `someone should`, `to-do for` nobody). The full result also includes the
+  M-393 `incomplete_turns` report; `--apply-incomplete-turns` persists its
+  run-ID ledger.
 - `orch-sweep.test.sh` — seeded verification for the stuck-list mode
-  (M-268 acceptance: fires once on a seeded case, silent on the same hash)
-  plus the M-328 matcher/exemption cases (trailing `?`, Owner-decision
-  phrases, WAKEUP/evidence/fenced-code exclusions, ask-card exemption) and
-  the M-393 incomplete-turn cases.
+  (M-268 acceptance: fires once on a seeded case, silent on the same hash),
+  the M-328 matcher/exemption cases (trailing `?`, Owner-decision phrases,
+  WAKEUP/evidence/fenced-code exclusions, ask-card exemption), the M-393
+  incomplete-turn cases, the M-391 illegal-endings cases (signals, exclusions,
+  same-run driver exemption), and the M-392 v2 cases (invariant satisfiers, blocked
+  kinds, wake budget, dry-run zero writes, batched Leader ping).
+- `tick-prompt-delta.md` — the Orchestrator prompt text to apply with the
+  deploy; without it the tick still carries the hash gate and v2 is inert.
+
+## Invariant, blocked kinds, event wakes (M-392, D2/D3/D4)
+
+**D2 invariant.** Every non-terminal card must have an active run, a live
+wakeup, or an open ask. `in_review`, `done` and `cancelled` are Owner-held and
+out of scope. `--invariant` prints `{checked, scope, cap, satisfied_by,
+violators[], violators_after[], escalations[]}`; each violator carries the one
+driver it would use (`wake:<cause>`, `ask`, `reassign`, `inspect`). Batched
+Leader work lands in `leader_queue` and is delivered by ONE `leader_ping` wake
+on `M-256` — at most one per 60 min, none while a Leader wake is pending, none
+on an empty queue. That replaces the stuck-list hash gate and the global
+4/day cap.
+
+**D3 blocked kinds.** `blocked` is never parked. `metadata block_kind`
+(`owner | dependency | agent`) plus `block_on` (`M-key` or `PR#n`) is the
+contract; without it the sweep falls back deterministically (open ask → owner,
+open blocker or issue ref → dependency, else agent) and stamps `kind_source`.
+An unknown metadata value is `unverified` and gets no automatic action.
+Drivers: Owner → one batched ask per cluster (same `block_on`); dependency →
+`wakeup --until-issue|--until-pr|--until-children-done` with an expiry and
+`--on-timeout wake`; agent → resume the assignee, or reassign when its account
+is cooling. The "after 2 failed resumes → blocked" rule is gone.
+
+**D4 wakes.** Wakes come from events/conditions the platform actually has and
+every one is one-shot or expiring. Budget is per card per ICT day: 6 wakes
+(`--max-wakes-per-card`, stored in card metadata `wake_budget` as
+`{d, n, last, esc}`). At the limit the sweep refuses, logs ONE escalation for
+that day (`esc`) and reports it; a failed `wakeup create` spends no budget.
+A delay (`--after`) is armed as the platform's `at` kind — with the default
+event kind the server rejects it with "select at least one supported event" —
+and the test stub enforces that rule plus "conditions use event kind" so a
+malformed flag set fails here instead of silently arming nothing.
+
+**Coverage is verified, not assumed.** `violators_after` drops a card only when
+its wake actually armed or its Leader queue was actually delivered by an armed
+ping. A create failure, a budget refusal, an unreadable card, or a ping that
+did not leave the box all stay listed, alongside their `escalations` entry.
+
+**Bound.** `--max-invariant-cards` (default 60) caps one pass, keeping every
+`blocked` card and then the oldest idle of the rest; `scope` reports the true
+total so a cap cannot truncate silently. Read cost per checked card is one
+`issue runs` + one `wakeup list`, plus one `question list` only when neither
+the run nor the wakeup satisfies it.
 
 ## Stuck-list triggers (M-268, deterministic, no LLM judgment)
 
@@ -128,7 +178,8 @@ searched and remain unverified.
  ## Deploy
 
 This repo copy is the source of truth. The tick runs the deployed copy at
-`/mnt/workspace/bin/orch-sweep` — copy it there after review:
+`/mnt/workspace/bin/orch-sweep` — copy it there after review, together with the
+prompt text from `tick-prompt-delta.md`:
 
 ```sh
 cp tools/orch-sweep/orch-sweep /mnt/workspace/bin/orch-sweep
@@ -136,3 +187,5 @@ cp tools/orch-sweep/orch-sweep /mnt/workspace/bin/orch-sweep
 
 Rollback for M-268: remove the trigger paragraph from the Orchestrator
 instructions + tick autopilot; the committee stops because no wakeups arrive.
+Rollback for M-392: restore the previous script and prompt text; the only v2
+state is per-card `wake_budget` metadata, which is inert without the sweep.
