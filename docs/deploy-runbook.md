@@ -405,6 +405,17 @@ The patch appliers take the package directory as their argument and also
 accept `--check`, which reports and writes nothing, and `--verify`, which
 asserts that the installed package carries its patch.
 
+The `.orig` files the appliers keep next to the patched files only exist when
+an applier actually patched something. Against a floating `dshmarket` that
+resolves to 1.66.46 or newer, the trusted-host applier stands down with
+"dshmarket <version> already carries the trusted-authority fix", writes no
+`.orig` file and needs none. The runbook step that restores from `.orig`
+applies only to a package the applier actually patched.
+
+The rollback's `dshmarket` check reads the expected version from the restored
+`pnpm-lock.yaml`, not from the manifest spec, so it still fires when the
+manifest carries a range.
+
 ## Rollback
 
 ### Lane rollback
