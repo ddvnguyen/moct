@@ -70,16 +70,31 @@ jobs:
       # The pinned harness generation the fork script records in the release
       # manifest (see the fork's .github/workflows/deploy-dsh.yml).
       HARNESS_SHA: 19caaf271abf0d380f48d125b1d9548a53be8793
+      # Owner rule #1: nothing under /tmp or the root disk; work, caches and
+      # the pnpm store live on the workspace disk.
+      TMPDIR: /mnt/workspace/tmp/dsh-lane-deploy-${{ github.run_id }}
+      XDG_CACHE_HOME: /mnt/workspace/cache/xdg
+      GOCACHE: /mnt/workspace/cache/go-build
+      GOMODCACHE: /mnt/workspace/cache/go-mod
+      npm_config_cache: /mnt/workspace/cache/npm
+      BUN_INSTALL_CACHE_DIR: /mnt/workspace/cache/bun
+      PLAYWRIGHT_BROWSERS_PATH: /mnt/workspace/cache/playwright
+      npm_config_store_dir: /mnt/workspace/cache/pnpm-store
+      DSH_PNPM_STORE_DIR: /mnt/workspace/cache/pnpm-store
     steps:
       - name: Checkout the train owner (this repo)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      - name: Prepare the workspace-disk dirs
+        run: mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$GOCACHE" "$GOMODCACHE" "$npm_config_cache" "$BUN_INSTALL_CACHE_DIR" "$PLAYWRIGHT_BROWSERS_PATH" "$npm_config_store_dir" /mnt/workspace/cache/setup-pnpm
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 11.28.5
+          dest: /mnt/workspace/cache/setup-pnpm
 
       - name: Resolve the logical ref to shas
         id: resolve
@@ -172,7 +187,7 @@ jobs:
         working-directory: deepseek-harness
         run: |
           set -euo pipefail
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --store-dir /mnt/workspace/cache/pnpm-store
           pnpm run build
 
       - name: Install the DSH customizations into the lane profile
@@ -226,8 +241,9 @@ jobs:
           set -euo pipefail
           echo "--- lane root"
           # The lane serves its UI behind the session token it publishes in its
-          # own journal, and it binds the address its unit names (the harness
-          # refuses a wildcard bind, so the unit pins one concrete address).
+          # own journal, and it binds the address its unit names. The wildcard
+          # bind is the contract: the release deploy refuses a unit that does
+          # not carry --host 0.0.0.0, so the unit pins 0.0.0.0.
           # Take the URL the lane published for THIS boot; fall back to the
           # unit's --host address.
           URL="$(journalctl --user -u "dsh-${{ inputs.lane }}.service" -n 300 --no-pager \
