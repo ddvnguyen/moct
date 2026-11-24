@@ -89,7 +89,8 @@ apply_rm() { # apply_rm <path...> : rm -rf in apply mode, report in dry-run
     size=$((size + mib))
   done
   if [ "$MODE" = "apply" ]; then
-    rm -rf -- "$@" && log "pruned $* (~${size}M)"
+    # A failed rm (e.g. an other-uid tmp/ entry) must not abort the whole run.
+    if rm -rf -- "$@"; then log "pruned $* (~${size}M)"; else log "prune FAILED $* (left in place)"; fi
   else
     log "would prune $* (~${size}M)"
   fi
