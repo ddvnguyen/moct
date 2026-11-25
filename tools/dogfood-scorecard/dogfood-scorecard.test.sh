@@ -264,7 +264,7 @@ with open(os.path.join(out_two, "scorecard-2026-11-26.json"), "rb") as handle:
     bytes_two = handle.read()
 check("cli-byte-identical", bytes_one == bytes_two)
 
-proc3 = subprocess.run(base + ["--stdout"], capture_output=True, text=True)
+proc3 = subprocess.run(base + ["--out-dir", out_one, "--stdout"], capture_output=True, text=True)
 check("cli-stdout-json", proc3.returncode == 0 and json.loads(proc3.stdout)["tool"] == "dogfood-scorecard", proc3.stderr)
 
 proc4 = subprocess.run([sys.executable, "./dogfood-scorecard", "--date", "2026-11-26", "--since", "2026-11-26T00:00:00Z"], capture_output=True, text=True)
