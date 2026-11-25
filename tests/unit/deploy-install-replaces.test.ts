@@ -61,7 +61,7 @@ interface Fixture {
   manifest: string;
 }
 
-function fixture(options: { corruptOnInstall?: boolean; noisyBuild?: boolean } = {}): Fixture {
+function fixture(options: { corruptOnInstall?: boolean; noisyBuild?: boolean; patchMaxVersionExclusive?: string } = {}): Fixture {
   const root = mkdtempSync(path.join(tmpdir(), "dsh-deploy-"));
   dirs.push(root);
 
@@ -137,7 +137,13 @@ function fixture(options: { corruptOnInstall?: boolean; noisyBuild?: boolean } =
             packages: [{ name: "@ddvnguyen/fake-plugin", dir: "." }],
           },
         ],
-        patches: [{ target: "@ddvnguyen/fake-plugin", script: "scripts/applier.mjs" }],
+        patches: [
+          {
+            target: "@ddvnguyen/fake-plugin",
+            script: "scripts/applier.mjs",
+            ...(options.patchMaxVersionExclusive ? { maxVersionExclusive: options.patchMaxVersionExclusive } : {}),
+          },
+        ],
       },
       null,
       2,
@@ -243,6 +249,22 @@ describe("the DSH customizations deploy", () => {
       expect(failed.status).not.toBe(0);
       expect(`${failed.stdout}${failed.stderr}`).toContain("ROLLING BACK");
       expect(installedLedger(fx)).toBe("build one\n");
+    },
+    180_000,
+  );
+
+  it(
+    "skips a patch loudly when the installed target is at or above its maxVersionExclusive",
+    () => {
+      // The applier would fail (FAIL_PATCH), so a green deploy proves it was skipped.
+      const skipped = deploy(fixture({ patchMaxVersionExclusive: "0.0.1" }), SHA_ONE, { FAIL_PATCH: "1" });
+      expect(skipped.status).toBe(0);
+      expect(`${skipped.stdout}${skipped.stderr}`).toContain("SKIPPING the @ddvnguyen/fake-plugin patch");
+
+      // Below the bound the patch still runs, and a failure still rolls back.
+      const applied = deploy(fixture({ patchMaxVersionExclusive: "0.0.2" }), SHA_ONE, { FAIL_PATCH: "1" });
+      expect(applied.status).not.toBe(0);
+      expect(`${applied.stdout}${applied.stderr}`).toContain("ROLLING BACK");
     },
     180_000,
   );
