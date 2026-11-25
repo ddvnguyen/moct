@@ -1,0 +1,806 @@
+#!/usr/bin/env python3
+"""dogfood-scorecard — M-577 (M-574 A1): dog-food MMX baseline report.
+
+One read-only pass over a fixed, checked-in card set (`cards.json`). Writes a
+deterministic JSON report plus a short markdown table to
+`/mnt/workspace/dogfood-scorecard/scorecard-<date>.{json,md}` and prints the
+table. Run it once a day; the week of files is the baseline every later M-574
+slice is compared against.
+
+Read-only contract (M-577 brief):
+  * every number comes from the `multica` CLI (or a pre-captured fixture);
+  * no DB access, no writes to the board, no comments, no status changes;
+  * a metric with no read path is reported in `unavailable[]` with the missing
+    field/endpoint — never estimated, never priced locally.
+
+Sources per metric (also in README.md):
+  runs / status / attempt        `multica issue runs <card> --output json`
+  tokens in/out/cache            same call, `runs[].usage[]`
+  MOCT inject size               same call, `runs[].result.init_context.parts[]`
+                                 where `part == "memory"` -> `tokens`
+  memory-tool calls              `multica issue run-messages <run> --issue <card>`
+                                 rows `type == "tool_use"`, `tool` in
+                                 memory_search|memory_get|memory_note
+  owner-answer -> next run       `multica issue comment list` (member rows) and
+                                 `multica question list` (`answered_at`,
+                                 `answered_by_type`) x `runs[].started_at`
+  active agents, role vs named   distinct `runs[].agent_id` + `multica agent list`
+                                 (`subtype` == role | agent)
+  cost                           `multica issue usage <card>` — CARD-LIFETIME,
+                                 not windowed; see `unavailable[]`
+
+Usage:
+  dogfood-scorecard [--date YYYY-MM-DD | --since RFC3339 [--until RFC3339]]
+                    [--cards cards.json] [--out-dir DIR] [--stdout]
+                    [--fixture captured.json]
+
+Exit codes: 0 report written, 2 bad usage / unreadable input.
+"""
+
+import argparse
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+TOOL = "dogfood-scorecard"
+VERSION = 1
+DEFAULT_OUT_DIR = "/mnt/workspace/dogfood-scorecard"
+MAX_WINDOW_DAYS = 31  # one run-messages call per run; keep a window bounded
+MEMORY_TOOLS = ("memory_get", "memory_note", "memory_search")
+MEMORY_PART = "memory"
+TERMINAL_OK = "completed"
+TERMINAL_BAD = ("failed", "blocked", "cancelled")
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CARDS = os.path.join(HERE, "cards.json")
+
+UNAVAILABLE = [
+    {
+        "metric": "cost_per_card_window",
+        "scope": "card-set",
+        "missing": "runs[].usage[].cost_usd_ticks",
+        "reason": (
+            "the runs API drops the per-row task_usage.cost_usd_ticks column, "
+            "and `multica issue usage` is card-lifetime only; the report carries "
+            "lifetime cost labelled scope=card-lifetime instead of pricing tokens"
+        ),
+    },
+    {
+        "metric": "active_agents_workspace",
+        "scope": "workspace",
+        "missing": "workspace-wide runs listing",
+        "reason": (
+            "the CLI lists runs per issue; the active-agent count is therefore "
+            "scoped to the fixed card set"
+        ),
+    },
+]
+
+_FRAC = re.compile(r"\.(\d+)")
+_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class ScorecardError(Exception):
+    """Bad input: usage error, unreadable cards file, oversized window."""
+
+
+class SourceError(Exception):
+    """One CLI read failed. Carried per metric so one bad card cannot kill the day."""
+
+    def __init__(self, what, code):
+        super().__init__("%s: exit %s" % (what, code))
+        self.what = what
+        self.code = code
+
+
+# --------------------------------------------------------------------------- #
+# time helpers — every timestamp is normalised to UTC, second precision
+# --------------------------------------------------------------------------- #
+
+def parse_ts(value):
+    """RFC3339 (Z or offset, any fraction length) -> aware UTC datetime.
+
+    Sub-second precision is dropped: every reported delta is a whole number of
+    seconds, and the baseline should not drift on Go's nanosecond timestamps.
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    m = _FRAC.search(s)
+    if m and len(m.group(1)) > 6:
+        s = s[: m.start(1)] + m.group(1)[:6] + s[m.end(1):]
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def iso(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Window:
+    def __init__(self, since, until):
+        self.since = since
+        self.until = until
+
+    def contains(self, dt):
+        return dt is not None and self.since <= dt < self.until
+
+    def label(self):
+        return self.since.strftime("%Y-%m-%d")
+
+    def to_json(self):
+        seconds = int((self.until - self.since).total_seconds())
+        return {
+            "since": iso(self.since),
+            "until": iso(self.until),
+            "seconds": seconds,
+            "days": round(seconds / 86400.0, 3),
+        }
+
+
+def resolve_window(date, since, until, now=None):
+    if date and (since or until):
+        raise ScorecardError("--date cannot be combined with --since/--until")
+    if date:
+        if not _DAY.match(date):
+            raise ScorecardError("--date must be YYYY-MM-DD")
+        start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        win = Window(start, start + timedelta(days=1))
+    elif since:
+        start = parse_ts(since)
+        if start is None:
+            raise ScorecardError("--since must be RFC3339")
+        end = parse_ts(until) if until else start + timedelta(days=1)
+        if end is None:
+            raise ScorecardError("--until must be RFC3339")
+        win = Window(start, end)
+    elif until:
+        raise ScorecardError("--until needs --since")
+    else:
+        current = now or datetime.now(timezone.utc)
+        start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        win = Window(start, start + timedelta(days=1))
+    if win.until <= win.since:
+        raise ScorecardError("--until must be after --since")
+    if (win.until - win.since) > timedelta(days=MAX_WINDOW_DAYS):
+        raise ScorecardError("window longer than %d days" % MAX_WINDOW_DAYS)
+    return win
+
+
+# --------------------------------------------------------------------------- #
+# sources: live CLI and pre-captured fixture
+# --------------------------------------------------------------------------- #
+
+class CliSource:
+    """Reads through the multica CLI. No curl, no DB, no writes."""
+
+    def __init__(self, cli=None):
+        self.cli = cli or os.environ.get("MULTICA_CLI_PATH") or "multica"
+
+    def _json(self, what, args):
+        try:
+            proc = subprocess.run(
+                [self.cli] + args, capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            raise SourceError(what, "spawn:%s" % exc.errno)
+        if proc.returncode != 0:
+            raise SourceError(what, proc.returncode)
+        text = proc.stdout.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise SourceError(what + " (bad json)", proc.returncode)
+
+    def issue(self, key):
+        return self._json("issue get", ["issue", "get", key, "--output", "json"])
+
+    def runs(self, key):
+        return self._json("issue runs", ["issue", "runs", key, "--output", "json"]) or []
+
+    def usage(self, key):
+        return self._json("issue usage", ["issue", "usage", key, "--output", "json"])
+
+    def comments(self, key):
+        return self._json(
+            "issue comment list", ["issue", "comment", "list", key, "--output", "json"]
+        ) or []
+
+    def questions(self, key):
+        return self._json("question list", ["question", "list", key, "--output", "json"]) or []
+
+    def run_messages(self, key, run_id):
+        return self._json(
+            "issue run-messages",
+            ["issue", "run-messages", run_id, "--issue", key, "--output", "json"],
+        ) or []
+
+    def agents(self):
+        return self._json("agent list", ["agent", "list", "--output", "json"]) or []
+
+
+class FixtureSource:
+    """Offline replay of captured CLI payloads; used by the seeded test."""
+
+    def __init__(self, data):
+        self.data = data or {}
+
+    def _one(self, bucket, key):
+        value = (self.data.get(bucket) or {}).get(key)
+        if value is None:
+            raise SourceError(bucket + " " + key, "fixture-miss")
+        return value
+
+    def issue(self, key):
+        return self._one("issues", key)
+
+    def runs(self, key):
+        return self._one("runs", key)
+
+    def usage(self, key):
+        return self._one("usage", key)
+
+    def comments(self, key):
+        return self._one("comments", key)
+
+    def questions(self, key):
+        return self._one("questions", key)
+
+    def run_messages(self, key, run_id):
+        return (self.data.get("run_messages") or {}).get(run_id, [])
+
+    def agents(self):
+        return self.data.get("agents") or []
+
+
+# --------------------------------------------------------------------------- #
+# report
+# --------------------------------------------------------------------------- #
+
+def _run_start(run):
+    return parse_ts(run.get("started_at") or run.get("created_at"))
+
+
+def _card_identifier(entry):
+    if isinstance(entry, str):
+        return entry.strip(), ""
+    ident = (entry or {}).get("identifier")
+    if not isinstance(ident, str) or not ident.strip():
+        raise ScorecardError("cards.json entry without identifier: %r" % (entry,))
+    return ident.strip(), (entry.get("note") or "")
+
+
+def load_cards(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        raise ScorecardError("cannot read %s: %s" % (path, exc))
+    except ValueError as exc:
+        raise ScorecardError("%s is not valid json: %s" % (path, exc))
+    entries = data.get("cards") if isinstance(data, dict) else data
+    if not isinstance(entries, list) or not entries:
+        raise ScorecardError("%s has no cards[]" % path)
+    cards = []
+    seen = set()
+    for entry in entries:
+        ident, note = _card_identifier(entry)
+        if ident in seen:
+            raise ScorecardError("duplicate card %s in %s" % (ident, path))
+        seen.add(ident)
+        cards.append({"identifier": ident, "note": note})
+    return cards
+
+
+def _empty_card(identifier, note):
+    return {
+        "identifier": identifier,
+        "note": note,
+        "issue_id": None,
+        "title": None,
+        "resolved": False,
+        "runs": {
+            "total": 0,
+            "completed": 0,
+            "failed": 0,
+            "blocked": 0,
+            "cancelled": 0,
+            "open": 0,
+            "retried": 0,
+            "after_delegated_failure": 0,
+        },
+        "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "models": []},
+        "cost": {
+            "scope": "card-lifetime",
+            "cost_usd_ticks": None,
+            "metered_task_count": None,
+            "task_count": None,
+            "unreported_task_count": None,
+        },
+        "memory_inject": {
+            "runs_with_report": 0,
+            "runs_without_report": 0,
+            "tokens_total": 0,
+            "tokens_mean": None,
+        },
+        "memory_tools": {"calls": 0, "by_tool": {}, "runs_with_calls": 0, "runs_unavailable": 0},
+        "owner_latency": {
+            "samples": 0,
+            "median_seconds": None,
+            "mean_seconds": None,
+            "max_seconds": None,
+            "pairs": [],
+        },
+        "errors": [],
+    }
+
+
+def _memory_tokens(run):
+    """(measured, tokens) from result.init_context; measured False when absent."""
+    result = run.get("result") or {}
+    ctx = result.get("init_context") or {}
+    parts = ctx.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return False, None
+    for part in parts:
+        if part.get("part") == MEMORY_PART:
+            tokens = part.get("tokens")
+            if isinstance(tokens, (int, float)):
+                return True, int(tokens)
+            return False, None
+    return False, None
+
+
+def memory_tool_name(tool):
+    """Canonical MOCT memory tool name, or None.
+
+    Mirrors `memoryToolName` in server/internal/handler/moct_memory_tools.go:
+    the bare name, or the MCP-qualified `mcp__moct__<name>` form (the server
+    segment must contain "moct"). The transcript stores whatever the harness
+    called, so both forms occur in practice.
+    """
+    name = (tool or "").strip()
+    if name in MEMORY_TOOLS:
+        return name
+    qualified = name[len("mcp__"):] if name.startswith("mcp__") else name
+    server, sep, rest = qualified.partition("__")
+    if sep and "moct" in server.lower() and rest in MEMORY_TOOLS:
+        return rest
+    return None
+
+
+def _memory_calls(messages):
+    calls = 0
+    by_tool = {}
+    for msg in messages or []:
+        if msg.get("type") != "tool_use":
+            continue
+        name = memory_tool_name(msg.get("tool"))
+        if name:
+            calls += 1
+            by_tool[name] = by_tool.get(name, 0) + 1
+    return calls, by_tool
+
+
+def _owner_events(source, key, window, errors):
+    """Member answers inside the window: comments and answered questions."""
+    events = []
+    try:
+        comments = source.comments(key)
+    except SourceError as exc:
+        errors.append(str(exc))
+        comments = []
+    for comment in comments:
+        if comment.get("author_type") != "member":
+            continue
+        at = parse_ts(comment.get("created_at"))
+        if window.contains(at):
+            events.append({"at": at, "kind": "comment", "id": comment.get("id")})
+    try:
+        questions = source.questions(key)
+    except SourceError as exc:
+        errors.append(str(exc))
+        questions = []
+    for question in questions:
+        if question.get("answered_by_type") != "member":
+            continue
+        at = parse_ts(question.get("answered_at"))
+        if window.contains(at):
+            events.append({"at": at, "kind": "question", "id": question.get("id")})
+    events.sort(key=lambda e: (e["at"], e["kind"], e["id"] or ""))
+    return events
+
+
+def _latency(source, key, window, runs, errors):
+    events = _owner_events(source, key, window, errors)
+    starts = sorted(
+        dt for dt in (_run_start(run) for run in runs) if dt is not None
+    )
+    pairs = []
+    for event in events:
+        nxt = next((dt for dt in starts if dt > event["at"]), None)
+        if nxt is None:
+            continue
+        pairs.append(
+            {
+                "kind": event["kind"],
+                "answered_at": iso(event["at"]),
+                "run_started_at": iso(nxt),
+                "seconds": int((nxt - event["at"]).total_seconds()),
+            }
+        )
+    seconds = [pair["seconds"] for pair in pairs]
+    return {
+        "samples": len(seconds),
+        "median_seconds": round(statistics.median(seconds), 1) if seconds else None,
+        "mean_seconds": round(sum(seconds) / len(seconds), 1) if seconds else None,
+        "max_seconds": max(seconds) if seconds else None,
+        "pairs": pairs[:20],
+        "_seconds": seconds,
+    }
+
+
+def summarize_card(source, card, window):
+    out = _empty_card(card["identifier"], card["note"])
+    errors = out["errors"]
+    key = card["identifier"]
+
+    try:
+        issue = source.issue(key) or {}
+        out["resolved"] = True
+        out["issue_id"] = issue.get("id")
+        out["title"] = issue.get("title")
+    except SourceError as exc:
+        errors.append(str(exc))
+        return out
+
+    try:
+        runs = source.runs(key)
+    except SourceError as exc:
+        errors.append(str(exc))
+        runs = []
+    if not isinstance(runs, list):
+        errors.append("issue runs: unexpected payload")
+        runs = []
+
+    in_window = [run for run in runs if window.contains(_run_start(run))]
+    in_window.sort(key=lambda run: (iso(_run_start(run)), run.get("id") or ""))
+
+    models = set()
+    memory_reported = 0
+    memory_missing = 0
+    memory_total = 0
+    calls_total = 0
+    calls_by_tool = {}
+    runs_with_calls = 0
+    messages_unavailable = 0
+
+    for run in in_window:
+        status = run.get("status")
+        out["runs"]["total"] += 1
+        if status == TERMINAL_OK:
+            out["runs"]["completed"] += 1
+        elif status == "failed":
+            out["runs"]["failed"] += 1
+        elif status == "blocked":
+            out["runs"]["blocked"] += 1
+        elif status == "cancelled":
+            out["runs"]["cancelled"] += 1
+        else:
+            out["runs"]["open"] += 1
+        if isinstance(run.get("attempt"), int) and run["attempt"] > 1:
+            out["runs"]["retried"] += 1
+        if run.get("trigger_evidence_kind") == "delegated_failure":
+            out["runs"]["after_delegated_failure"] += 1
+
+        for row in run.get("usage") or []:
+            if not isinstance(row, dict):
+                continue
+            out["tokens"]["input"] += int(row.get("input_tokens") or 0)
+            out["tokens"]["output"] += int(row.get("output_tokens") or 0)
+            out["tokens"]["cache_read"] += int(row.get("cache_read_tokens") or 0)
+            out["tokens"]["cache_write"] += int(row.get("cache_write_tokens") or 0)
+            if row.get("model"):
+                models.add(str(row["model"]))
+
+        measured, tokens = _memory_tokens(run)
+        if measured:
+            memory_reported += 1
+            memory_total += tokens
+        else:
+            memory_missing += 1
+
+        try:
+            messages = source.run_messages(key, run.get("id"))
+        except SourceError as exc:
+            errors.append(str(exc))
+            messages_unavailable += 1
+            continue
+        calls, by_tool = _memory_calls(messages)
+        calls_total += calls
+        if calls:
+            runs_with_calls += 1
+            for tool, count in by_tool.items():
+                calls_by_tool[tool] = calls_by_tool.get(tool, 0) + count
+
+    out["tokens"]["models"] = sorted(models)
+    out["memory_inject"] = {
+        "runs_with_report": memory_reported,
+        "runs_without_report": memory_missing,
+        "tokens_total": memory_total,
+        "tokens_mean": round(memory_total / memory_reported, 1) if memory_reported else None,
+    }
+    out["memory_tools"] = {
+        "calls": calls_total,
+        "by_tool": dict(sorted(calls_by_tool.items())),
+        "runs_with_calls": runs_with_calls,
+        "runs_unavailable": messages_unavailable,
+    }
+
+    try:
+        usage = source.usage(key) or {}
+        out["cost"] = {
+            "scope": "card-lifetime",
+            "cost_usd_ticks": usage.get("cost_usd_ticks"),
+            "metered_task_count": usage.get("metered_task_count"),
+            "task_count": usage.get("task_count"),
+            "unreported_task_count": usage.get("unreported_task_count"),
+        }
+    except SourceError as exc:
+        errors.append(str(exc))
+
+    out["owner_latency"] = _latency(source, key, window, runs, errors)
+    out["_latency_seconds"] = out["owner_latency"].pop("_seconds", [])
+
+    # Deterministic order of the error list; the set is stable for a given input.
+    out["errors"] = sorted(set(errors))
+    out["_agent_runs"] = [(run.get("agent_id"), run.get("id")) for run in in_window]
+    return out
+
+
+def _agent_table(agent_runs, agents_raw):
+    index = {}
+    for agent in agents_raw or []:
+        if agent.get("id"):
+            index[agent["id"]] = agent
+    counts = {}
+    for agent_id, _run_id in agent_runs:
+        if not agent_id:
+            continue
+        counts[agent_id] = counts.get(agent_id, 0) + 1
+    rows = []
+    for agent_id, runs in counts.items():
+        agent = index.get(agent_id) or {}
+        subtype = agent.get("subtype") or "unknown"
+        rows.append(
+            {
+                "id": agent_id,
+                "name": agent.get("name") or "(unlisted agent)",
+                "subtype": subtype,
+                "archived": bool(agent.get("archived_at")),
+                "runs": runs,
+            }
+        )
+    rows.sort(key=lambda row: (row["name"], row["id"]))
+    roles = sum(1 for row in rows if row["subtype"] == "role")
+    named = sum(1 for row in rows if row["subtype"] == "agent")
+    return {
+        "active": len(rows),
+        "roles": roles,
+        "named": named,
+        "unknown": len(rows) - roles - named,
+        "list": rows,
+    }
+
+
+def _totals(cards):
+    tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    runs = {
+        "total": 0,
+        "completed": 0,
+        "failed": 0,
+        "blocked": 0,
+        "cancelled": 0,
+        "open": 0,
+        "retried": 0,
+        "after_delegated_failure": 0,
+    }
+    memory_tokens = 0
+    memory_calls = 0
+    seconds = []
+    for card in cards:
+        for key in tokens:
+            tokens[key] += card["tokens"][key]
+        for key in runs:
+            runs[key] += card["runs"][key]
+        memory_tokens += card["memory_inject"]["tokens_total"]
+        memory_calls += card["memory_tools"]["calls"]
+        seconds.extend(card["_latency_seconds"])
+    return {
+        "runs": runs,
+        "tokens": tokens,
+        "memory_inject_tokens": memory_tokens,
+        "memory_tool_calls": memory_calls,
+        "owner_latency": {
+            "samples": len(seconds),
+            "median_seconds": round(statistics.median(seconds), 1) if seconds else None,
+            "mean_seconds": round(sum(seconds) / len(seconds), 1) if seconds else None,
+            "max_seconds": max(seconds) if seconds else None,
+        },
+    }
+
+
+def build_report(source, cards, window):
+    summaries = []
+    agent_runs = []
+    for card in cards:
+        summary = summarize_card(source, card, window)
+        agent_runs.extend(summary.pop("_agent_runs", []))
+        summaries.append(summary)
+    totals = _totals(summaries)
+    for summary in summaries:
+        summary.pop("_latency_seconds", None)
+    try:
+        agents_raw = source.agents()
+    except SourceError:
+        agents_raw = []
+    return {
+        "tool": TOOL,
+        "version": VERSION,
+        "window": window.to_json(),
+        "cards": summaries,
+        "totals": totals,
+        "agents": _agent_table(agent_runs, agents_raw),
+        "unavailable": UNAVAILABLE,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+
+def _num(value):
+    if value is None:
+        return "—"
+    if isinstance(value, int):
+        return "{:,}".format(value)
+    return str(value)
+
+
+def render_markdown(report):
+    window = report["window"]
+    lines = [
+        "# Dog-food scorecard — %s" % window["since"][:10],
+        "",
+        "Window: `%s` → `%s` (%s day(s), UTC)" % (window["since"], window["until"], window["days"]),
+        "",
+        "| Card | Runs | Failed | Retried | In | Out | Cache read | Mem tok | Mem calls | Owner→run s |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for card in report["cards"]:
+        runs = card["runs"]
+        latency = card["owner_latency"]["median_seconds"]
+        ident = card["identifier"] if card["resolved"] else card["identifier"] + " (unresolved)"
+        lines.append(
+            "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |"
+            % (
+                ident,
+                _num(runs["total"]),
+                _num(runs["failed"]),
+                _num(runs["retried"]),
+                _num(card["tokens"]["input"]),
+                _num(card["tokens"]["output"]),
+                _num(card["tokens"]["cache_read"]),
+                _num(card["memory_inject"]["tokens_total"]),
+                _num(card["memory_tools"]["calls"]),
+                _num(latency),
+            )
+        )
+    totals = report["totals"]
+    lines.append(
+        "| **total** | %s | %s | %s | %s | %s | %s | %s | %s | %s |"
+        % (
+            _num(totals["runs"]["total"]),
+            _num(totals["runs"]["failed"]),
+            _num(totals["runs"]["retried"]),
+            _num(totals["tokens"]["input"]),
+            _num(totals["tokens"]["output"]),
+            _num(totals["tokens"]["cache_read"]),
+            _num(totals["memory_inject_tokens"]),
+            _num(totals["memory_tool_calls"]),
+            _num(totals["owner_latency"]["median_seconds"]),
+        )
+    )
+    agents = report["agents"]
+    lines += [
+        "",
+        "Agents active in the window: %d (%d role, %d named, %d unknown), scoped to the card set."
+        % (agents["active"], agents["roles"], agents["named"], agents["unknown"]),
+        "",
+        "Unavailable (named, not estimated):",
+    ]
+    for gap in report["unavailable"]:
+        lines.append("- `%s` — missing `%s` (%s)" % (gap["metric"], gap["missing"], gap["reason"]))
+    errors = [(card["identifier"], err) for card in report["cards"] for err in card["errors"]]
+    if errors:
+        lines += ["", "Read errors:"]
+        for ident, err in errors:
+            lines.append("- %s: %s" % (ident, err))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_outputs(report, markdown, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.join(out_dir, "scorecard-" + report["window"]["since"][:10])
+    payload = json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    with open(stem + ".json", "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    with open(stem + ".md", "w", encoding="utf-8") as handle:
+        handle.write(markdown)
+    return stem + ".json", stem + ".md"
+
+
+# --------------------------------------------------------------------------- #
+# entry point
+# --------------------------------------------------------------------------- #
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="Read-only daily dog-food report over a fixed card set (M-577).",
+    )
+    parser.add_argument("--cards", default=DEFAULT_CARDS, help="cards.json path")
+    parser.add_argument("--date", help="UTC day YYYY-MM-DD (default: today)")
+    parser.add_argument("--since", help="RFC3339 window start (needs --until or defaults to +1 day)")
+    parser.add_argument("--until", help="RFC3339 window end (exclusive)")
+    parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR, help="report directory")
+    parser.add_argument("--fixture", help="replay captured CLI payloads (offline test)")
+    parser.add_argument("--cli", help="multica executable (default: $MULTICA_CLI_PATH)")
+    parser.add_argument("--stdout", action="store_true", help="print JSON instead of the table")
+    args = parser.parse_args(argv)
+
+    try:
+        window = resolve_window(args.date, args.since, args.until)
+        cards = load_cards(args.cards)
+    except ScorecardError as exc:
+        print("%s: %s" % (TOOL, exc), file=sys.stderr)
+        return 2
+
+    if args.fixture:
+        try:
+            with open(args.fixture, "r", encoding="utf-8") as handle:
+                source = FixtureSource(json.load(handle))
+        except (OSError, ValueError) as exc:
+            print("%s: cannot read fixture: %s" % (TOOL, exc), file=sys.stderr)
+            return 2
+    else:
+        source = CliSource(args.cli)
+
+    report = build_report(source, cards, window)
+    markdown = render_markdown(report)
+    json_path, md_path = write_outputs(report, markdown, args.out_dir)
+
+    if args.stdout:
+        sys.stdout.write(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    else:
+        sys.stdout.write(markdown)
+        print("wrote %s" % json_path, file=sys.stderr)
+        print("wrote %s" % md_path, file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
