@@ -378,16 +378,106 @@ def role_pilot_record(issue):
     return raw
 
 
-def role_pilot_readiness(row, wip, max_wip, prefix):
-    """(ready, reason) for one Role. Fails closed: unknown, archived, offline, unbound, at wip."""
+# M-588 B1d (G1): a Role is `status=offline`, `runtime_bound=false` forever by
+# construction, so the old agent-row check failed closed to `named` on every
+# card and the pilot gained 0 %. Readiness now probes the Role's *route*: the
+# workspace flag plus a usable tier with a live, free member runtime.
+#
+# There is no `multica` CLI command (and no API the sweep already uses) that
+# reads `model_tier_role` / tier members. The probe therefore uses the narrow
+# read-only command proposed in the README; until that command exists the
+# probe fails closed (`role_route_unreadable`) and the card stays on `named`.
+# No DB path is guessed.
+ROLE_ROUTE_FRESH_MINUTES = 15
+
+
+def role_route(role_id):
+    """Read one Role's route snapshot via the CLI. `{"__error__": ...}` on failure."""
+    d = sh_json(["multica", "agent", "role-route", role_id, "--output", "json"])
+    return d if isinstance(d, dict) else {"__error__": "route not an object"}
+
+
+def role_route_ready(route, t=None):
+    """(ready, reason) from a role-route snapshot. Fails closed on any unknown.
+
+    A tier qualifies when it is enabled, not `manual_only`, not in cooldown,
+    and has a member runtime that is online, fresh and has a free slot.
+    """
+    if not isinstance(route, dict) or "__error__" in route:
+        return False, "role_route_unreadable"
+    if route.get("flag_on") is not True:
+        return False, "role_flag_off"
+    tiers = route.get("tiers")
+    if not isinstance(tiers, list):
+        return False, "role_route_unreadable"
+    t = t or now()
+    eligible, online = 0, False
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        if tier.get("enabled") is False or tier.get("manual_only"):
+            continue
+        cd = tier.get("cooldown_until")
+        if cd:
+            cd_t = parse_ts(cd) if isinstance(cd, str) else None
+            if not cd_t or cd_t > t:
+                continue
+        eligible += 1
+        members = tier.get("members")
+        if not isinstance(members, list):
+            continue
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            if member.get("runtime_status") != "online":
+                continue
+            last_seen = member.get("runtime_last_seen_at")
+            seen = parse_ts(last_seen) if isinstance(last_seen, str) else None
+            if not seen or (t - seen).total_seconds() > ROLE_ROUTE_FRESH_MINUTES * 60:
+                continue
+            online = True
+            try:
+                free = int(member.get("free_slots") or 0)
+            except (TypeError, ValueError):
+                free = 0
+            if free > 0:
+                return True, None
+    if not eligible:
+        return False, "role_route_no_eligible_tier"
+    if not online:
+        return False, "role_route_no_online_runtime"
+    return False, "role_route_no_capacity"
+
+
+def role_route_summary(route):
+    """Small, log-safe probe summary for the sweep JSON."""
+    if not isinstance(route, dict) or "__error__" in route:
+        return {"readable": False}
+    tiers = route.get("tiers") if isinstance(route.get("tiers"), list) else []
+    eligible = 0
+    for tier in tiers:
+        if not isinstance(tier, dict) or tier.get("enabled") is False or tier.get("manual_only"):
+            continue
+        cd = tier.get("cooldown_until")
+        cd_t = parse_ts(cd) if isinstance(cd, str) else None
+        if cd_t and cd_t > now():
+            continue
+        eligible += 1
+    return {"readable": True, "flag_on": route.get("flag_on"),
+            "tiers": len(tiers), "eligible_tiers": eligible}
+
+
+def role_pilot_readiness(row, wip, max_wip, prefix, route=None, t=None):
+    """(ready, reason) for one Role. The agent row's `status`/`runtime_bound`
+    are not consulted: a Role is offline and unbound by construction. Only
+    the route probe, the archive state and the Engineer WIP cap decide."""
     if not row:
         return False, prefix + "_unknown"
     if row.get("archived_at"):
         return False, prefix + "_archived"
-    if row.get("status") == "offline":
-        return False, prefix + "_offline"
-    if row.get("runtime_bound") is False:
-        return False, prefix + "_unbound"
+    ready, reason = role_route_ready(route, t)
+    if not ready:
+        return False, reason
     if max_wip is not None and wip >= max_wip:
         return False, prefix + "_at_wip"
     return True, None
@@ -395,7 +485,7 @@ def role_pilot_readiness(row, wip, max_wip, prefix):
 
 def build_role_pilot(issues, board_runs, names, cfg, cfg_error, apply=False,
                      runs_fn=None, write_fn=None, config_path=None,
-                     max_cards=ROLE_PILOT_MAX_CARDS):
+                     max_cards=ROLE_PILOT_MAX_CARDS, route_fn=None, route_now=None):
     """M-588 B1b: deterministic role/named split for cards that have not been routed.
 
     Read-only unless `apply`, which writes the arm once as card metadata
@@ -418,8 +508,19 @@ def build_role_pilot(issues, board_runs, names, cfg, cfg_error, apply=False,
     for i in issues:
         if i.get("status") == "in_progress" and i.get("assignee_id"):
             wip[i["assignee_id"]] = wip.get(i["assignee_id"], 0) + 1
-    eng_ready, eng_reason = role_pilot_readiness(eng_row, wip.get(eng_id, 0), max_wip, "role")
-    lead_ready, lead_reason = role_pilot_readiness(lead_row, 0, None, "lead")
+    # G1: probe each Role's route, never its `status`/`runtime_bound` fields.
+    route_fn = route_fn or role_route
+    def read_route(role_id):
+        try:
+            return route_fn(role_id)
+        except Exception as exc:  # noqa: BLE001 - a probe must never stall the tick
+            return {"__error__": repr(exc)[:150]}
+    eng_route = read_route(eng_id) if eng_row else None
+    lead_route = read_route(lead_id) if lead_row else None
+    eng_ready, eng_reason = role_pilot_readiness(
+        eng_row, wip.get(eng_id, 0), max_wip, "role", eng_route, route_now)
+    lead_ready, lead_reason = role_pilot_readiness(
+        lead_row, 0, None, "lead", lead_route, route_now)
 
     eligible, skipped, recorded = [], [], []
     counts = {"role": 0, "named": 0, "skipped": 0, "existing": 0,
@@ -500,14 +601,17 @@ def build_role_pilot(issues, board_runs, names, cfg, cfg_error, apply=False,
         "config": config_path or ROLE_PILOT_CONFIG,
         "apply": bool(apply),
         "engineer_role": {"id": eng_id, "name": eng_row.get("name"),
+                          # informational only: G1 no longer gates on these fields
                           "status": eng_row.get("status"),
                           "runtime_bound": eng_row.get("runtime_bound"),
                           "ready": eng_ready, "reason": eng_reason,
-                          "wip": wip.get(eng_id, 0), "max_wip": max_wip},
+                          "wip": wip.get(eng_id, 0), "max_wip": max_wip,
+                          "route": role_route_summary(eng_route)},
         "lead_role": {"id": lead_id, "name": lead_row.get("name"),
                       "status": lead_row.get("status"),
                       "runtime_bound": lead_row.get("runtime_bound"),
-                      "ready": lead_ready, "reason": lead_reason},
+                      "ready": lead_ready, "reason": lead_reason,
+                      "route": role_route_summary(lead_route)},
         "eligible": eligible, "skipped": skipped, "recorded": recorded,
         "counts": counts, "truncated": truncated,
     }
@@ -783,7 +887,8 @@ def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=26
           apply_incomplete_turns=False, v2_enabled=True, v2_apply=False,
           v2_cards=INVARIANT_CARDS_DEFAULT, wake_limit=WAKE_LIMIT_DEFAULT,
           role_pilot_apply=False, role_pilot_config_path=None,
-          role_pilot_cards=ROLE_PILOT_MAX_CARDS):
+          role_pilot_cards=ROLE_PILOT_MAX_CARDS,
+          role_pilot_route_fn=None, role_pilot_route_now=None):
     t_start = now()
     issues_d = fetch_issues()
     if isinstance(issues_d, list):
@@ -1031,7 +1136,9 @@ def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=26
         rp_cfg, rp_err = role_pilot_config(role_pilot_config_path)
         role_pilot = build_role_pilot(issues, board_runs, names, rp_cfg, rp_err,
                                       apply=role_pilot_apply, config_path=role_pilot_config_path,
-                                      max_cards=role_pilot_cards)
+                                      max_cards=role_pilot_cards,
+                                      route_fn=role_pilot_route_fn,
+                                      route_now=role_pilot_route_now)
     except Exception as exc:  # noqa: BLE001
         role_pilot = {"status": "error", "pct": 0, "error": repr(exc)[:200],
                       "eligible": [], "skipped": [], "recorded": [],

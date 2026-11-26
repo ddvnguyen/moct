@@ -9,8 +9,19 @@ cd "$(dirname "$0")"
 # real board: an un-stubbed call gets an empty JSON object instead of a crash.
 shim="$PWD/.test-bin.$$"
 mkdir -p "$shim"
-printf '#!/bin/sh\necho "{}"\n' > "$shim/multica"
+# G1: `agent role-route` returns a seeded, fresh route so the CLI read path is
+# exercised on PATH; every other un-stubbed call still gets `{}`.
+cat > "$shim/multica" <<'SH'
+#!/bin/sh
+d=$(dirname "$0")
+for a in "$@"; do
+  if [ "$a" = "role-route" ]; then cat "$d/route.json"; exit 0; fi
+done
+echo "{}"
+SH
 chmod +x "$shim/multica"
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '{"flag_on":true,"tiers":[{"name":"seeded","enabled":true,"manual_only":false,"cooldown_until":null,"members":[{"runtime_id":"rt-seed","runtime_status":"online","runtime_last_seen_at":"%s","free_slots":2}]}]}' "$NOW" > "$shim/route.json"
 PATH="$shim:$PATH"
 export PATH
 trap 'rm -rf "$shim"' EXIT
@@ -83,7 +94,7 @@ mkboard() { # mkboard <json-board> <json-issues> <json-resume>
 }
 
 echo "TAP version 13"
-echo "1..60"
+echo "1..68"
 npass=0; nfail=0
 check "a-fires"              "$(mkboard "[{\"card\":\"M-2\",\"activity_minutes\":10,\"active_run\":false,\"wakeup_pending\":false,\"prs\":[$GREEN_PR],\"failure_class\":null,\"reason\":\"fresh\"}]" "[]" "{}")"
 check "a-excludes-live-run"  "$(mkboard "[{\"card\":\"M-2\",\"activity_minutes\":10,\"active_run\":true,\"wakeup_pending\":false,\"prs\":[$GREEN_PR],\"failure_class\":null,\"reason\":\"run-live\"}]" "[]" "{}")"
@@ -768,16 +779,25 @@ check_rp() { # check_rp <case>
   local name="$1"
   if python3 - "$name" <<'EOF'; then
 import importlib.machinery, importlib.util, json, sys
+from datetime import timedelta
 loader = importlib.machinery.SourceFileLoader("s", "./orch-sweep")
 spec = importlib.util.spec_from_loader("s", loader)
 s = importlib.util.module_from_spec(spec); loader.exec_module(s)
 name = sys.argv[1]
 ENG, LEAD = "eng-role", "lead-role"
 CFG = {"pct": 30, "engineer_role_id": ENG, "lead_role_id": LEAD, "max_wip": 1}
-READY = {ENG: {"name": "Engineer Role", "status": "idle", "runtime_bound": True, "archived_at": None},
-         LEAD: {"name": "Management Role", "status": "idle", "runtime_bound": True, "archived_at": None}}
+# G1: these fields used to gate readiness; they must no longer matter.
 OFFLINE = {ENG: {"name": "Engineer Role", "status": "offline", "runtime_bound": False, "archived_at": None},
            LEAD: {"name": "Management Role", "status": "offline", "runtime_bound": False, "archived_at": None}}
+NOW = s.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+STALE = (s.now() - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def route(flag=True, tiers=None):
+    if tiers is None:
+        tiers = [{"name": "go-hy4", "enabled": True, "manual_only": False, "cooldown_until": None,
+                  "members": [{"runtime_id": "rt-1", "runtime_status": "online",
+                               "runtime_last_seen_at": NOW, "free_slots": 3}]}]
+    return {"flag_on": flag, "tiers": tiers}
+ROUTE_OK = route()
 def issue(n, status="todo", assignee=None, md=None):
     return {"id": n, "identifier": "M-" + n, "status": status,
             "assignee_id": assignee, "metadata": md or {}}
@@ -791,13 +811,17 @@ def named_id():
         if s.role_pilot_bucket("card-%d" % i) >= 30:
             return "card-%d" % i
     raise AssertionError("no named bucket")
-def build(issues, board=None, names=None, cfg=None, err=None, apply=False, write=None, runs=None):
-    # `runs` is stubbed: the harness must never shell out to the multica CLI
-    # (CI has none on PATH, and a real card uuid is not available here).
-    return s.build_role_pilot(issues, board or {}, names or READY, cfg or CFG, err,
+def build(issues, board=None, names=None, cfg=None, err=None, apply=False, write=None,
+          runs=None, routes=None):
+    # `runs` and `routes` are stubbed: the harness must never shell out to the
+    # real multica CLI (CI has none, and real card uuids are not available here).
+    rts = {"eng-role": ROUTE_OK, "lead-role": ROUTE_OK} if routes is None else routes
+    return s.build_role_pilot(issues, board or {}, names or OFFLINE, cfg or CFG, err,
                               apply=apply, write_fn=write or (lambda i, p: (0, "")),
                               runs_fn=runs or (lambda i: []),
-                              config_path="role-pilot.test.json")
+                              config_path="role-pilot.test.json",
+                              route_fn=lambda rid: rts.get(rid, {"__error__": "route_not_seeded"}),
+                              route_now=s.now())
 ok, detail = True, ""
 if name == "rp-arm-stable":
     card = role_id()
@@ -814,13 +838,72 @@ elif name == "rp-arm-pct0":
     r = build([issue(role_id())], cfg=cfg)
     ok = r["counts"]["role"] == 0 and r["eligible"][0]["arm"] == "named"
     detail = json.dumps(r["counts"])
-elif name == "rp-role-offline":
+elif name == "rp-route-offline-field-ignored":
+    # G1: "offline"/"runtime_bound false" on the agent row no longer gate a Role.
     r = build([issue(role_id())], names=OFFLINE)
     e = r["eligible"][0]
-    ok = (e["arm"] == "named" and e["reason"] == "role_offline"
-          and any(x["reason"] == "role_offline" for x in r["skipped"])
-          and r["counts"]["fallback"] == 1)
+    ok = (e["arm"] == "role" and e["reason"] is None and r["counts"]["fallback"] == 0
+          and r["engineer_role"]["route"]["readable"] is True)
+    detail = json.dumps({"arm": e["arm"], "reason": e["reason"],
+                         "engineer_role": r["engineer_role"]})
+elif name == "rp-route-cli-read":
+    # The fake multica on PATH answers `agent role-route` with a seeded route.
+    seeded = s.role_route(ENG)
+    ready, reason = s.role_route_ready(seeded)
+    ok = (seeded.get("flag_on") is True and ready is True and reason is None)
+    detail = json.dumps({"route": seeded, "ready": ready, "reason": reason})
+elif name == "rp-route-flag-off":
+    r = build([issue(role_id())], routes={ENG: route(flag=False), LEAD: route(flag=False)})
+    e = r["eligible"][0]
+    ok = (e["arm"] == "named" and e["reason"] == "role_flag_off"
+          and any(x["reason"] == "role_flag_off" for x in r["skipped"]))
     detail = json.dumps({"arm": e["arm"], "reason": e["reason"], "skipped": r["skipped"]})
+elif name == "rp-route-no-online-runtime":
+    tiers = [{"name": "t", "enabled": True, "manual_only": False, "cooldown_until": None,
+              "members": [{"runtime_id": "rt-1", "runtime_status": "offline",
+                           "runtime_last_seen_at": NOW, "free_slots": 3}]}]
+    r = build([issue(role_id())], routes={ENG: route(tiers=tiers), LEAD: route(tiers=tiers)})
+    e = r["eligible"][0]
+    ok = (e["arm"] == "named" and e["reason"] == "role_route_no_online_runtime"
+          and any(x["reason"] == "role_route_no_online_runtime" for x in r["skipped"]))
+    detail = json.dumps({"arm": e["arm"], "reason": e["reason"], "skipped": r["skipped"]})
+elif name == "rp-route-stale-runtime":
+    tiers = [{"name": "t", "enabled": True, "manual_only": False, "cooldown_until": None,
+              "members": [{"runtime_id": "rt-1", "runtime_status": "online",
+                           "runtime_last_seen_at": STALE, "free_slots": 3}]}]
+    r = build([issue(role_id())], routes={ENG: route(tiers=tiers), LEAD: route(tiers=tiers)})
+    e = r["eligible"][0]
+    ok = (e["arm"] == "named" and e["reason"] == "role_route_no_online_runtime")
+    detail = json.dumps({"arm": e["arm"], "reason": e["reason"]})
+elif name == "rp-route-no-capacity":
+    tiers = [{"name": "t", "enabled": True, "manual_only": False, "cooldown_until": None,
+              "members": [{"runtime_id": "rt-1", "runtime_status": "online",
+                           "runtime_last_seen_at": NOW, "free_slots": 0}]}]
+    r = build([issue(role_id())], routes={ENG: route(tiers=tiers), LEAD: route(tiers=tiers)})
+    e = r["eligible"][0]
+    ok = (e["arm"] == "named" and e["reason"] == "role_route_no_capacity"
+          and any(x["reason"] == "role_route_no_capacity" for x in r["skipped"]))
+    detail = json.dumps({"arm": e["arm"], "reason": e["reason"], "skipped": r["skipped"]})
+elif name == "rp-route-probe-error":
+    r = build([issue(role_id())], routes={ENG: {"__error__": "rc=1 unknown command"},
+                                          LEAD: {"__error__": "rc=1 unknown command"}})
+    e = r["eligible"][0]
+    ok = (e["arm"] == "named" and e["reason"] == "role_route_unreadable"
+          and any(x["reason"] == "role_route_unreadable" for x in r["skipped"])
+          and r["engineer_role"]["route"] == {"readable": False})
+    detail = json.dumps({"arm": e["arm"], "reason": e["reason"], "skipped": r["skipped"]})
+elif name == "rp-route-no-eligible-tier":
+    tiers = [{"name": "manual", "enabled": True, "manual_only": True, "cooldown_until": None,
+              "members": [{"runtime_id": "rt-1", "runtime_status": "online",
+                           "runtime_last_seen_at": NOW, "free_slots": 3}]},
+             {"name": "cool", "enabled": True, "manual_only": False,
+              "cooldown_until": (s.now() + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "members": [{"runtime_id": "rt-2", "runtime_status": "online",
+                           "runtime_last_seen_at": NOW, "free_slots": 3}]}]
+    r = build([issue(role_id())], routes={ENG: route(tiers=tiers), LEAD: route(tiers=tiers)})
+    e = r["eligible"][0]
+    ok = (e["arm"] == "named" and e["reason"] == "role_route_no_eligible_tier")
+    detail = json.dumps({"arm": e["arm"], "reason": e["reason"]})
 elif name == "rp-config-missing":
     r = build([issue(role_id())], cfg={"pct": 0, "engineer_role_id": ENG, "lead_role_id": LEAD, "max_wip": 1},
               err="config_missing")
@@ -875,7 +958,14 @@ EOF
 check_rp "rp-arm-stable"
 check_rp "rp-arm-30pct"
 check_rp "rp-arm-pct0"
-check_rp "rp-role-offline"
+check_rp "rp-route-offline-field-ignored"
+check_rp "rp-route-cli-read"
+check_rp "rp-route-flag-off"
+check_rp "rp-route-no-online-runtime"
+check_rp "rp-route-stale-runtime"
+check_rp "rp-route-no-capacity"
+check_rp "rp-route-probe-error"
+check_rp "rp-route-no-eligible-tier"
 check_rp "rp-config-missing"
 check_rp "rp-never-resplit"
 check_rp "rp-dry-run-no-write"

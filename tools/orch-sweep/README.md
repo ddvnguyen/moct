@@ -9,7 +9,8 @@ live board (issues, runs, wakeups, PRs, quota ledger, committee seats, queues).
   per-card budget. `--invariant` and `--blocked-kinds` print those slices and
   write nothing. `--role-pilot-config <path>` (default `role-pilot.json` beside
   the script) and `--max-role-pilot-cards N` (default 20) tune the M-588 role
-  split; `--apply` is what records an arm. `--stuck-list` prints the compact M-268 committee slice
+  split; `--apply` is what records an arm. Role readiness is decided by a
+  `agent role-route` CLI probe (see below), not by the agent row. `--stuck-list` prints the compact M-268 committee slice
   `{at, tool, mode, hash, triggers, items}` (deprecated alias, one release);
   `--free-questions [--hours N]` (default 24) prints the M-328 slice
   `{at, tool, mode, hours, issues_scanned, comments_flagged, offenders[]}` for
@@ -29,10 +30,14 @@ live board (issues, runs, wakeups, PRs, quota ledger, committee seats, queues).
   same-run driver exemption), and the M-392 v2 cases (invariant satisfiers, blocked
   kinds, wake budget, dry-run zero writes, batched Leader ping), plus the
   M-588 B1b role-split cases (arm stability, 30 % ±1.5 over 10k uuids, pct=0,
-  Role offline, missing config, never re-split, dry run writes nothing, cards
-  with runs, unreadable runs, `pre_assigned`, and a failed write that keeps the
-  arm). The harness puts a `multica` shim on `PATH` (empty JSON for any
-  un-stubbed call), so it runs in CI where no CLI exists.
+  never re-split, dry run writes nothing, cards with runs, unreadable runs,
+  `pre_assigned`, and a failed write that keeps the arm), plus the B1d/G1
+  route-probe cases: an `offline`/unbound agent row no longer gates a Role;
+  the fake `multica` on `PATH` answers `agent role-route`; flag off, no online
+  runtime, stale runtime, no capacity, all tiers manual/cooldown, and a probe
+  error each land on `named` with a precise `reason`. The harness puts a
+  `multica` shim on `PATH` (empty JSON for any un-stubbed call except a seeded
+  `role-route`), so it runs in CI where no CLI exists.
 - `tick-prompt-delta.md` — the Orchestrator prompt text to apply with the
   deploy; without it the tick still carries the hash gate and v2 is inert.
 
@@ -108,18 +113,50 @@ never relabelled. Cards with runs are `already_run`; an unreadable
 `--max-role-pilot-cards` caps the per-pass `issue runs` calls; anything left
 over is `truncated`.
 
-**Readiness, fail closed.** The role arm needs both Roles ready: not archived,
-not `offline`, `runtime_bound` not false, and the Engineer Role below
-`max_wip`. Any failure records `named` with `role_*` / `lead_*` in
-`reason` and appends `{card, reason, arm}` to `skipped[]`, so a go-live
-period with offline Roles is visible as `counts.fallback` rather than
-silently filling the control group.
+**Readiness, fail closed (M-588 B1d / G1).** A Role is `status=offline` and
+`runtime_bound=false` forever by construction, so those agent-row fields are
+**not** consulted any more. The role arm needs both Roles ready by *route*:
+not archived, the workspace flag on, at least one tier that is enabled, not
+`manual_only`, not in cooldown, with a member runtime that is `online`, fresh
+(`runtime_last_seen_at` within 15 minutes) and has a free slot; the Engineer
+Role must also be below `max_wip`. Any failure records `named` with a precise
+`reason` and appends `{card, reason, arm}` to `skipped[]`, so a go-live period
+with no route is visible as `counts.fallback` rather than silently filling the
+control group. Reason codes: `role_flag_off`, `role_route_unreadable` (probe
+error, including a missing CLI command), `role_route_no_eligible_tier` (all
+tiers disabled/manual/cooldown), `role_route_no_online_runtime` (no online and
+fresh member), `role_route_no_capacity` (online but no free slot). Archive /
+WIP / unknown still use `role_*` / `lead_*` prefixes.
+
+**Route read (the smallest read-only endpoint).** The probe calls:
+
+```
+multica agent role-route <role-id> --output json
+```
+
+and expects (read-only, one call per Role; no key or secret in the output):
+
+```json
+{"flag_on": true, "tiers": [
+  {"name": "go-hy4", "enabled": true, "manual_only": false, "cooldown_until": null,
+   "members": [{"runtime_id": "…", "runtime_status": "online",
+                "runtime_last_seen_at": "2026-11-26T09:00:00Z", "free_slots": 3}]}
+]}
+```
+
+**Gap:** no `multica` CLI command and no API the sweep already uses exposes
+`model_tier_role` / tier members today (confirmed with `multica --help`,
+`agent --help` and the B4 tier-pick audit). The sweep therefore fails closed
+with `role_route_unreadable` until that narrow read exists; go-live needs the
+CLI binding above added to `multica-x`. The sweep never guesses a DB path.
+The probe result is echoed in `engineer_role.route` / `lead_role.route` in the
+sweep JSON.
 
 **Record.** With `--apply` (the only write mode) the arm is written once as
 card metadata `role_pilot`:
 
 ```json
-{"arm":"named","bucket":5,"pct":30,"reason":"role_offline","at":"2026-11-26T09:00:00Z"}
+{"arm":"named","bucket":5,"pct":30,"reason":"role_route_no_capacity","at":"2026-11-26T09:00:00Z"}
 ```
 
 `role` cards also get `engineer_id` (assignee) and `reviewer_id` (the
