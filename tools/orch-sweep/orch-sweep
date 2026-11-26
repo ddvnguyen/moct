@@ -443,7 +443,10 @@ def build_role_pilot(issues, board_runs, names, cfg, cfg_error, apply=False,
             if len(eligible) >= max_cards:
                 truncated += 1
                 continue
-            runs = runs_fn(issue.get("id"))
+            try:
+                runs = runs_fn(issue.get("id"))
+            except Exception as exc:  # noqa: BLE001 - a CLI miss must not stall the tick
+                runs = {"__error__": repr(exc)[:150]}
             if isinstance(runs, dict) and "__error__" in runs:
                 skipped.append({"card": card, "reason": "runs_unreadable"})
                 counts["skipped"] += 1

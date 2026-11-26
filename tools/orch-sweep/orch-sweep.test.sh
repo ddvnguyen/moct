@@ -5,6 +5,15 @@
 # and hash stability (same board twice -> same hash; age drift -> same hash).
 set -euo pipefail
 cd "$(dirname "$0")"
+# Hermetic CLI. CI has no `multica` binary, and the harness must never read the
+# real board: an un-stubbed call gets an empty JSON object instead of a crash.
+shim="$PWD/.test-bin.$$"
+mkdir -p "$shim"
+printf '#!/bin/sh\necho "{}"\n' > "$shim/multica"
+chmod +x "$shim/multica"
+PATH="$shim:$PATH"
+export PATH
+trap 'rm -rf "$shim"' EXIT
 check() { # check <name> <payload-json>
   local name="$1" payload="$2"
   if python3 - "$name" "$payload" <<'EOF'; then
@@ -782,9 +791,12 @@ def named_id():
         if s.role_pilot_bucket("card-%d" % i) >= 30:
             return "card-%d" % i
     raise AssertionError("no named bucket")
-def build(issues, board=None, names=None, cfg=None, err=None, apply=False, write=None):
+def build(issues, board=None, names=None, cfg=None, err=None, apply=False, write=None, runs=None):
+    # `runs` is stubbed: the harness must never shell out to the multica CLI
+    # (CI has none on PATH, and a real card uuid is not available here).
     return s.build_role_pilot(issues, board or {}, names or READY, cfg or CFG, err,
                               apply=apply, write_fn=write or (lambda i, p: (0, "")),
+                              runs_fn=runs or (lambda i: []),
                               config_path="role-pilot.test.json")
 ok, detail = True, ""
 if name == "rp-arm-stable":
@@ -838,6 +850,11 @@ elif name == "rp-pre-assigned":
               write=lambda i, p: calls.append(i) or (0, ""))
     ok = (r["eligible"] == [] and r["skipped"][0]["reason"] == "pre_assigned" and calls == [])
     detail = json.dumps({"skipped": r["skipped"], "writes": len(calls)})
+elif name == "rp-runs-unreadable":
+    card = role_id()
+    r = build([issue(card)], runs=lambda i: {"__error__": "no multica on PATH"})
+    ok = r["eligible"] == [] and r["skipped"][0]["reason"] == "runs_unreadable"
+    detail = json.dumps(r["skipped"])
 elif name == "rp-write-failure-keeps-arm":
     card = role_id()
     r = build([issue(card)], apply=True, write=lambda i, p: (1, "boom"))
@@ -864,6 +881,7 @@ check_rp "rp-never-resplit"
 check_rp "rp-dry-run-no-write"
 check_rp "rp-not-yet-run"
 check_rp "rp-pre-assigned"
+check_rp "rp-runs-unreadable"
 check_rp "rp-write-failure-keeps-arm"
 
 echo "# passed=$npass failed=$nfail"

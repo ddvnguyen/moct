@@ -30,7 +30,9 @@ live board (issues, runs, wakeups, PRs, quota ledger, committee seats, queues).
   kinds, wake budget, dry-run zero writes, batched Leader ping), plus the
   M-588 B1b role-split cases (arm stability, 30 % ±1.5 over 10k uuids, pct=0,
   Role offline, missing config, never re-split, dry run writes nothing, cards
-  with runs, `pre_assigned`, and a failed write that keeps the arm).
+  with runs, unreadable runs, `pre_assigned`, and a failed write that keeps the
+  arm). The harness puts a `multica` shim on `PATH` (empty JSON for any
+  un-stubbed call), so it runs in CI where no CLI exists.
 - `tick-prompt-delta.md` — the Orchestrator prompt text to apply with the
   deploy; without it the tick still carries the hash gate and v2 is inert.
 
@@ -101,8 +103,10 @@ A missing or malformed file fails closed: `pct=0`, `status` is
 runs yet, and is either unassigned or already assigned to the Engineer Role.
 Cards already recorded are counted in `counts.existing` and never re-split.
 Cards assigned to any other agent are `pre_assigned` — a hand-routed card is
-never relabelled. Cards with runs are `already_run`. `--max-role-pilot-cards`
-caps the per-pass `issue runs` calls; anything left over is `truncated`.
+never relabelled. Cards with runs are `already_run`; an unreadable
+`issue runs` (or a missing CLI) is `runs_unreadable` and the card keeps no arm.
+`--max-role-pilot-cards` caps the per-pass `issue runs` calls; anything left
+over is `truncated`.
 
 **Readiness, fail closed.** The role arm needs both Roles ready: not archived,
 not `offline`, `runtime_bound` not false, and the Engineer Role below
