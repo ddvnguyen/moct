@@ -4,7 +4,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOL="$HERE/tier-pick-audit"
-TMP="$HERE/.test-tmp"
+TMP="$HERE/.test-tmp-audit"
 rm -rf "$TMP"
 mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
