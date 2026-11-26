@@ -54,6 +54,13 @@ MEMORY_TOOLS = ("memory_get", "memory_note", "memory_search")
 MEMORY_PART = "memory"
 TERMINAL_OK = "completed"
 TERMINAL_BAD = ("failed", "blocked", "cancelled")
+# M-588 B1b: the arm orch-sweep records on a card, and the groups --by-arm reports.
+ARM_KEY = "role_pilot"
+ARM_GROUPS = ("role", "named", "pre-pilot")
+ARM_LABEL_ROLE = "role"
+ARM_LABEL_NAMED = "named (control)"
+ARM_LABEL_FALLBACK = "named (fallback: intended role)"
+TURN_BLOCKS = ("tool_use", "text")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CARDS = os.path.join(HERE, "cards.json")
 
@@ -394,6 +401,38 @@ def _memory_calls(messages):
     return calls, by_tool
 
 
+def count_turns(messages):
+    """Assistant-side blocks in one run: every tool call and every assistant text
+    block. A model turn that emits both counts two; the transcript carries no
+    turn id, so this is the honest, reproducible floor (see by_arm.definition)."""
+    return sum(1 for msg in messages or [] if msg.get("type") in TURN_BLOCKS)
+
+
+def arm_fields(issue):
+    """The role-pilot arm recorded on the card, or `pre-pilot` when none exists."""
+    raw = (issue.get("metadata") or {}).get(ARM_KEY)
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if not isinstance(raw, dict) or raw.get("arm") not in ("role", "named"):
+        return {"arm": "pre-pilot", "arm_label": "pre-pilot", "arm_bucket": None,
+                "arm_pct": None, "arm_reason": None}
+    bucket, pct, reason = raw.get("bucket"), raw.get("pct"), raw.get("reason")
+    fallback = (
+        raw["arm"] == "named"
+        and isinstance(bucket, int)
+        and isinstance(pct, int)
+        and bucket < pct
+        and bool(reason)
+    )
+    label = ARM_LABEL_FALLBACK if fallback else (
+        ARM_LABEL_NAMED if raw["arm"] == "named" else ARM_LABEL_ROLE)
+    return {"arm": raw["arm"], "arm_label": label, "arm_bucket": bucket,
+            "arm_pct": pct, "arm_reason": reason}
+
+
 def _owner_events(source, key, window, errors):
     """Member answers inside the window: comments and answered questions."""
     events = []
@@ -452,16 +491,20 @@ def _latency(source, key, window, runs, errors):
     }
 
 
-def summarize_card(source, card, window):
+def summarize_card(source, card, window, by_arm=False):
     out = _empty_card(card["identifier"], card["note"])
     errors = out["errors"]
     key = card["identifier"]
+    if by_arm:
+        out.update(arm_fields({}))
 
     try:
         issue = source.issue(key) or {}
         out["resolved"] = True
         out["issue_id"] = issue.get("id")
         out["title"] = issue.get("title")
+        if by_arm:
+            out.update(arm_fields(issue))
     except SourceError as exc:
         errors.append(str(exc))
         return out
@@ -486,6 +529,7 @@ def summarize_card(source, card, window):
     calls_by_tool = {}
     runs_with_calls = 0
     messages_unavailable = 0
+    turns_total = 0
 
     for run in in_window:
         status = run.get("status")
@@ -529,6 +573,7 @@ def summarize_card(source, card, window):
             messages_unavailable += 1
             continue
         calls, by_tool = _memory_calls(messages)
+        turns_total += count_turns(messages)
         calls_total += calls
         if calls:
             runs_with_calls += 1
@@ -563,6 +608,9 @@ def summarize_card(source, card, window):
 
     out["owner_latency"] = _latency(source, key, window, runs, errors)
     out["_latency_seconds"] = out["owner_latency"].pop("_seconds", [])
+    if by_arm:
+        out["turns"] = turns_total
+        out["turns_runs_unavailable"] = messages_unavailable
 
     # Deterministic order of the error list; the set is stable for a given input.
     out["errors"] = sorted(set(errors))
@@ -642,11 +690,80 @@ def _totals(cards):
     }
 
 
-def build_report(source, cards, window):
+def _empty_arm_group(name):
+    return {
+        "group": name,
+        "cards": 0,
+        "runs": 0,
+        "failed": 0,
+        "turns": 0,
+        "turns_runs_unavailable": 0,
+        "tokens": {"input": 0, "output": 0, "cache_read": 0},
+        "cost_usd_ticks": 0,
+        "cost_missing_cards": 0,
+        "latency_samples": 0,
+        "fallback": 0,
+        "control": 0,
+        "_latency": [],
+    }
+
+
+def arm_groups(cards):
+    """M-588 B1b --by-arm: role / named / pre-pilot, plus the fallback count that
+    keeps a go-live period with offline Roles from silently filling the control."""
+    groups = {name: _empty_arm_group(name) for name in ARM_GROUPS}
+    for card in cards:
+        arm = card.get("arm") or "pre-pilot"
+        group = groups.get(arm) or groups["pre-pilot"]
+        group["cards"] += 1
+        group["runs"] += card["runs"]["total"]
+        group["failed"] += card["runs"]["failed"]
+        group["turns"] += card.get("turns") or 0
+        group["turns_runs_unavailable"] += card.get("turns_runs_unavailable") or 0
+        for key in ("input", "output", "cache_read"):
+            group["tokens"][key] += card["tokens"][key]
+        ticks = (card.get("cost") or {}).get("cost_usd_ticks")
+        if isinstance(ticks, int):
+            group["cost_usd_ticks"] += ticks
+        else:
+            group["cost_missing_cards"] += 1
+        latency = card["owner_latency"]["median_seconds"]
+        if latency is not None:
+            group["_latency"].append(latency)
+            group["latency_samples"] += 1
+        if card.get("arm_label") == ARM_LABEL_FALLBACK:
+            group["fallback"] += 1
+    for group in groups.values():
+        group["runs_per_card"] = (
+            round(group["runs"] / group["cards"], 2) if group["cards"] else None)
+        group["turns_per_card"] = (
+            round(group["turns"] / group["cards"], 2) if group["cards"] else None)
+        latencies = group.pop("_latency")
+        group["latency_median_seconds"] = (
+            round(statistics.median(latencies), 1) if latencies else None)
+        if group["group"] == "named":
+            group["control"] = group["cards"] - group["fallback"]
+    return {
+        "definition": {
+            "arm_source": "issue metadata role_pilot = {arm, pct, bucket, reason}",
+            "role": "bucket < pct and both Roles ready; routed to the Engineer Role, "
+                    "reviewed by the Management Role",
+            "named": "bucket >= pct, or the intended role arm failed closed",
+            "pre-pilot": "no arm recorded on the card",
+            "fallback": "named card whose bucket < pct and whose reason names a Role failure",
+            "turns": "assistant blocks (tool_use + text) per run from run-messages; "
+                     "a transcript block count, not a model-turn count",
+            "cost": "card-lifetime, see unavailable[]",
+        },
+        "groups": groups,
+    }
+
+
+def build_report(source, cards, window, by_arm=False):
     summaries = []
     agent_runs = []
     for card in cards:
-        summary = summarize_card(source, card, window)
+        summary = summarize_card(source, card, window, by_arm=by_arm)
         agent_runs.extend(summary.pop("_agent_runs", []))
         summaries.append(summary)
     totals = _totals(summaries)
@@ -656,7 +773,7 @@ def build_report(source, cards, window):
         agents_raw = source.agents()
     except SourceError:
         agents_raw = []
-    return {
+    report = {
         "tool": TOOL,
         "version": VERSION,
         "window": window.to_json(),
@@ -665,6 +782,9 @@ def build_report(source, cards, window):
         "agents": _agent_table(agent_runs, agents_raw),
         "unavailable": UNAVAILABLE,
     }
+    if by_arm:
+        report["by_arm"] = arm_groups(summaries)
+    return report
 
 
 # --------------------------------------------------------------------------- #
@@ -681,22 +801,28 @@ def _num(value):
 
 def render_markdown(report):
     window = report["window"]
+    by_arm = "by_arm" in report
+    arm_head = " Arm |" if by_arm else ""
+    arm_rule = " --- |" if by_arm else ""
     lines = [
         "# Dog-food scorecard — %s" % window["since"][:10],
         "",
         "Window: `%s` → `%s` (%s day(s), UTC)" % (window["since"], window["until"], window["days"]),
         "",
-        "| Card | Runs | Failed | Retried | In | Out | Cache read | Mem tok | Mem calls | Owner→run s |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Card |%s Runs | Failed | Retried | In | Out | Cache read | Mem tok | Mem calls | Owner→run s |"
+        % arm_head,
+        "| --- |%s ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |" % arm_rule,
     ]
     for card in report["cards"]:
         runs = card["runs"]
         latency = card["owner_latency"]["median_seconds"]
         ident = card["identifier"] if card["resolved"] else card["identifier"] + " (unresolved)"
+        arm_cell = " %s |" % card.get("arm_label", "pre-pilot") if by_arm else ""
         lines.append(
-            "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |"
+            "| %s |%s %s | %s | %s | %s | %s | %s | %s | %s | %s |"
             % (
                 ident,
+                arm_cell,
                 _num(runs["total"]),
                 _num(runs["failed"]),
                 _num(runs["retried"]),
@@ -710,8 +836,9 @@ def render_markdown(report):
         )
     totals = report["totals"]
     lines.append(
-        "| **total** | %s | %s | %s | %s | %s | %s | %s | %s | %s |"
+        "| **total** |%s %s | %s | %s | %s | %s | %s | %s | %s | %s |"
         % (
+            " — |" if by_arm else "",
             _num(totals["runs"]["total"]),
             _num(totals["runs"]["failed"]),
             _num(totals["runs"]["retried"]),
@@ -723,6 +850,42 @@ def render_markdown(report):
             _num(totals["owner_latency"]["median_seconds"]),
         )
     )
+    if by_arm:
+        lines += [
+            "",
+            "## By arm",
+            "",
+            "| Arm | Cards | Fallback | Runs | Runs/card | Turns | Turns/card | In | Out | "
+            "Failed | Owner→run s | Cost (lifetime ticks) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for name in ARM_GROUPS:
+            group = report["by_arm"]["groups"][name]
+            label = name
+            if name == "named":
+                label = "named (control %d / fallback %d)" % (group["control"], group["fallback"])
+            lines.append(
+                "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |"
+                % (
+                    label,
+                    _num(group["cards"]),
+                    _num(group["fallback"]),
+                    _num(group["runs"]),
+                    _num(group["runs_per_card"]),
+                    _num(group["turns"]),
+                    _num(group["turns_per_card"]),
+                    _num(group["tokens"]["input"]),
+                    _num(group["tokens"]["output"]),
+                    _num(group["failed"]),
+                    _num(group["latency_median_seconds"]),
+                    _num(group["cost_usd_ticks"]),
+                )
+            )
+        lines += [
+            "",
+            "Arm source: `issue metadata role_pilot`. Turns count assistant blocks "
+            "(`tool_use` + `text`) in `run-messages`; cost is card-lifetime.",
+        ]
     agents = report["agents"]
     lines += [
         "",
@@ -770,6 +933,8 @@ def main(argv=None):
     parser.add_argument("--fixture", help="replay captured CLI payloads (offline test)")
     parser.add_argument("--cli", help="multica executable (default: $MULTICA_CLI_PATH)")
     parser.add_argument("--stdout", action="store_true", help="print JSON instead of the table")
+    parser.add_argument("--by-arm", action="store_true",
+                        help="group by the role-pilot arm (role / named / pre-pilot)")
     args = parser.parse_args(argv)
 
     try:
@@ -789,7 +954,7 @@ def main(argv=None):
     else:
         source = CliSource(args.cli)
 
-    report = build_report(source, cards, window)
+    report = build_report(source, cards, window, by_arm=args.by_arm)
     markdown = render_markdown(report)
     json_path, md_path = write_outputs(report, markdown, args.out_dir)
 

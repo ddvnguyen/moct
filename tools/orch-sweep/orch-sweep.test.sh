@@ -74,7 +74,7 @@ mkboard() { # mkboard <json-board> <json-issues> <json-resume>
 }
 
 echo "TAP version 13"
-echo "1..50"
+echo "1..60"
 npass=0; nfail=0
 check "a-fires"              "$(mkboard "[{\"card\":\"M-2\",\"activity_minutes\":10,\"active_run\":false,\"wakeup_pending\":false,\"prs\":[$GREEN_PR],\"failure_class\":null,\"reason\":\"fresh\"}]" "[]" "{}")"
 check "a-excludes-live-run"  "$(mkboard "[{\"card\":\"M-2\",\"activity_minutes\":10,\"active_run\":true,\"wakeup_pending\":false,\"prs\":[$GREEN_PR],\"failure_class\":null,\"reason\":\"run-live\"}]" "[]" "{}")"
@@ -748,6 +748,123 @@ EOF
 else
   nfail=$((nfail+1)); echo "not ok - v2-leader-ping"
 fi
+
+# M-588 B1b: the deterministic role split. Pure-function cases, no board and
+# no writes: bucket stability, the 30% distribution, pct=0, fail-closed when
+# the Role is offline or the config is missing, never re-split a recorded card,
+# a dry pass writes nothing, a card that already ran is not eligible, a card
+# already handed to a named agent is not relabelled, and a failed write keeps
+# the arm the pass already decided.
+check_rp() { # check_rp <case>
+  local name="$1"
+  if python3 - "$name" <<'EOF'; then
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("s", "./orch-sweep")
+spec = importlib.util.spec_from_loader("s", loader)
+s = importlib.util.module_from_spec(spec); loader.exec_module(s)
+name = sys.argv[1]
+ENG, LEAD = "eng-role", "lead-role"
+CFG = {"pct": 30, "engineer_role_id": ENG, "lead_role_id": LEAD, "max_wip": 1}
+READY = {ENG: {"name": "Engineer Role", "status": "idle", "runtime_bound": True, "archived_at": None},
+         LEAD: {"name": "Management Role", "status": "idle", "runtime_bound": True, "archived_at": None}}
+OFFLINE = {ENG: {"name": "Engineer Role", "status": "offline", "runtime_bound": False, "archived_at": None},
+           LEAD: {"name": "Management Role", "status": "offline", "runtime_bound": False, "archived_at": None}}
+def issue(n, status="todo", assignee=None, md=None):
+    return {"id": n, "identifier": "M-" + n, "status": status,
+            "assignee_id": assignee, "metadata": md or {}}
+def role_id():
+    for i in range(1000):
+        if s.role_pilot_bucket("card-%d" % i) < 30:
+            return "card-%d" % i
+    raise AssertionError("no role bucket")
+def named_id():
+    for i in range(1000):
+        if s.role_pilot_bucket("card-%d" % i) >= 30:
+            return "card-%d" % i
+    raise AssertionError("no named bucket")
+def build(issues, board=None, names=None, cfg=None, err=None, apply=False, write=None):
+    return s.build_role_pilot(issues, board or {}, names or READY, cfg or CFG, err,
+                              apply=apply, write_fn=write or (lambda i, p: (0, "")),
+                              config_path="role-pilot.test.json")
+ok, detail = True, ""
+if name == "rp-arm-stable":
+    card = role_id()
+    arms = [build([issue(card)])["eligible"][0]["arm"] for _ in range(3)]
+    ok = arms == ["role"] * 3 and len(set(arms)) == 1
+    detail = ",".join(arms)
+elif name == "rp-arm-30pct":
+    hits = sum(1 for i in range(10000) if s.role_pilot_bucket("u-%d" % i) < 30)
+    share = hits / 100.0
+    ok = abs(share - 30.0) <= 1.5
+    detail = "share=%.2f%%" % share
+elif name == "rp-arm-pct0":
+    cfg = dict(CFG, pct=0)
+    r = build([issue(role_id())], cfg=cfg)
+    ok = r["counts"]["role"] == 0 and r["eligible"][0]["arm"] == "named"
+    detail = json.dumps(r["counts"])
+elif name == "rp-role-offline":
+    r = build([issue(role_id())], names=OFFLINE)
+    e = r["eligible"][0]
+    ok = (e["arm"] == "named" and e["reason"] == "role_offline"
+          and any(x["reason"] == "role_offline" for x in r["skipped"])
+          and r["counts"]["fallback"] == 1)
+    detail = json.dumps({"arm": e["arm"], "reason": e["reason"], "skipped": r["skipped"]})
+elif name == "rp-config-missing":
+    r = build([issue(role_id())], cfg={"pct": 0, "engineer_role_id": ENG, "lead_role_id": LEAD, "max_wip": 1},
+              err="config_missing")
+    ok = (r["status"] == "config_missing" and r["pct"] == 0
+          and r["eligible"][0]["arm"] == "named" and r["eligible"][0]["reason"] == "config_missing")
+    detail = json.dumps({"status": r["status"], "pct": r["pct"], "arm": r["eligible"][0]["arm"]})
+elif name == "rp-never-resplit":
+    card = role_id()
+    rec = json.dumps({"arm": "named", "pct": 30, "bucket": 99, "reason": None})
+    r = build([issue(card, md={"role_pilot": rec})])
+    ok = r["eligible"] == [] and r["counts"]["existing"] == 1
+    detail = json.dumps(r["counts"])
+elif name == "rp-dry-run-no-write":
+    calls = []
+    r = build([issue(role_id())], apply=False, write=lambda i, p: calls.append(i) or (0, ""))
+    ok = calls == [] and r["recorded"] == [] and r["apply"] is False
+    detail = "writes=%d" % len(calls)
+elif name == "rp-not-yet-run":
+    card = named_id()
+    r = build([issue(card)], board={"M-" + card: 2})
+    ok = r["eligible"] == [] and r["skipped"][0]["reason"] == "already_run"
+    detail = json.dumps(r["skipped"])
+elif name == "rp-pre-assigned":
+    calls = []
+    card = role_id()
+    r = build([issue(card, assignee="named-agent")], apply=True,
+              write=lambda i, p: calls.append(i) or (0, ""))
+    ok = (r["eligible"] == [] and r["skipped"][0]["reason"] == "pre_assigned" and calls == [])
+    detail = json.dumps({"skipped": r["skipped"], "writes": len(calls)})
+elif name == "rp-write-failure-keeps-arm":
+    card = role_id()
+    r = build([issue(card)], apply=True, write=lambda i, p: (1, "boom"))
+    ok = (r["eligible"][0]["arm"] == "role" and r["recorded"][0]["written"] is False
+          and r["counts"]["role"] == 1)
+    detail = json.dumps({"arm": r["eligible"][0]["arm"], "recorded": r["recorded"]})
+else:
+    ok, detail = False, "unknown case " + name
+print(("PASS " if ok else "FAIL ") + name + " :: " + detail)
+sys.exit(0 if ok else 1)
+EOF
+    npass=$((npass+1)); echo "ok - $name"
+  else
+    nfail=$((nfail+1)); echo "not ok - $name"
+  fi
+}
+
+check_rp "rp-arm-stable"
+check_rp "rp-arm-30pct"
+check_rp "rp-arm-pct0"
+check_rp "rp-role-offline"
+check_rp "rp-config-missing"
+check_rp "rp-never-resplit"
+check_rp "rp-dry-run-no-write"
+check_rp "rp-not-yet-run"
+check_rp "rp-pre-assigned"
+check_rp "rp-write-failure-keeps-arm"
 
 echo "# passed=$npass failed=$nfail"
 [ "$nfail" -eq 0 ]

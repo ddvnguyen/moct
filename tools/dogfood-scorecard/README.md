@@ -6,7 +6,7 @@ baseline every later M-574 slice is compared against.
 
 ```
 dogfood-scorecard [--date YYYY-MM-DD | --since RFC3339 [--until RFC3339]]
-                  [--cards cards.json] [--out-dir DIR] [--stdout]
+                  [--cards cards.json] [--out-dir DIR] [--stdout] [--by-arm]
                   [--fixture captured.json] [--cli /path/to/multica]
 ```
 
@@ -22,6 +22,35 @@ Output:
 
 Two runs over the same window produce byte-identical JSON: no timestamps other
 than the window, cards sorted by identifier, keys sorted.
+
+## By arm (M-588 B1b)
+
+`--by-arm` adds an `Arm` column per card, a `by_arm` block, and a
+`## By arm` table. Without the flag the output is exactly what it was
+before, byte for byte.
+
+The arm comes from card metadata `role_pilot` (written once by
+`orch-sweep`): `{arm, pct, bucket, reason, at}`. Three groups:
+
+| Group | Definition |
+| --- | --- |
+| `role` | `arm == "role"` — routed to the Engineer Role, reviewed by the Management Role |
+| `named (control)` | `arm == "named"` with `bucket >= pct` |
+| `named (fallback: intended role)` | `arm == "named"`, `bucket < pct`, and a `reason` — hashed into the role arm but failed closed |
+| `pre-pilot` | no `role_pilot` metadata on the card |
+
+The fallback label is a count and a label on the existing `named` group, not a
+fourth group: intent-to-treat stays visible while the routing comparison stays
+honest. A card with no arm is `pre-pilot`, never `named` — an unarmed card was
+not part of the pilot.
+
+Per group: cards, runs, failed, turns, turns/card, tokens in/out, owner→run
+median, cost ticks (lifetime), `control` and `fallback` counts.
+
+**Turns** are assistant blocks (`type` in `tool_use` | `text`) in
+`run-messages`, summed per card. The transcript carries no turn id, so this is
+a reproducible floor, not a model-turn count; the `by_arm.definition` block
+says so in the report itself.
 
 ## Card set
 
@@ -81,9 +110,11 @@ pnpm test                                                # CI gate (vitest wrapp
 
 The bash test replays a synthetic fixture through the same `build_report` the
 live run uses and asserts run counts, token sums, memory-inject extraction,
-memory-tool counting, latency pairing, the role/named split, byte-identical
-output on a second pass, and the window rules. `tests/unit/dogfood-scorecard.test.ts`
-runs it inside `pnpm test`, so CI covers it without a workflow change.
+memory-tool counting, latency pairing, the role/named split, the `--by-arm`
+groups (role / named control / named fallback / pre-pilot, turns, and the
+default output staying arm-free), byte-identical output on a second pass, and
+the window rules. `tests/unit/dogfood-scorecard.test.ts` runs it inside
+`pnpm test`, so CI covers it without a workflow change.
 
 ## Deploy and daily run
 

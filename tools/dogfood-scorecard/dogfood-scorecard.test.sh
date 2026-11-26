@@ -57,8 +57,16 @@ def init_ctx(memory_tokens):
 
 fixture = {
     "issues": {
-        "M-1": {"id": "id-1", "identifier": "M-1", "title": "first"},
-        "M-2": {"id": "id-2", "identifier": "M-2", "title": "second"},
+        "M-1": {"id": "id-1", "identifier": "M-1", "title": "first",
+                "metadata": {"role_pilot": json.dumps(
+                    {"arm": "role", "pct": 30, "bucket": 3, "reason": None})}},
+        "M-2": {"id": "id-2", "identifier": "M-2", "title": "second",
+                "metadata": {"role_pilot": json.dumps(
+                    {"arm": "named", "pct": 30, "bucket": 77, "reason": None})}},
+        "M-3": {"id": "id-3", "identifier": "M-3", "title": "third", "metadata": {}},
+        "M-4": {"id": "id-4", "identifier": "M-4", "title": "fourth",
+                "metadata": {"role_pilot": json.dumps(
+                    {"arm": "named", "pct": 30, "bucket": 5, "reason": "role_offline"})}},
     },
     "runs": {
         "M-1": [
@@ -104,6 +112,8 @@ fixture = {
             },
         ],
         "M-2": [],
+        "M-3": [],
+        "M-4": [],
     },
     "usage": {
         "M-1": {
@@ -113,6 +123,8 @@ fixture = {
             "unreported_task_count": 1,
         },
         "M-2": {"cost_usd_ticks": 0, "metered_task_count": 0, "task_count": 0, "unreported_task_count": 0},
+        "M-3": {"cost_usd_ticks": 0, "metered_task_count": 0, "task_count": 0, "unreported_task_count": 0},
+        "M-4": {"cost_usd_ticks": 0, "metered_task_count": 0, "task_count": 0, "unreported_task_count": 0},
     },
     "comments": {
         "M-1": [
@@ -121,6 +133,8 @@ fixture = {
             {"id": "c-old", "author_type": "member", "created_at": "2026-11-25T22:00:00Z"},
         ],
         "M-2": [{"id": "c-lonely", "author_type": "member", "created_at": "2026-11-26T05:00:00Z"}],
+        "M-3": [],
+        "M-4": [],
     },
     "questions": {
         "M-1": [
@@ -130,6 +144,8 @@ fixture = {
             {"id": "q-agent", "answered_by_type": "agent", "answered_at": "2026-11-26T02:45:00Z"},
         ],
         "M-2": [],
+        "M-3": [],
+        "M-4": [],
     },
     "run_messages": {
         "r1": [
@@ -218,6 +234,49 @@ check("markdown-has-card", "| M-1 |" in markdown, markdown[:200])
 check("markdown-has-total", "| **total** |" in markdown, markdown[:200])
 check("markdown-has-unavailable", "`cost_per_card_window`" in markdown, markdown[-400:])
 
+# --- M-588 B1b: --by-arm grouping -----------------------------------------
+check("by-arm-off-by-default", "by_arm" not in report and "## By arm" not in markdown)
+
+arm_cards = cards + [
+    {"identifier": "M-3", "note": "c"},
+    {"identifier": "M-4", "note": "d"},
+]
+arm_report = mod.build_report(source, arm_cards, window, by_arm=True)
+arm_by_id = {card["identifier"]: card for card in arm_report["cards"]}
+check("arm-role-label", arm_by_id["M-1"]["arm"] == "role"
+      and arm_by_id["M-1"]["arm_label"] == "role", arm_by_id["M-1"].get("arm"))
+check("arm-control-label", arm_by_id["M-2"]["arm_label"] == "named (control)",
+      arm_by_id["M-2"].get("arm_label"))
+check("arm-pre-pilot-label", arm_by_id["M-3"]["arm_label"] == "pre-pilot",
+      arm_by_id["M-3"].get("arm_label"))
+check("arm-fallback-label", arm_by_id["M-4"]["arm_label"] == "named (fallback: intended role)",
+      arm_by_id["M-4"].get("arm_label"))
+check("arm-turns", arm_by_id["M-1"]["turns"] == 5, arm_by_id["M-1"].get("turns"))
+
+groups = arm_report["by_arm"]["groups"]
+check("by-arm-three-groups", sorted(groups) == ["named", "pre-pilot", "role"], sorted(groups))
+check("by-arm-cards", [groups[n]["cards"] for n in ("role", "named", "pre-pilot")] == [1, 2, 1],
+      {n: groups[n]["cards"] for n in groups})
+check("by-arm-fallback-count", groups["named"]["fallback"] == 1 and groups["named"]["control"] == 1,
+      groups["named"])
+check("by-arm-role-runs", groups["role"]["runs"] == 3 and groups["role"]["failed"] == 1,
+      groups["role"])
+check("by-arm-turns-per-card", groups["role"]["turns"] == 5
+      and groups["role"]["turns_per_card"] == 5.0, groups["role"])
+check("by-arm-cost", groups["role"]["cost_usd_ticks"] == 1234
+      and groups["named"]["cost_missing_cards"] == 0, groups["named"])
+check("by-arm-definition", "fallback" in arm_report["by_arm"]["definition"]
+      and "pre-pilot" in arm_report["by_arm"]["definition"], arm_report["by_arm"]["definition"])
+
+arm_markdown = mod.render_markdown(arm_report)
+check("by-arm-markdown-table", "## By arm" in arm_markdown, arm_markdown[-600:])
+check("by-arm-markdown-named", "named (control 1 / fallback 1)" in arm_markdown, arm_markdown[-600:])
+check("by-arm-markdown-column", "| Card | Arm |" in arm_markdown, arm_markdown[:300])
+check("by-arm-deterministic",
+      json.dumps(arm_report, sort_keys=True, ensure_ascii=False)
+      == json.dumps(mod.build_report(source, arm_cards, window, by_arm=True),
+                    sort_keys=True, ensure_ascii=False))
+
 # --- a missing card is an error, not a zero --------------------------------
 missing = mod.summarize_card(mod.FixtureSource({}), {"identifier": "M-404", "note": ""}, window)
 check("missing-card-unresolved", missing["resolved"] is False, missing)
@@ -266,6 +325,18 @@ check("cli-byte-identical", bytes_one == bytes_two)
 
 proc3 = subprocess.run(base + ["--out-dir", out_one, "--stdout"], capture_output=True, text=True)
 check("cli-stdout-json", proc3.returncode == 0 and json.loads(proc3.stdout)["tool"] == "dogfood-scorecard", proc3.stderr)
+
+arm_cards_path = os.path.join(tmp, "arm-cards.json")
+with open(arm_cards_path, "w", encoding="utf-8") as handle:
+    json.dump({"version": 1, "cards": arm_cards}, handle)
+proc_arm = subprocess.run(
+    [sys.executable, "./dogfood-scorecard", "--fixture", fixture_path,
+     "--cards", arm_cards_path, "--date", "2026-11-26", "--by-arm", "--stdout"],
+    capture_output=True, text=True)
+arm_cli = json.loads(proc_arm.stdout) if proc_arm.returncode == 0 else {}
+check("cli-by-arm", proc_arm.returncode == 0 and "by_arm" in arm_cli, proc_arm.stderr)
+check("cli-by-arm-cards", len(arm_cli.get("cards", [])) == 4
+      and all("arm_label" in card for card in arm_cli.get("cards", [])), arm_cli.get("tool"))
 
 proc4 = subprocess.run([sys.executable, "./dogfood-scorecard", "--date", "2026-11-26", "--since", "2026-11-26T00:00:00Z"], capture_output=True, text=True)
 check("cli-rejects-mixed", proc4.returncode == 2, proc4.returncode)
