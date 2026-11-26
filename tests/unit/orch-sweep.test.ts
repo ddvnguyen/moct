@@ -1,5 +1,5 @@
 /**
- * M-588 B1b: the sweep ships a seeded, offline bash test (TAP-style, 61 cases).
+ * M-588 B1b/B1d: the sweep ships a seeded, offline bash test (TAP-style, 68 cases).
  * CI's only test door is `pnpm test` (vitest), so this wrapper keeps that test
  * inside the existing gate without touching `.github/workflows/ci.yml`.
  */
@@ -17,6 +17,6 @@ describe("orch-sweep", () => {
       encoding: "utf8",
       timeout: 120_000,
     });
-    expect(out).toContain("# passed=61 failed=0");
+    expect(out).toContain("# passed=68 failed=0");
   });
 });
