@@ -55,6 +55,7 @@ observed-signal only; do not invent one.
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -270,7 +271,13 @@ def agent_names():
     rows = d.get("agents", []) if isinstance(d, dict) else []
     for a in rows:
         if a.get("id"):
-            out[a["id"]] = {"name": a.get("name"), "model": a.get("model"), "status": a.get("status")}
+            out[a["id"]] = {"name": a.get("name"), "model": a.get("model"),
+                            "status": a.get("status"),
+                            # M-588 B1b: role readiness needs the binding, not just the status.
+                            "runtime_bound": a.get("runtime_bound"),
+                            "archived_at": a.get("archived_at"),
+                            "subtype": a.get("subtype"),
+                            "max_concurrent_tasks": a.get("max_concurrent_tasks")}
     return out
 
 
@@ -306,6 +313,204 @@ def card_runs(card_id):
 def card_wakeups(card_id):
     d = sh_json(["multica", "issue", "wakeup", "list", card_id, "--output", "json"])
     return d if isinstance(d, list) else d.get("wakeups", []) if isinstance(d, dict) else []
+
+
+# ------------------------------------------- M-588 B1b: role pilot split
+# 30% of new eligible cards go to the Engineer Role (reviewer: Management
+# Role); the rest keep the named-agent routing. The split is deterministic on
+# the card uuid and recorded once per card, so the scorecard can compare the
+# two arms. Fail closed: every error lands on the named arm.
+ROLE_PILOT_KEY = "role_pilot"
+ROLE_PILOT_CONFIG = os.path.join(os.path.dirname(os.path.realpath(__file__)), "role-pilot.json")
+ROLE_PILOT_MAX_CARDS = 20
+ROLE_PILOT_ROLE = "role"
+ROLE_PILOT_NAMED = "named"
+
+
+def role_pilot_bucket(issue_id):
+    """0-99 bucket from the card uuid: same card, same answer, on any host, forever."""
+    digest = hashlib.sha256(str(issue_id).encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 100
+
+
+def role_pilot_config(path=None):
+    """(config, error). A missing or malformed file fails closed to pct=0."""
+    fallback = {"pct": 0, "engineer_role_id": "", "lead_role_id": "", "max_wip": 1}
+    path = path or ROLE_PILOT_CONFIG
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return fallback, "config_missing"
+    except (OSError, ValueError):
+        return fallback, "config_invalid"
+    if not isinstance(raw, dict):
+        return fallback, "config_invalid"
+    pct = raw.get("pct")
+    if not isinstance(pct, int) or isinstance(pct, bool) or not 0 <= pct <= 100:
+        return fallback, "config_invalid"
+    ids = []
+    for key in ("engineer_role_id", "lead_role_id"):
+        value = raw.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return fallback, "config_invalid"
+        ids.append(value.strip())
+    max_wip = raw.get("max_wip", 1)
+    if not isinstance(max_wip, int) or isinstance(max_wip, bool) or max_wip < 1:
+        return fallback, "config_invalid"
+    return {"pct": pct, "engineer_role_id": ids[0], "lead_role_id": ids[1],
+            "max_wip": max_wip}, None
+
+
+def role_pilot_record(issue):
+    """The arm already recorded on a card, or None. A corrupt record is no record."""
+    md = issue.get("metadata")
+    raw = md.get(ROLE_PILOT_KEY) if isinstance(md, dict) else None
+    if raw in (None, ""):
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    if not isinstance(raw, dict) or raw.get("arm") not in (ROLE_PILOT_ROLE, ROLE_PILOT_NAMED):
+        return None
+    return raw
+
+
+def role_pilot_readiness(row, wip, max_wip, prefix):
+    """(ready, reason) for one Role. Fails closed: unknown, archived, offline, unbound, at wip."""
+    if not row:
+        return False, prefix + "_unknown"
+    if row.get("archived_at"):
+        return False, prefix + "_archived"
+    if row.get("status") == "offline":
+        return False, prefix + "_offline"
+    if row.get("runtime_bound") is False:
+        return False, prefix + "_unbound"
+    if max_wip is not None and wip >= max_wip:
+        return False, prefix + "_at_wip"
+    return True, None
+
+
+def build_role_pilot(issues, board_runs, names, cfg, cfg_error, apply=False,
+                     runs_fn=None, write_fn=None, config_path=None,
+                     max_cards=ROLE_PILOT_MAX_CARDS):
+    """M-588 B1b: deterministic role/named split for cards that have not been routed.
+
+    Read-only unless `apply`, which writes the arm once as card metadata
+    `role_pilot`. A card that already carries an arm is never re-split; a card
+    already assigned to a named agent is never claimed (`pre_assigned`).
+    """
+    runs_fn = runs_fn or card_runs
+    if write_fn is None:
+        def write_fn(issue_id, payload):
+            rc, _, err = sh(["multica", "issue", "metadata", "set", issue_id,
+                             "--key", ROLE_PILOT_KEY, "--value", payload, "--type", "string"])
+            return rc, err
+    pct = 0 if cfg_error else cfg.get("pct", 0)
+    eng_id = cfg.get("engineer_role_id") or ""
+    lead_id = cfg.get("lead_role_id") or ""
+    max_wip = cfg.get("max_wip") or 1
+    eng_row = names.get(eng_id) or {}
+    lead_row = names.get(lead_id) or {}
+    wip = {}
+    for i in issues:
+        if i.get("status") == "in_progress" and i.get("assignee_id"):
+            wip[i["assignee_id"]] = wip.get(i["assignee_id"], 0) + 1
+    eng_ready, eng_reason = role_pilot_readiness(eng_row, wip.get(eng_id, 0), max_wip, "role")
+    lead_ready, lead_reason = role_pilot_readiness(lead_row, 0, None, "lead")
+
+    eligible, skipped, recorded = [], [], []
+    counts = {"role": 0, "named": 0, "skipped": 0, "existing": 0,
+              "fallback": 0, "intended_role": 0}
+    truncated = 0
+    for issue in issues:
+        if issue.get("status") not in ("todo", "in_progress"):
+            continue
+        card = issue.get("identifier") or issue.get("id")
+        if role_pilot_record(issue):
+            counts["existing"] += 1
+            continue
+        assignee = issue.get("assignee_id")
+        # Condition B: a card already handed to a named agent is not ours to relabel.
+        if assignee and assignee != eng_id:
+            skipped.append({"card": card, "reason": "pre_assigned"})
+            counts["skipped"] += 1
+            continue
+        seen = board_runs.get(card)
+        if seen is None:
+            if len(eligible) >= max_cards:
+                truncated += 1
+                continue
+            try:
+                runs = runs_fn(issue.get("id"))
+            except Exception as exc:  # noqa: BLE001 - a CLI miss must not stall the tick
+                runs = {"__error__": repr(exc)[:150]}
+            if isinstance(runs, dict) and "__error__" in runs:
+                skipped.append({"card": card, "reason": "runs_unreadable"})
+                counts["skipped"] += 1
+                continue
+            seen = len(runs or [])
+        if seen:
+            skipped.append({"card": card, "reason": "already_run"})
+            counts["skipped"] += 1
+            continue
+
+        bucket = role_pilot_bucket(issue.get("id"))
+        intended = ROLE_PILOT_ROLE if bucket < pct else ROLE_PILOT_NAMED
+        if intended == ROLE_PILOT_ROLE:
+            counts["intended_role"] += 1
+        arm, reason = intended, None
+        if cfg_error:
+            # No usable pct: the pilot is inert this pass, and every card says why.
+            arm, reason = ROLE_PILOT_NAMED, cfg_error
+        elif intended == ROLE_PILOT_ROLE:
+            if not eng_ready:
+                arm, reason = ROLE_PILOT_NAMED, eng_reason
+            elif not lead_ready:
+                arm, reason = ROLE_PILOT_NAMED, lead_reason
+        if reason:
+            counts["fallback"] += 1
+            # The brief's contract: `skipped[]` says why a card is not in the role arm.
+            skipped.append({"card": card, "reason": reason, "arm": arm})
+            counts["skipped"] += 1
+        counts[arm] += 1
+        eligible.append({"card": card, "issue_id": issue.get("id"), "bucket": bucket,
+                         "arm": arm,
+                         "engineer_id": eng_id if arm == ROLE_PILOT_ROLE else None,
+                         "reviewer_id": lead_id if arm == ROLE_PILOT_ROLE else None,
+                         "reason": reason})
+        if apply:
+            # Condition C: the arm is already decided; a failed write changes no routing.
+            payload = json.dumps({"arm": arm, "pct": pct, "bucket": bucket,
+                                  "reason": reason,
+                                  "at": now().strftime("%Y-%m-%dT%H:%M:%SZ")},
+                                 separators=(",", ":"), sort_keys=True)
+            try:
+                rc, err = write_fn(issue.get("id"), payload)
+            except Exception as exc:  # noqa: BLE001 - a write must never stall the tick
+                rc, err = 1, repr(exc)
+            recorded.append({"card": card, "arm": arm, "written": rc == 0,
+                             "error": None if rc == 0 else str(err or "")[:150]})
+
+    return {
+        "status": cfg_error or "ok",
+        "pct": pct,
+        "config": config_path or ROLE_PILOT_CONFIG,
+        "apply": bool(apply),
+        "engineer_role": {"id": eng_id, "name": eng_row.get("name"),
+                          "status": eng_row.get("status"),
+                          "runtime_bound": eng_row.get("runtime_bound"),
+                          "ready": eng_ready, "reason": eng_reason,
+                          "wip": wip.get(eng_id, 0), "max_wip": max_wip},
+        "lead_role": {"id": lead_id, "name": lead_row.get("name"),
+                      "status": lead_row.get("status"),
+                      "runtime_bound": lead_row.get("runtime_bound"),
+                      "ready": lead_ready, "reason": lead_reason},
+        "eligible": eligible, "skipped": skipped, "recorded": recorded,
+        "counts": counts, "truncated": truncated,
+    }
 
 
 def wakeup_age_hours(w, t):
@@ -576,7 +781,9 @@ def seed_ledger(applied):
 # -------------------------------------------------------------------- board
 def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=260,
           apply_incomplete_turns=False, v2_enabled=True, v2_apply=False,
-          v2_cards=INVARIANT_CARDS_DEFAULT, wake_limit=WAKE_LIMIT_DEFAULT):
+          v2_cards=INVARIANT_CARDS_DEFAULT, wake_limit=WAKE_LIMIT_DEFAULT,
+          role_pilot_apply=False, role_pilot_config_path=None,
+          role_pilot_cards=ROLE_PILOT_MAX_CARDS):
     t_start = now()
     issues_d = fetch_issues()
     if isinstance(issues_d, list):
@@ -814,9 +1021,27 @@ def sweep(ledger, names, all_prs, apply_cooldown, max_cards, max_runs_err_len=26
     if v2_enabled:
         v2 = sweep_v2(issues, t_start, names, all_prs, v2_apply, wake_limit, v2_cards,
                       agent_row, todos, wip)
+    # M-588 B1b: deterministic role split for cards entering todo/in_progress
+    # that have not been run yet. Never raises: a pilot error must not stall the tick.
+    # Only rows whose run count was actually read: an error row carries no
+    # runs_seen, so the card falls back to its own `issue runs` call below.
+    board_runs = {b["card"]: b["runs_seen"] for b in board
+                  if b.get("card") and isinstance(b.get("runs_seen"), int)}
+    try:
+        rp_cfg, rp_err = role_pilot_config(role_pilot_config_path)
+        role_pilot = build_role_pilot(issues, board_runs, names, rp_cfg, rp_err,
+                                      apply=role_pilot_apply, config_path=role_pilot_config_path,
+                                      max_cards=role_pilot_cards)
+    except Exception as exc:  # noqa: BLE001
+        role_pilot = {"status": "error", "pct": 0, "error": repr(exc)[:200],
+                      "eligible": [], "skipped": [], "recorded": [],
+                      "counts": {"role": 0, "named": 0, "skipped": 0, "existing": 0,
+                                 "fallback": 0, "intended_role": 0},
+                      "truncated": 0}
     return {"board": board, "gate_waiting": gate_waiting, "todo_reroutes": todo_reroutes,
             "cooldown_writes": cooldown_writes, "counts": counts, "stuck": stuck,
             "v2": v2,
+            "role_pilot": role_pilot,
             "incomplete_turns": incomplete_turns,
             "queues": fetch_queues(t_start),
             "wip_breaches": wip_breaches, "seats": seats,
@@ -1965,6 +2190,13 @@ def main():
     hours = FREEQ_DEFAULT_HOURS
     if "--hours" in args:
         hours = int(args[args.index("--hours") + 1])
+    # M-588 B1b: config path and per-pass cap for the role split.
+    rp_config = None
+    if "--role-pilot-config" in args:
+        rp_config = args[args.index("--role-pilot-config") + 1]
+    rp_cards = ROLE_PILOT_MAX_CARDS
+    if "--max-role-pilot-cards" in args:
+        rp_cards = max(1, int(args[args.index("--max-role-pilot-cards") + 1]))
 
     if "--free-questions" in args:
         fq_names = agent_names()
@@ -1996,7 +2228,9 @@ def main():
     result = sweep(ledger, names, all_prs=prs, apply_cooldown=apply_cooldown,
                    max_cards=max_cards, apply_incomplete_turns=apply_incomplete_turns,
                    v2_enabled=not stuck_list, v2_apply=v2_apply,
-                   v2_cards=v2_cards, wake_limit=wake_limit)
+                   v2_cards=v2_cards, wake_limit=wake_limit,
+                   role_pilot_apply=v2_apply, role_pilot_config_path=rp_config,
+                   role_pilot_cards=rp_cards)
     if stuck_list:
         print(json.dumps({"at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                           "tool": "orch-sweep", "mode": "stuck-list",

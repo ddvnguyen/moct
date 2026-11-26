@@ -7,7 +7,9 @@ live board (issues, runs, wakeups, PRs, quota ledger, committee seats, queues).
   including the `v2` block (invariant, blocked kinds, wakes, Leader queue).
   `--apply` is the only mode that writes: it arms the v2 wakes and records the
   per-card budget. `--invariant` and `--blocked-kinds` print those slices and
-  write nothing. `--stuck-list` prints the compact M-268 committee slice
+  write nothing. `--role-pilot-config <path>` (default `role-pilot.json` beside
+  the script) and `--max-role-pilot-cards N` (default 20) tune the M-588 role
+  split; `--apply` is what records an arm. `--stuck-list` prints the compact M-268 committee slice
   `{at, tool, mode, hash, triggers, items}` (deprecated alias, one release);
   `--free-questions [--hours N]` (default 24) prints the M-328 slice
   `{at, tool, mode, hours, issues_scanned, comments_flagged, offenders[]}` for
@@ -25,7 +27,12 @@ live board (issues, runs, wakeups, PRs, quota ledger, committee seats, queues).
   WAKEUP/evidence/fenced-code exclusions, ask-card exemption), the M-393
   incomplete-turn cases, the M-391 illegal-endings cases (signals, exclusions,
   same-run driver exemption), and the M-392 v2 cases (invariant satisfiers, blocked
-  kinds, wake budget, dry-run zero writes, batched Leader ping).
+  kinds, wake budget, dry-run zero writes, batched Leader ping), plus the
+  M-588 B1b role-split cases (arm stability, 30 % ±1.5 over 10k uuids, pct=0,
+  Role offline, missing config, never re-split, dry run writes nothing, cards
+  with runs, unreadable runs, `pre_assigned`, and a failed write that keeps the
+  arm). The harness puts a `multica` shim on `PATH` (empty JSON for any
+  un-stubbed call), so it runs in CI where no CLI exists.
 - `tick-prompt-delta.md` — the Orchestrator prompt text to apply with the
   deploy; without it the tick still carries the hash gate and v2 is inert.
 
@@ -71,6 +78,60 @@ did not leave the box all stay listed, alongside their `escalations` entry.
 total so a cap cannot truncate silently. Read cost per checked card is one
 `issue runs` + one `wakeup list`, plus one `question list` only when neither
 the run nor the wakeup satisfies it.
+
+## Role pilot split (M-588 B1b)
+
+A deterministic 30 % A/B split of new work between the **Engineer Role** and the
+named agents. The result is a `role_pilot` block in every sweep JSON.
+
+**Bucket.** `int(sha256(issue_uuid).hexdigest()[:8], 16) % 100`. The card uuid,
+not the identifier, so the answer is the same on any host and never drifts. The
+card is in the role arm iff `bucket < pct`.
+
+**Config.** `role-pilot.json` beside the script (override with
+`--role-pilot-config`):
+
+```json
+{"pct": 30, "engineer_role_id": "…", "lead_role_id": "…", "max_wip": 1}
+```
+
+A missing or malformed file fails closed: `pct=0`, `status` is
+`config_missing` / `config_invalid`, and every candidate card is recorded
+`named` with that reason.
+
+**Who is eligible.** A `todo` / `in_progress` card that has no recorded arm, no
+runs yet, and is either unassigned or already assigned to the Engineer Role.
+Cards already recorded are counted in `counts.existing` and never re-split.
+Cards assigned to any other agent are `pre_assigned` — a hand-routed card is
+never relabelled. Cards with runs are `already_run`; an unreadable
+`issue runs` (or a missing CLI) is `runs_unreadable` and the card keeps no arm.
+`--max-role-pilot-cards` caps the per-pass `issue runs` calls; anything left
+over is `truncated`.
+
+**Readiness, fail closed.** The role arm needs both Roles ready: not archived,
+not `offline`, `runtime_bound` not false, and the Engineer Role below
+`max_wip`. Any failure records `named` with `role_*` / `lead_*` in
+`reason` and appends `{card, reason, arm}` to `skipped[]`, so a go-live
+period with offline Roles is visible as `counts.fallback` rather than
+silently filling the control group.
+
+**Record.** With `--apply` (the only write mode) the arm is written once as
+card metadata `role_pilot`:
+
+```json
+{"arm":"named","bucket":5,"pct":30,"reason":"role_offline","at":"2026-11-26T09:00:00Z"}
+```
+
+`role` cards also get `engineer_id` (assignee) and `reviewer_id` (the
+Management Role) in the `eligible[]` entry. A failed metadata write is
+reported in `recorded[]` with `written:false` and **does not change that
+pass's routing** — the arm was decided before the write.
+
+Block shape: `{status, pct, config, apply, engineer_role, lead_role,
+eligible[], skipped[], recorded[], counts{role,named,skipped,existing,fallback,
+intended_role}, truncated}`. `counts.fallback` is the intent-to-treat count:
+cards that hashed into the role arm but were routed `named` because a Role was
+unavailable.
 
 ## Stuck-list triggers (M-268, deterministic, no LLM judgment)
 
