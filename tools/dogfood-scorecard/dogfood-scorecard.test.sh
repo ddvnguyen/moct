@@ -331,7 +331,8 @@ with open(arm_cards_path, "w", encoding="utf-8") as handle:
     json.dump({"version": 1, "cards": arm_cards}, handle)
 proc_arm = subprocess.run(
     [sys.executable, "./dogfood-scorecard", "--fixture", fixture_path,
-     "--cards", arm_cards_path, "--date", "2026-11-26", "--by-arm", "--stdout"],
+     "--cards", arm_cards_path, "--date", "2026-11-26", "--by-arm", "--stdout",
+     "--out-dir", os.path.join(tmp, "out-arm")],
     capture_output=True, text=True)
 arm_cli = json.loads(proc_arm.stdout) if proc_arm.returncode == 0 else {}
 check("cli-by-arm", proc_arm.returncode == 0 and "by_arm" in arm_cli, proc_arm.stderr)
