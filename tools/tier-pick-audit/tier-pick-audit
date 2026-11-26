@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+"""tier-pick-audit — M-588 B4: read-only audit of the tier-pick inputs.
+
+The M-423 resolver picks a tier by `important_level` + `complexity` (issue
+custom properties) and a role quality floor. M-424 supplies the model quality
+ranking. Both are inert if the values are missing. This tool measures how much
+is missing and reports what it can and cannot resolve through the same read
+path the M-577 scorecard uses: the `multica` CLI, nothing else.
+
+Read-only contract:
+  * every number comes from `multica issue list`, `multica property list` or
+    `multica agent list` (or a pre-captured fixture);
+  * no DB/curl, no writes to the board, no comments, no status changes;
+  * a metric with no CLI read path is listed in `unavailable[]` with the
+    missing field — never estimated, never invented;
+  * no LLM is called anywhere in this path.
+
+Sources (also in README.md):
+  issues + difficulty  `multica issue list --resolve-properties --output json`
+                       (paged at 100; `properties[]` carries name + value)
+  property ids/usage   `multica property list --output json`
+  agent role mapping   `multica agent list --output json` (`tier_role`)
+  tier quality / cost / role links / manual_only / online runtime /
+  model_tier_role      NO CLI READ PATH — see `unavailable[]`
+
+Usage:
+  tier-pick-audit [--date YYYY-MM-DD] [--out-dir DIR] [--stdout]
+                  [--fixture captured.json] [--cli /path/to/multica]
+                  [--dry-run]
+
+Exit codes: 0 report written, 2 bad usage / unreadable input.
+"""
+
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+TOOL = "tier-pick-audit"
+VERSION = 1
+DEFAULT_OUT_DIR = "/mnt/workspace/tier-pick-audit"
+DIFFICULTY = ("important_level", "complexity")
+ISSUE_FIELDS = (
+    "id,identifier,title,status,priority,created_at,updated_at,properties,"
+    "parent_issue_id,labels,description,assignee_id,assignee_type"
+)
+PAGE = 100
+SAMPLE_SIZE = 20
+
+# Mirrors multica-x server/internal/service/tier_resolve.go:93 (tierQualityBands)
+TIER_QUALITY_BANDS = {
+    "architect": [72, 75],
+    "management": [65, 72],
+    "engineer": [50, 65],
+    "leader": [65, 72],
+    "reviewer": [65, 72],
+    "orchestrator": [65, 72],
+    "planning": [72, 75],
+}
+# Mirrors normalizeTierRole (tier_resolve.go:108).
+ROLE_ALIASES = {
+    "leader": "management",
+    "reviewer": "management",
+    "orchestrator": "management",
+    "planning": "architect",
+}
+# Roles reported in the sample: the three the M-588 pilot uses.
+PILOT_ROLES = ("engineer", "management", "architect")
+
+# Closed statuses excluded from the backfill dry-run unless the audit says
+# otherwise. `in_review` is the 355+ cards the brief names.
+CLOSED_STATUSES = {"in_review", "done", "cancelled"}
+
+BACKFILL_RULES = [
+    "important_level starts at 1; complexity starts at 1",
+    "+1 important_level when priority is high or urgent",
+    "+1 important_level when a label is in {deploy, production, security, owner-gate, incident}",
+    "+1 complexity for a description of at least 1500 characters",
+    "+1 complexity for a description of at least 4000 characters (cumulative with the 1500 rule)",
+    "+1 complexity when a label is in {refactor, migration, architecture, cross-repo, protocol}",
+    "both fields clamp to 1..5; deterministic from card facts; no LLM; no board writes",
+]
+DEFERRED_BACKFILL_SIGNALS = [
+    "PR diff size (needs one `multica issue pull-requests` read per card)",
+    "previous failed runs (needs one `multica issue runs` read per card)",
+]
+
+UNAVAILABLE = [
+    {
+        "metric": "tier_quality_and_cost",
+        "scope": "workspace",
+        "missing": "tiers.quality, tiers.cost (and cost set-vs-NULL counts)",
+        "reason": (
+            "the M-577 scorecard's only read path is the multica CLI; no CLI "
+            "command exposes model tiers. The tier config lives in the "
+            "multica-x Postgres tables. Stopped on this part per the brief."
+        ),
+    },
+    {
+        "metric": "tier_role_links_manual_online",
+        "scope": "workspace",
+        "missing": "model_tier_role rows, manual_only, online runtime per tier",
+        "reason": "same: no multica CLI command reads tier/role/runtime config.",
+    },
+    {
+        "metric": "tier_models_without_quality",
+        "scope": "workspace",
+        "missing": "model_tier_role / tiers rows with quality NULL",
+        "reason": "same: no multica CLI command reads the tier catalog.",
+    },
+    {
+        "metric": "concrete_tier_pick",
+        "scope": "sample",
+        "missing": "the tier rows (idx, quality, auto-pick, capacity, online flag)",
+        "reason": (
+            "the required quality floor is computed exactly from the resolver "
+            "source, but naming the tier that satisfies it needs the tier rows, "
+            "which have no CLI read path. Only the floor is reported."
+        ),
+    },
+]
+
+PROPOSAL = {
+    "question": "what sets important_level/complexity for a card created without planning?",
+    "evidence": (
+        "the plan-approve default is the only writer today; it produced 3 of "
+        "the workspace's issues, all 1/1. The rest were created without that "
+        "path and carry no value."
+    ),
+    "options": [
+        {
+            "id": "i",
+            "name": "required field at card creation / planning template",
+            "pros": ["explicit, human-owned value", "already works on the plan-approve path"],
+            "cons": [
+                "does not fix cards created without planning unless new enforcement code ships",
+                "quick-create has no template today, so coverage would stay near zero",
+            ],
+        },
+        {
+            "id": "ii",
+            "name": "deterministic script derived from card facts (no LLM)",
+            "pros": [
+                "covers unplanned cards, the actual gap",
+                "reproducible and auditable; rules written down",
+                "doubles as the backfill tool",
+            ],
+            "cons": [
+                "heuristic; may misclassify unusual cards",
+                "rules need maintenance as the board evolves",
+            ],
+        },
+        {
+            "id": "iii",
+            "name": "leave unset = 1/1",
+            "pros": ["no work"],
+            "cons": [
+                "the quality floor never rises, so role-based tier picking stays inert",
+                "contradicts the Owner's tier-pick decision",
+            ],
+        },
+    ],
+    "recommendation": "ii",
+    "recommendation_detail": (
+        "Adopt the deterministic script for new unplanned cards and as the "
+        "backfill job; keep the plan-approve default for planned cards. Keep "
+        "(i) as a complement later if the workspace adds a creation-time "
+        "template. Reject (iii). No LLM in any of these paths. Nothing here is "
+        "applied: production data and product code changes are a separate card."
+    ),
+}
+
+
+class AuditError(Exception):
+    """Bad input: usage error or unreadable fixture."""
+
+
+class SourceError(Exception):
+    """One CLI read failed; carried per source so one failure is visible."""
+
+    def __init__(self, what, code):
+        super().__init__("%s: exit %s" % (what, code))
+        self.what = what
+        self.code = code
+
+
+# --------------------------------------------------------------------------- #
+# sources: live CLI and pre-captured fixture
+# --------------------------------------------------------------------------- #
+
+def _parse_ts(value):
+    if not value:
+        return None
+    s = str(value).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def creation_week(value):
+    dt = _parse_ts(value)
+    if dt is None:
+        return "unknown"
+    iso_year, iso_week, _ = dt.isocalendar()
+    return "%04d-W%02d" % (iso_year, iso_week)
+
+
+class CliSource:
+    """Reads through the multica CLI. No curl, no DB, no writes."""
+
+    def __init__(self, cli=None):
+        self.cli = cli or os.environ.get("MULTICA_CLI_PATH") or "multica"
+
+    def _json(self, what, args):
+        try:
+            proc = subprocess.run(
+                [self.cli] + args, capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            raise SourceError(what, "spawn:%s" % exc.errno)
+        if proc.returncode != 0:
+            raise SourceError(what, proc.returncode)
+        text = proc.stdout.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise SourceError(what + " (bad json)", proc.returncode)
+
+    def issues(self):
+        out, offset = [], 0
+        while True:
+            page = self._json(
+                "issue list",
+                [
+                    "issue", "list", "--output", "json", "--resolve-properties",
+                    "--fields", ISSUE_FIELDS, "--limit", str(PAGE),
+                    "--offset", str(offset),
+                ],
+            )
+            if not page:
+                break
+            rows = page.get("issues") or []
+            out.extend(rows)
+            offset += len(rows)
+            if not page.get("has_more") or not rows:
+                break
+        return out
+
+    def properties(self):
+        return self._json("property list", ["property", "list", "--output", "json"]) or []
+
+    def agents(self):
+        return self._json("agent list", ["agent", "list", "--output", "json"]) or []
+
+
+class FixtureSource:
+    """Offline replay of captured CLI payloads; used by the seeded test."""
+
+    def __init__(self, data):
+        self.data = data or {}
+
+    def issues(self):
+        return self.data.get("issues") or []
+
+    def properties(self):
+        return self.data.get("properties") or []
+
+    def agents(self):
+        return self.data.get("agents") or []
+
+
+# --------------------------------------------------------------------------- #
+# difficulty + resolver floor — mirrors multica-x tier_resolve.go exactly
+# --------------------------------------------------------------------------- #
+
+def prop_level(raw):
+    """tierPropLevel: a JSON number in 1..5 that is integral; anything else -> 1."""
+    if raw is None:
+        return 1
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1
+    if value != math.trunc(value) or value < 1 or value > 5:
+        return 1
+    return int(value)
+
+
+def difficulty(issue):
+    """difficultyFromProperties over the CLI's --resolve-properties rows."""
+    bag = {}
+    for row in issue.get("properties") or []:
+        name = str(row.get("name") or "").strip().lower()
+        if name in DIFFICULTY:
+            bag[name] = row.get("value")
+    return prop_level(bag.get("important_level")), prop_level(bag.get("complexity"))
+
+
+def normalize_role(role):
+    key = (role or "").strip().lower()
+    return ROLE_ALIASES.get(key, key)
+
+
+def required_quality(role, important, complex_level):
+    """requiredTierQuality: lo + ceil((hi-lo)*(important+complex-2)/8)."""
+    band = TIER_QUALITY_BANDS.get(normalize_role(role))
+    if not band:
+        return 0
+    lo, hi = band
+    return lo + int(math.ceil(float(hi - lo) * float(important + complex_level - 2) / 8.0))
+
+
+def pilot_floors(important, complex_level):
+    """The required floor for each of the three roles the M-588 pilot uses."""
+    return {role: required_quality(role, important, complex_level) for role in PILOT_ROLES}
+
+
+def scenario_floors(important, complex_level):
+    """Floors for all bands plus the three pilot roles, for one difficulty."""
+    all_bands = {}
+    for role in sorted(TIER_QUALITY_BANDS):
+        all_bands[role] = required_quality(role, important, complex_level)
+    return {
+        "important_level": important,
+        "complexity": complex_level,
+        "floor_by_role": all_bands,
+        "pilot_floors": pilot_floors(important, complex_level),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# report
+# --------------------------------------------------------------------------- #
+
+def _counter():
+    return {
+        "both": 0, "important_only": 0, "complexity_only": 0, "neither": 0
+    }
+
+
+def _classify(bucket, has_important, has_complex):
+    if has_important and has_complex:
+        bucket["both"] += 1
+    elif has_important:
+        bucket["important_only"] += 1
+    elif has_complex:
+        bucket["complexity_only"] += 1
+    else:
+        bucket["neither"] += 1
+
+
+def _spread_sample(rows, size):
+    """Deterministic 20-card sample: every card that has a difficulty value
+    first, then an evenly spaced cross-section of the rest, so the table shows
+    both what exists today and what the fabricated scenarios would change."""
+    def key(issue):
+        return str(issue.get("identifier") or issue.get("id") or "")
+
+    def has_value(issue):
+        return any(
+            str(r.get("name") or "").strip().lower() in DIFFICULTY
+            for r in (issue.get("properties") or [])
+        )
+
+    ordered = sorted(rows, key=key)
+    picked = [r for r in ordered if has_value(r)][:size]
+    rest = [r for r in ordered if not has_value(r)]
+    needed = size - len(picked)
+    if needed > 0:
+        n = len(rest)
+        if n <= needed:
+            picked.extend(rest)
+        elif needed == 1:
+            picked.append(rest[n // 2])
+        else:
+            indices = sorted({int(round(i * (n - 1) / float(needed - 1))) for i in range(needed)})
+            picked.extend(rest[i] for i in indices)
+    return sorted(picked, key=key)
+
+
+def _propose(issue):
+    """BACKFILL_RULES, applied to card facts available in `issue list`."""
+    important, complexity = 1, 1
+    priority = str(issue.get("priority") or "").lower()
+    labels = {
+        str(x).strip().lower()
+        for x in (issue.get("labels") or [])
+        if isinstance(x, str)
+    }
+    description = str(issue.get("description") or "")
+    if priority in {"high", "urgent"}:
+        important += 1
+    if labels & {"deploy", "production", "security", "owner-gate", "incident"}:
+        important += 1
+    if len(description) >= 1500:
+        complexity += 1
+    if len(description) >= 4000:
+        complexity += 1
+    if labels & {"refactor", "migration", "architecture", "cross-repo", "protocol"}:
+        complexity += 1
+    return min(5, important), min(5, complexity)
+
+
+def build_report(source, day, dry_run=False):
+    issues = source.issues()
+    properties = source.properties()
+    agents = source.agents()
+    if not issues:
+        raise AuditError("no issues returned by the CLI source")
+
+    agents_by_id = {a.get("id"): a for a in agents}
+    prop_defs = {}
+    for prop in properties:
+        name = str(prop.get("name") or "").strip().lower()
+        if name in DIFFICULTY and prop.get("type") == "number" and not prop.get("archived"):
+            key = str(prop.get("id") or "")
+            prev = prop_defs.get(name)
+            if prev is None or key < prev["property_id"]:
+                prop_defs[name] = {
+                    "property_id": key,
+                    "usage_count": prop.get("usage_count"),
+                }
+
+    coverage = _counter()
+    by_status = {}
+    by_week = {}
+    distribution = {name: {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0} for name in DIFFICULTY}
+    present = {name: 0 for name in DIFFICULTY}
+
+    for issue in issues:
+        important, complexity = difficulty(issue)
+        raw = {
+            name: {
+                r.get("name"): r.get("value")
+                for r in (issue.get("properties") or [])
+                if str(r.get("name") or "").strip().lower() == name
+            }.get(name)
+            for name in DIFFICULTY
+        }
+        has_important = raw["important_level"] is not None
+        has_complex = raw["complexity"] is not None
+        _classify(coverage, has_important, has_complex)
+
+        status = str(issue.get("status") or "unknown")
+        status_bucket = by_status.setdefault(status, _counter())
+        _classify(status_bucket, has_important, has_complex)
+
+        week = creation_week(issue.get("created_at"))
+        week_bucket = by_week.setdefault(week, _counter())
+        _classify(week_bucket, has_important, has_complex)
+
+        for name, value in (("important_level", important), ("complexity", complexity)):
+            if raw[name] is not None:
+                present[name] += 1
+                distribution[name][str(value)] += 1
+
+    total = len(issues)
+    coverage_pct = {}
+    for key, count in coverage.items():
+        coverage_pct[key] = round(100.0 * count / total, 2) if total else 0.0
+
+    sample = []
+    for issue in _spread_sample(issues, SAMPLE_SIZE):
+        important, complexity = difficulty(issue)
+        assignee = agents_by_id.get(issue.get("assignee_id")) or {}
+        raw_agent_role = assignee.get("tier_role") or ""
+        today_bands = scenario_floors(important, complexity)["floor_by_role"]
+        sample.append({
+            "identifier": issue.get("identifier") or issue.get("id"),
+            "status": issue.get("status"),
+            "assignee": assignee.get("name") or issue.get("assignee_id"),
+            "agent_tier_role": raw_agent_role or None,
+            "today": {
+                "important_level": important,
+                "complexity": complexity,
+                "floor_by_role": today_bands,
+                "agent_role_floor": (
+                    today_bands.get(normalize_role(raw_agent_role))
+                    if raw_agent_role else None
+                ),
+            },
+            "fabricated_3": pilot_floors(3, 3),
+            "fabricated_5": pilot_floors(5, 5),
+            "concrete_tier": None,
+        })
+
+    report = {
+        "tool": TOOL,
+        "version": VERSION,
+        "generated_for": day,
+        "scope": {
+            "read_path": "multica CLI (same as the M-577 scorecard)",
+            "total_issues": total,
+            "property_ids": prop_defs,
+        },
+        "coverage": {
+            "counts": coverage,
+            "percent": coverage_pct,
+            "by_status": dict(sorted(by_status.items())),
+            "by_creation_week": dict(sorted(by_week.items())),
+        },
+        "value_distribution": {
+            name: {
+                "set_count": present[name],
+                "values": distribution[name],
+            }
+            for name in DIFFICULTY
+        },
+        "resolver_floor": {
+            "source": "multica-x server/internal/service/tier_resolve.go:93,196-203",
+            "formula": "lo + ceil((hi - lo) * (important + complexity - 2) / 8)",
+            "bands": TIER_QUALITY_BANDS,
+            "pilot_roles": list(PILOT_ROLES),
+            "scenarios": {
+                "today": scenario_floors(1, 1),
+                "fabricated_3": scenario_floors(3, 3),
+                "fabricated_5": scenario_floors(5, 5),
+            },
+            "note": (
+                "today: a missing/invalid field is read as 1/1 by the resolver. "
+                "The concrete tier that satisfies a floor is not resolvable "
+                "through the CLI — see unavailable[concrete_tier_pick]."
+            ),
+            "sample_size": len(sample),
+            "sample": sample,
+        },
+        "unavailable": UNAVAILABLE,
+        "proposal": PROPOSAL,
+        "backfill": {
+            "mode": "dry-run" if dry_run else "not-requested",
+            "writes_performed": False,
+            "excluded_closed_statuses": sorted(CLOSED_STATUSES),
+            "rules": BACKFILL_RULES,
+            "deferred_signals": DEFERRED_BACKFILL_SIGNALS,
+        },
+    }
+
+    if dry_run:
+        eligible = [
+            issue for issue in issues
+            if str(issue.get("status") or "") not in CLOSED_STATUSES
+        ]
+        eligible.sort(key=lambda r: str(r.get("identifier") or r.get("id") or ""))
+        plan = []
+        for issue in eligible:
+            important, complexity = difficulty(issue)
+            proposed_important, proposed_complexity = _propose(issue)
+            plan.append({
+                "identifier": issue.get("identifier") or issue.get("id"),
+                "status": issue.get("status"),
+                "current": {"important_level": important, "complexity": complexity},
+                "would_set": {
+                    "important_level": proposed_important,
+                    "complexity": proposed_complexity,
+                },
+            })
+        report["backfill"].update({
+            "eligible_count": len(plan),
+            "excluded_closed_count": total - len(plan),
+            "plan": plan,
+        })
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# markdown rendering
+# --------------------------------------------------------------------------- #
+
+def _table(headers, rows):
+    lines = ["| " + " | ".join(headers) + " |",
+             "| " + " | ".join("---" for _ in headers) + " |"]
+    for row in rows:
+        lines.append("| " + " | ".join(str(cell) for cell in row) + " |")
+    return "\n".join(lines)
+
+
+def render_markdown(report):
+    out = ["# Tier-pick data audit — %s" % report["generated_for"], ""]
+    out.append("Read path: %s. Total issues: %d. No LLM, no writes." % (
+        report["scope"]["read_path"], report["scope"]["total_issues"]))
+    out.append("")
+
+    cov = report["coverage"]
+    out.append("## Coverage (difficulty fields)")
+    out.append("")
+    out.append(_table(
+        ["group", "count", "percent"],
+        [[key, cov["counts"][key], "%s%%" % cov["percent"][key]]
+         for key in ("both", "important_only", "complexity_only", "neither")],
+    ))
+    out.append("")
+    out.append("By status:")
+    out.append("")
+    out.append(_table(
+        ["status", "total", "both", "important only", "complexity only", "neither"],
+        [[status, sum(b.values()), b["both"], b["important_only"],
+          b["complexity_only"], b["neither"]]
+         for status, b in cov["by_status"].items()],
+    ))
+    out.append("")
+    out.append("By creation week:")
+    out.append("")
+    out.append(_table(
+        ["week", "total", "both", "important only", "complexity only", "neither"],
+        [[week, sum(b.values()), b["both"], b["important_only"],
+          b["complexity_only"], b["neither"]]
+         for week, b in cov["by_creation_week"].items()],
+    ))
+    out.append("")
+
+    out.append("## Value distribution (of the values that exist)")
+    out.append("")
+    out.append(_table(
+        ["field", "set", "1", "2", "3", "4", "5"],
+        [[name, d["set_count"]] + [d["values"][str(i)] for i in range(1, 6)]
+         for name, d in report["value_distribution"].items()],
+    ))
+    out.append("")
+
+    rf = report["resolver_floor"]
+    out.append("## Resolver quality floor")
+    out.append("")
+    out.append("`%s` (source: `%s`). `%s`" % (
+        rf["formula"], rf["source"], rf["note"]))
+    out.append("")
+    out.append(_table(
+        ["scenario", "important", "complexity", "engineer", "management", "architect"],
+        [[name, s["important_level"], s["complexity"],
+          s["pilot_floors"]["engineer"], s["pilot_floors"]["management"],
+          s["pilot_floors"]["architect"]]
+         for name, s in rf["scenarios"].items()],
+    ))
+    out.append("")
+    out.append("Sample of %d real cards (required floor, not the concrete tier):" % rf["sample_size"])
+    out.append("")
+    out.append(_table(
+        ["card", "status", "agent role", "today imp/cplx", "today eng/mgt/arch",
+         "3/3 eng/mgt/arch", "5/5 eng/mgt/arch"],
+        [[row["identifier"], row["status"], row["agent_tier_role"] or "-",
+          "%d/%d" % (row["today"]["important_level"], row["today"]["complexity"]),
+          "/".join(str(row["today"]["floor_by_role"][r]) for r in PILOT_ROLES),
+          "/".join(str(row["fabricated_3"][r]) for r in PILOT_ROLES),
+          "/".join(str(row["fabricated_5"][r]) for r in PILOT_ROLES)]
+         for row in rf["sample"]],
+    ))
+    out.append("")
+
+    out.append("## Unavailable (no CLI read path — stopped on these parts)")
+    out.append("")
+    out.append(_table(
+        ["metric", "missing", "reason"],
+        [[u["metric"], u["missing"], u["reason"]] for u in report["unavailable"]],
+    ))
+    out.append("")
+
+    prop = report["proposal"]
+    out.append("## Proposal (not applied)")
+    out.append("")
+    out.append(prop["question"])
+    out.append("")
+    out.append(prop["evidence"])
+    out.append("")
+    out.append(_table(
+        ["option", "name", "pros", "cons"],
+        [[o["id"], o["name"], "; ".join(o["pros"]), "; ".join(o["cons"])]
+         for o in prop["options"]],
+    ))
+    out.append("")
+    out.append("Recommendation: **%s** — %s" % (
+        prop["recommendation"], prop["recommendation_detail"]))
+    out.append("")
+
+    bf = report["backfill"]
+    out.append("## Backfill (%s)" % bf["mode"])
+    out.append("")
+    if bf["mode"] == "dry-run":
+        out.append("Would touch %d open/new cards; %d closed cards excluded. "
+                   "Writes performed: %s." % (
+                       bf["eligible_count"], bf["excluded_closed_count"],
+                       bf["writes_performed"]))
+        out.append("")
+        out.append("Rules: " + "; ".join(bf["rules"]))
+        out.append("")
+        out.append("Deferred signals: " + "; ".join(bf["deferred_signals"]))
+        out.append("")
+        out.append(_table(
+            ["card", "status", "current imp/cplx", "would set imp/cplx"],
+            [[p["identifier"], p["status"],
+              "%d/%d" % (p["current"]["important_level"], p["current"]["complexity"]),
+              "%d/%d" % (p["would_set"]["important_level"], p["would_set"]["complexity"])]
+             for p in bf["plan"][:20]],
+        ))
+        if bf["eligible_count"] > 20:
+            out.append("")
+            out.append("(%d more rows in the JSON report.)" % (bf["eligible_count"] - 20))
+    else:
+        out.append("No backfill run; pass `--dry-run` to see the proposed writes.")
+    return "\n".join(out) + "\n"
+
+
+def write_outputs(report, markdown, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.join(out_dir, "tier-pick-audit-" + report["generated_for"])
+    payload = json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    with open(stem + ".json", "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    with open(stem + ".md", "w", encoding="utf-8") as handle:
+        handle.write(markdown)
+    return stem + ".json", stem + ".md"
+
+
+# --------------------------------------------------------------------------- #
+# entry point
+# --------------------------------------------------------------------------- #
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="Read-only audit of the tier-pick inputs (M-588 B4).",
+    )
+    parser.add_argument("--date", help="UTC day YYYY-MM-DD (default: today)")
+    parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR, help="report directory")
+    parser.add_argument("--fixture", help="replay captured CLI payloads (offline test)")
+    parser.add_argument("--cli", help="multica executable (default: $MULTICA_CLI_PATH)")
+    parser.add_argument("--stdout", action="store_true", help="print JSON instead of the table")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="show the proposed backfill writes; never applies them")
+    args = parser.parse_args(argv)
+
+    day = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        print("%s: --date must be YYYY-MM-DD" % TOOL, file=sys.stderr)
+        return 2
+
+    if args.fixture:
+        try:
+            with open(args.fixture, "r", encoding="utf-8") as handle:
+                source = FixtureSource(json.load(handle))
+        except (OSError, ValueError) as exc:
+            print("%s: cannot read fixture: %s" % (TOOL, exc), file=sys.stderr)
+            return 2
+    else:
+        source = CliSource(args.cli)
+
+    try:
+        report = build_report(source, day, dry_run=args.dry_run)
+    except (AuditError, SourceError) as exc:
+        print("%s: %s" % (TOOL, exc), file=sys.stderr)
+        return 2
+
+    markdown = render_markdown(report)
+    json_path, md_path = write_outputs(report, markdown, args.out_dir)
+    if args.stdout:
+        sys.stdout.write(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    else:
+        sys.stdout.write(markdown)
+        print("wrote %s" % json_path, file=sys.stderr)
+        print("wrote %s" % md_path, file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
