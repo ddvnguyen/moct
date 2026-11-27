@@ -110,4 +110,6 @@ origin. The curator autopilot runs it daily:
 ```sh
 multica repo checkout https://github.com/ddvnguyen/Knowledge_Documents --ref mmx-harness
 /mnt/workspace/bin/mmx-scan nightly --repo <checkout> --push mmx-harness
-``` Rollback: pause the autopilot (`multica autopilot update <id> --status paused`).
+```
+
+Rollback: pause the autopilot (`multica autopilot update <id> --status paused`).
