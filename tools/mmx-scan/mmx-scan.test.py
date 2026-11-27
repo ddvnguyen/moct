@@ -65,4 +65,85 @@ for text, want in [("**Review of PR #53: REQUEST_CHANGES.**", True), ("Verdict: 
     fail += not ok
     print(("ok  " if ok else "FAIL"), "reject_re", repr(text))
 
+# --- M-608: snapshot attribution, verdict regexes, compare, redaction --------
+from datetime import datetime, timedelta, timezone
+
+D = datetime(2026, 11, 26, tzinfo=timezone.utc)
+
+
+def st(h, f, t, actor="A", kind="agent"):
+    return {"type": "activity", "action": "status_changed", "actor_type": kind, "actor_id": actor,
+            "created_at": (D + timedelta(hours=h)).isoformat(), "details": {"from": f, "to": t}}
+
+
+def cm(h, body, kind="member"):
+    return {"type": "comment", "actor_type": kind, "content": body,
+            "created_at": (D + timedelta(hours=h)).isoformat()}
+
+
+tl = [st(-30, "todo", "in_progress", "BUILDER"), st(-29, "in_progress", "agent_review_deploy", "BUILDER"),
+      st(-28, "agent_review_deploy", "in_review", "LEAD"),
+      cm(2, "It not run yet and the team move to In review? How?"),
+      cm(3, "**Verdict: PR #58 REQUEST_CHANGES (one blocker)**", "agent"),
+      cm(3.5, "Signals: reopens, Needs changes, REQUEST_CHANGES, resumes", "agent"),
+      st(4, "in_review", "in_progress", "LEAD"),
+      st(5, "in_progress", "in_review", "BUILDER"), st(6, "in_review", "done", "OWNER", "member")]
+ev = [(k, b) for k, _a, b, _x in mod.card_events(tl, D, D + timedelta(days=1), "ASSIGNEE")]
+for name, want in [("owner correction -> builder", ("owner_correction", "BUILDER")),
+                   ("REQUEST_CHANGES verdict -> builder", ("request_changes", "BUILDER")),
+                   ("reopen from in_review -> builder", ("reopen", "BUILDER")),
+                   ("in_review entry counted", ("in_review", "BUILDER")),
+                   ("done counted", ("done", "BUILDER"))]:
+    ok = want in ev
+    fail += not ok
+    print(("ok  " if ok else "FAIL"), name, ev if not ok else "")
+ok = sum(1 for k, _ in ev if k == "request_changes") == 1
+fail += not ok
+print(("ok  " if ok else "FAIL"), "REQUEST_CHANGES listed as a signal is not a verdict")
+ok = not any(k == "owner_correction" for k, _a, _b, _x in mod.card_events(
+    [st(-1, "todo", "in_progress"), cm(1, "no, do X")], D, D + timedelta(days=1), None))
+fail += not ok
+print(("ok  " if ok else "FAIL"), "owner comment on a working card is not a delivery correction")
+for text, want in [("I add more research. This skill should have the loop.", False),
+                   ("move back to implement: remove all legacy tier config", False),
+                   ("still broken @Claude Architect", True), ("No, do it in the skill instead", True)]:
+    ok = bool(mod.OWNER_CORRECTION_RE.search(text)) == want
+    fail += not ok
+    print(("ok  " if ok else "FAIL"), "owner_correction_re", repr(text))
+
+red = mod.redact("token: ghp_" + "a" * 36 + " and Redact every secret")
+ok = "ghp_" not in red and "[REDACTED]" in red and red.endswith("Redact every secret")
+fail += not ok
+print(("ok  " if ok else "FAIL"), "redact secret-shaped strings only")
+
+
+def row(day, agent, cards, corrected):
+    r = {k: 0 for k in mod.COUNT_KEYS}
+    r.update(date=day, agent=agent, agent_id=agent, cards_in_review=cards, corrected_cards=corrected)
+    return r
+
+
+def days(n, start):
+    s = datetime.fromisoformat(start)
+    return [(s + timedelta(days=i)).date().isoformat() for i in range(n)]
+
+
+import random
+rnd = random.Random(1)
+rows = []
+for d in days(14, "2026-11-01"):
+    rows += [row(d, "C", 3, rnd.choice([1, 2])), row(d, "K", 3, rnd.choice([1, 2]))]
+for d in days(7, "2026-11-15"):
+    rows += [row(d, "C", 3, 0), row(d, "K", 3, rnd.choice([1, 2]))]
+e = mod.evaluate(rows, "correction_rate", ["C"], "2026-11-15")
+ok = e["effect"] < -e["delta"] < 0
+fail += not ok
+print(("ok  " if ok else "FAIL"), "compare: clear canary gain beats δ", round(e["effect"], 3), round(e["delta"], 3))
+rows2 = [r if r["date"] < "2026-11-15" or r["agent"] == "K" else row(r["date"], "C", 3, rnd.choice([1, 2]))
+         for r in rows]
+e2 = mod.evaluate(rows2, "correction_rate", ["C"], "2026-11-15")
+ok = abs(e2["effect"]) <= e2["delta"]
+fail += not ok
+print(("ok  " if ok else "FAIL"), "compare: noise stays inside δ", round(e2["effect"], 3), round(e2["delta"], 3))
+
 sys.exit(1 if fail else 0)
