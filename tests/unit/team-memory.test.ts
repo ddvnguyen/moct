@@ -5,7 +5,6 @@
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { TursoRepository } from "../../src/store/turso-repository.js";
@@ -57,22 +56,22 @@ async function makeWorld(): Promise<World> {
 }
 
 /**
- * A real v8 fleet.db: the v8 DDL straight from main, with one legacy
- * null-workspace expert row, its tag and its version row. Opening it must run
- * the v9 rebuild (which drops the old table CHECK), keep the legacy row, and
- * let a stamped write land afterwards. Written with node:sqlite so the file
- * is a genuine v8 file, not a simulation; the Turso connection only opens it.
- * Reopen is not asserted here: this Turso version drops uncheckpointed WAL
- * rows on close, which would make a close/reopen round-trip lose the seed.
+ * A real v8 fleet.db: the v8 memory DDL extracted from main
+ * (tests/fixtures/v8-team-memory.sql), with one legacy null-workspace expert
+ * row, its tag and its version row. Opening it must run the v9 rebuild (which
+ * drops the old table CHECK), keep the legacy row, and let a stamped write
+ * land afterwards. Written with node:sqlite so the file is a genuine v8
+ * file, not a simulation; the Turso connection only opens it. Reopen is not
+ * asserted here: this Turso version drops uncheckpointed WAL rows on close,
+ * which would make a close/reopen round-trip lose the seed.
  */
 async function makeV8World(): Promise<World> {
   const root = mkdtempSync(path.join(tmpdir(), "moct-memory-v8-"));
   dirs.push(root);
   const dbPath = path.join(root, "fleet.db");
-  const ddl = execFileSync("git", ["show", "main:src/store/schema.ts"], { encoding: "utf8" }) as string;
-  const sql = ddl.split("export const FLEET_SCHEMA_SQL = `")[1].split("`;")[0];
+  const sql = readFileSync(new URL("../fixtures/v8-team-memory.sql", import.meta.url), "utf8");
   const seed = new DatabaseSync(dbPath);
-  seed.exec(sql);
+  for (const stmt of sql.split(/\n\s*\n/).map((s) => s.trim()).filter((s) => s.length > 0)) seed.exec(stmt);
   seed.prepare(`INSERT INTO team_memory_records(id, workspace_id, type, title, body, attrs, home_kind, home_ref, priority, pinned,
        status, flag, supersedes, superseded_by, conflicts_with, task_ref, unique_key, author_kind, author_id,
        created_at, updated_at, last_used_at, use_count, version)
