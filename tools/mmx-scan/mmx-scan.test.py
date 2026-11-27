@@ -219,6 +219,10 @@ print(("ok  " if ok else "FAIL"), "gate: noise stays inconclusive", j["verdict"]
       j["reasons"] if not ok else "")
 
 # Scheduler: 10 runs unlock round 1; then +1 day, +1 day, then every 3 days.
+class _A:
+    pass
+
+
 ok = mod.rounds_schedule(9) == [] and len(mod.rounds_schedule(10, "2026-11-28")) == 1
 fail += not ok
 print(("ok  " if ok else "FAIL"), "rounds: round 1 gates on 10 runs")
