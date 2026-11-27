@@ -36,12 +36,15 @@
  *   v8 (Team memory, additive)
  *                     -> team_memory_records / _tags / _links / _versions / _settings
  *                        (typed records with visibility tags; backend-owned state,
- *                         NOT a projection of the ledger: how_to_work spans
- *                         Workspaces and a purge must remove text, which an
- *                         append-only log cannot)
+ *                         NOT a projection of the ledger: a purge must remove text,
+ *                         which an append-only log cannot)
+ *   v9 (Team memory workspace containment, additive migration)
+ *                     -> team_memory_records gains a nullable owner_workspace_id
+ *                        (legacy null-workspace expert rows are owned by their home
+ *                        expert; v9 writes stamp workspace_id on every record)
  */
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /**
  * Versions whose DDL ships in FLEET_SCHEMA_SQL, oldest first. FLEET_SCHEMA_SQL
@@ -50,7 +53,7 @@ export const SCHEMA_VERSION = 8;
  * (`schema_version:<n>` -> applied_at), which is how this DB records the
  * migration history. Never drop a version from this list.
  */
-export const APPLIED_SCHEMA_VERSIONS: readonly number[] = [2, 3, 6, 7, 8];
+export const APPLIED_SCHEMA_VERSIONS: readonly number[] = [2, 3, 6, 7, 8, 9];
 
 export const FLEET_SCHEMA_SQL = `
 PRAGMA journal_mode=WAL;
@@ -377,9 +380,11 @@ CREATE TABLE IF NOT EXISTS team_thread_bindings (
 );
 CREATE INDEX IF NOT EXISTS idx_team_thread_bindings_member ON team_thread_bindings(workspace_id, member_id);
 
--- team_memory_records: one typed memory record (v8). Backend-owned state, not a
--- projection of the ledger: how_to_work follows an expert across Workspaces and a
--- purge must remove text, which an append-only log cannot.
+-- team_memory_records: one typed memory record (v8; contained by v9). Backend-owned
+-- state, not a projection of the ledger: a purge must remove text, which an
+-- append-only log cannot. v9 stamps workspace_id on every write (expert homes
+-- included); legacy null-workspace expert rows are confined to their owning
+-- expert until backfilled.
 --   type        rule | decision | convention | how_to_work | task | branch
 --   home_*      the narrowest visibility tag (task < channel < team; expert apart),
 --               kept in step with team_memory_tags by the store; it picks the
@@ -389,6 +394,12 @@ CREATE INDEX IF NOT EXISTS idx_team_thread_bindings_member ON team_thread_bindin
 --   title/body/attrs are NULL only after a purge. embedding is reserved.
 CREATE TABLE IF NOT EXISTS team_memory_records (
     id TEXT PRIMARY KEY,
+    -- v9: every new write stamps its workspace (expert homes included); the
+    -- store enforces this (note() requires workspaceId; TYPE_HOMES pins each
+    -- type to its homes), not a table CHECK: a CHECK change cannot migrate an
+    -- existing v8 table, whose old CHECK would then reject stamped writes.
+    -- The column stays nullable so the v9 rebuild can carry legacy
+    -- null-workspace expert rows, owned by their home expert until backfilled.
     workspace_id TEXT,
     type TEXT NOT NULL CHECK (type IN ('rule', 'decision', 'convention', 'how_to_work', 'task', 'branch')),
     title TEXT,
@@ -413,7 +424,7 @@ CREATE TABLE IF NOT EXISTS team_memory_records (
     use_count INTEGER NOT NULL DEFAULT 0,
     version INTEGER NOT NULL,
     embedding BLOB,
-    CHECK ((type = 'how_to_work') = (workspace_id IS NULL)),
+    owner_workspace_id TEXT,
     CHECK (
         (type IN ('rule', 'convention') AND home_kind IN ('team', 'channel'))
         OR (type = 'decision' AND home_kind IN ('channel', 'task'))
@@ -424,6 +435,9 @@ CREATE TABLE IF NOT EXISTS team_memory_records (
 );
 CREATE INDEX IF NOT EXISTS idx_team_memory_records_home ON team_memory_records(workspace_id, home_kind, home_ref, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_team_memory_records_unique_key ON team_memory_records(workspace_id, unique_key);
+-- v9 migration (owner_workspace_id + workspace stamping) lives in
+-- TursoRepository.open, which rebuilds the table when it still carries the v8
+-- CHECK. It cannot live here: this file runs on every open.
 
 -- team_memory_tags: who and what a record belongs to (v8). team / channel / task /
 -- expert grant visibility; repo / branch only describe and never widen it.
@@ -445,16 +459,18 @@ CREATE TABLE IF NOT EXISTS team_memory_links (
 );
 CREATE INDEX IF NOT EXISTS idx_team_memory_links_to ON team_memory_links(to_id);
 
--- team_memory_versions: every change to a record, with who and when (v8). All
--- versions are kept. Insert-only, except that a purge may scrub title, body and
--- attrs: first overwrite in place with '#' filler of the same byte length, then
--- set NULL. tags_json snapshots the tags, so a widen keeps the old scope on record.
+-- team_memory_versions: every change to a record, with who and when (v8; v9 adds
+-- owner_workspace_id beside workspace_id). All versions are kept. Insert-only,
+-- except that a purge may scrub title, body and attrs: first overwrite in place
+-- with '#' filler of the same byte length, then set NULL. tags_json snapshots
+-- the tags, so a widen keeps the old scope on record.
 CREATE TABLE IF NOT EXISTS team_memory_versions (
     memory_id TEXT NOT NULL,
     version INTEGER NOT NULL,
     action TEXT NOT NULL CHECK (action IN ('create', 'edit', 'pin', 'unpin', 'priority', 'widen', 'approve', 'supersede',
         'retract', 'restore', 'expire', 'purge')),
     workspace_id TEXT,
+    owner_workspace_id TEXT,
     type TEXT NOT NULL,
     home_kind TEXT NOT NULL,
     home_ref TEXT NOT NULL,
@@ -472,6 +488,8 @@ CREATE TABLE IF NOT EXISTS team_memory_versions (
     PRIMARY KEY (memory_id, version)
 );
 CREATE INDEX IF NOT EXISTS idx_team_memory_versions_feed ON team_memory_versions(workspace_id, type, at);
+-- v9 migration (owner_workspace_id backfill) lives in TursoRepository.open with
+-- the records-table one; ALTER TABLE cannot live in this re-run file.
 CREATE TRIGGER IF NOT EXISTS team_memory_versions_no_delete BEFORE DELETE ON team_memory_versions BEGIN
     SELECT RAISE(ABORT, 'team_memory_versions is INSERT-ONLY');
 END;
@@ -483,7 +501,7 @@ WHEN (NEW.title IS NOT OLD.title AND NEW.title IS NOT NULL
     OR (NEW.attrs IS NOT OLD.attrs AND NEW.attrs IS NOT NULL
         AND NOT (length(CAST(NEW.attrs AS BLOB)) = length(CAST(OLD.attrs AS BLOB)) AND trim(NEW.attrs, '#') = ''))
     OR NEW.memory_id IS NOT OLD.memory_id OR NEW.version IS NOT OLD.version OR NEW.action IS NOT OLD.action
-    OR NEW.workspace_id IS NOT OLD.workspace_id OR NEW.type IS NOT OLD.type
+    OR NEW.workspace_id IS NOT OLD.workspace_id OR NEW.owner_workspace_id IS NOT OLD.owner_workspace_id OR NEW.type IS NOT OLD.type
     OR NEW.home_kind IS NOT OLD.home_kind OR NEW.home_ref IS NOT OLD.home_ref OR NEW.tags_json IS NOT OLD.tags_json
     OR NEW.priority IS NOT OLD.priority OR NEW.pinned IS NOT OLD.pinned OR NEW.status IS NOT OLD.status
     OR NEW.actor_kind IS NOT OLD.actor_kind OR NEW.actor_id IS NOT OLD.actor_id

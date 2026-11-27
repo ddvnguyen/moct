@@ -95,10 +95,19 @@ function queryNumber(query: URLSearchParams, name: string): number | undefined {
 }
 
 /** Reader scope from the query string: workspaceId, expertId, channels, tasks, all=1. */
-function parseScope(query: URLSearchParams): MemoryScope {
+function parseScope(query: URLSearchParams, opts: { expertRequired?: boolean } = {}): MemoryScope {
+  const rawExpert = query.get("expertId") ?? "";
+  // Single-record routes (GET, versions, PATCH, verbs) gate on the workspace
+  // and let the orchestrator `all` flag or the record's own expert tag carry
+  // the rest: the Memory page and the proxy's lookup call these without an
+  // expert to name. Search/getMany/inject keep requiring both.
+  const expertId =
+    opts.expertRequired === false && rawExpert.trim().length === 0
+      ? "-"
+      : reqString(rawExpert, "expertId");
   return {
     workspaceId: reqString(query.get("workspaceId"), "workspaceId"),
-    expertId: reqString(query.get("expertId"), "expertId"),
+    expertId,
     channels: csv(query.get("channels")),
     tasks: csv(query.get("tasks")),
     all: query.get("all") === "1" || query.get("all") === "true",
@@ -239,9 +248,11 @@ async function dispatch(
 
   if (parts.length === 1) {
     if (method === "GET") {
-      const record = await memory.get(id);
-      if (record === undefined) throw new MemoryError(404, "NOT_FOUND", "no such memory record");
-      return sendJson(res, 200, record);
+      // Scoped like a getMany of one: a foreign-workspace id is a 404, and
+      // the proxy's lookup gate keeps working because it already checks this.
+      const got = await memory.getMany([id], parseScope(url.searchParams, { expertRequired: false }));
+      if (got.records.length === 0) throw new MemoryError(404, "NOT_FOUND", "no such memory record");
+      return sendJson(res, 200, got.records[0]);
     }
     if (method === "PATCH") {
       const body = asObject(await readBody());
@@ -257,6 +268,7 @@ async function dispatch(
           pinned: body["pinned"],
           priority: body["priority"],
           reason: optString(body["reason"], "reason"),
+          scope: parseScope(url.searchParams, { expertRequired: false }),
         }),
       );
     }
@@ -266,26 +278,27 @@ async function dispatch(
   const verb = parts[1] ?? "";
   if (verb === "versions") {
     if (method !== "GET") return methodNotAllowed(res);
-    return sendJson(res, 200, { versions: await memory.versions(id) });
+    return sendJson(res, 200, { versions: await memory.versions(id, parseScope(url.searchParams, { expertRequired: false })) });
   }
   if (!RECORD_VERBS.has(verb)) return notFound(res);
   if (method !== "POST") return methodNotAllowed(res);
   const body = asObject(await readBody());
   const actor = parseActor(body["actor"]);
   const reason = optString(body["reason"], "reason");
+  const scope = parseScope(url.searchParams, { expertRequired: false });
   switch (verb) {
     case "widen": {
       const to = asObject(body["to"] ?? null);
       return sendJson(
         res,
         200,
-        await memory.widen(id, { to: { kind: to["kind"], ref: to["ref"] }, baseVersion: reqVersion(body["baseVersion"], "baseVersion"), actor, reason }),
+        await memory.widen(id, { to: { kind: to["kind"], ref: to["ref"] }, baseVersion: reqVersion(body["baseVersion"], "baseVersion"), actor, reason, scope }),
       );
     }
     case "approve":
-      return sendJson(res, 200, await memory.approve(id, { baseVersion: reqVersion(body["baseVersion"], "baseVersion"), actor, reason }));
+      return sendJson(res, 200, await memory.approve(id, { baseVersion: reqVersion(body["baseVersion"], "baseVersion"), actor, reason, scope }));
     case "retract":
-      return sendJson(res, 200, await memory.retract(id, { baseVersion: reqVersion(body["baseVersion"], "baseVersion"), actor, reason }));
+      return sendJson(res, 200, await memory.retract(id, { baseVersion: reqVersion(body["baseVersion"], "baseVersion"), actor, reason, scope }));
     case "restore":
       return sendJson(
         res,
@@ -295,10 +308,11 @@ async function dispatch(
           baseVersion: reqVersion(body["baseVersion"], "baseVersion"),
           actor,
           reason,
+          scope,
         }),
       );
     default:
-      return sendJson(res, 200, await memory.purge(id, { actor, reason }));
+      return sendJson(res, 200, await memory.purge(id, { actor, reason, scope }));
   }
 }
 

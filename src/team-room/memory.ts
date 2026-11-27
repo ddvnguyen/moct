@@ -1,14 +1,16 @@
 /**
- * Team memory (schema v8, design v5). Typed records with visibility tags, every
+ * Team memory (schema v9, design v5). Typed records with visibility tags, every
  * change kept as a version row. Backend-owned state, not a projection of
- * team_operations: how_to_work follows an expert across Workspaces, and a purge
- * must remove text, which an append-only log cannot. No ledger op kind is added.
+ * team_operations: a purge must remove text, which an append-only log cannot.
+ * No ledger op kind is added. v9 stamps workspace_id on every write (expert
+ * homes included); legacy null-workspace expert rows are owned by their home
+ * expert (owner_workspace_id) until backfilled, and reads confine them there.
  *
  *   type         home            visible to
  *   rule         team | channel  that team or channel           priority 100, always loads
  *   decision     channel | task  the whole team (+ its home)    priority 80
  *   convention   team | channel  that team or channel           priority 60
- *   how_to_work  expert          that expert (+ orchestrators)  priority 60
+ *   how_to_work  expert          that expert in that workspace   priority 60
  *   task         task            the whole team                 priority 40, one per task
  *   branch       channel         the whole team                 priority 40, one per repo+branch
  *
@@ -114,7 +116,10 @@ export interface MemoryTag {
 
 export interface MemoryRecord {
   id: string;
-  workspaceId: string | null;
+  /** The workspace this record belongs to. v9 stamps it on every write. */
+  workspaceId: string;
+  /** Legacy scope only: the owning expert of a null-workspace v8 expert row. */
+  ownerWorkspaceId: string | null;
   type: MemoryType;
   title: string | null;
   body: string | null;
@@ -145,7 +150,10 @@ export interface MemoryVersion {
   memoryId: string;
   version: number;
   action: string;
+  /** The record's workspace at that version (v9 stamps it; legacy v8 rows may be null). */
   workspaceId: string | null;
+  /** Legacy scope only: the owning expert of a null-workspace v8 expert version. */
+  ownerWorkspaceId: string | null;
   type: MemoryType;
   home: MemoryHome;
   tags: MemoryTag[];
@@ -398,7 +406,11 @@ function rowToRecord(row: Record<string, unknown>, tags: MemoryTag[]): MemoryRec
   const body = (row["body"] as string | null) ?? null;
   return {
     id: String(row["id"]),
-    workspaceId: (row["workspace_id"] as string | null) ?? null,
+    // v8 fleet.db files have no owner_workspace_id column; every row they hold
+    // is a v8 row, so missing means legacy. v9 rows always carry it (possibly null).
+    workspaceId: (row["workspace_id"] as string | null) ?? (row["owner_workspace_id"] as string | null) ?? "",
+    ownerWorkspaceId:
+      row["owner_workspace_id"] === undefined ? null : ((row["owner_workspace_id"] as string | null) ?? null),
     type: row["type"] as MemoryType,
     title,
     body,
@@ -431,6 +443,7 @@ function rowToVersion(row: Record<string, unknown>): MemoryVersion {
     version: Number(row["version"]),
     action: String(row["action"]),
     workspaceId: (row["workspace_id"] as string | null) ?? null,
+    ownerWorkspaceId: row["owner_workspace_id"] === undefined ? null : ((row["owner_workspace_id"] as string | null) ?? null),
     type: row["type"] as MemoryType,
     home: { kind: row["home_kind"] as HomeKind, ref: String(row["home_ref"]) },
     tags: parseJson<MemoryTag[]>(row["tags_json"], []),
@@ -694,35 +707,67 @@ export class TeamMemoryStore {
     return record;
   }
 
+  /**
+   * The scoped form of require for mutating verbs: a record outside the
+   * caller's workspace reads as missing (404), never as forbidden, so a
+   * foreign id reveals nothing and mutates nothing.
+   */
+  private async requireVisible(id: string, scope: MemoryScope | undefined): Promise<MemoryRecord> {
+    const record = await this.require(id);
+    if (scope !== undefined && !(await this.visible(id, scope))) {
+      throw new MemoryError(404, "NOT_FOUND", "no such memory record");
+    }
+    return record;
+  }
+
   private checkBase(record: MemoryRecord, baseVersion: number): void {
     if (record.version !== baseVersion) {
       throw new MemoryError(409, "VERSION_STALE", `record is at version ${record.version}, not ${baseVersion}`);
     }
   }
 
-  /** SQL that limits `r` to what the scope may see. */
+  /**
+   * SQL that limits `r` to what the scope may see. Every record belongs to one
+   * workspace (v9 stamps it on write); legacy null-workspace expert rows belong
+   * to their owning expert (`owner_workspace_id`, backfilled from the home ref).
+   * Nothing crosses workspaces: stamped rows need the requesting workspace,
+   * legacy rows additionally need a proof of ownership (see below).
+   */
   private visibility(scope: MemoryScope): { sql: string; params: unknown[] } {
     if (!nonEmpty(scope.workspaceId) || !nonEmpty(scope.expertId)) {
       throw new MemoryError(400, "INVALID_SCOPE", "scope needs workspaceId and expertId");
     }
-    if (scope.all === true) {
-      return { sql: "(r.workspace_id = ? OR r.workspace_id IS NULL)", params: [scope.workspaceId] };
-    }
     const ors = ["(t.kind = 'team' AND t.ref = ?)", "(t.kind = 'expert' AND t.ref = ?)"];
-    const params: unknown[] = [scope.workspaceId, scope.expertId];
+    const tagParams: unknown[] = [scope.workspaceId, scope.expertId];
     const channels = (scope.channels ?? []).filter(nonEmpty);
     const tasks = (scope.tasks ?? []).filter(nonEmpty);
     if (channels.length > 0) {
       ors.push(`(t.kind = 'channel' AND t.ref IN (${placeholders(channels.length)}))`);
-      params.push(...channels);
+      tagParams.push(...channels);
     }
     if (tasks.length > 0) {
       ors.push(`(t.kind = 'task' AND t.ref IN (${placeholders(tasks.length)}))`);
-      params.push(...tasks);
+      tagParams.push(...tasks);
     }
+    // The tag match is inlined twice below (stamped branch, legacy branch),
+    // so each branch binds its own copy of the tag params.
+    const tagMatch = `EXISTS (SELECT 1 FROM team_memory_tags t WHERE t.record_id = r.id AND (${ors.join(" OR ")}))`;
+    if (scope.all === true) {
+      // Orchestrator scope: every stamped row of this workspace (the Memory
+      // page lists the whole workspace), plus a legacy expert row only when
+      // the same request names that expert (search/get with expertId, or the
+      // proxy's lookup gate) — the author's handle until backfill.
+      return {
+        sql: `((r.workspace_id = ?) OR (r.workspace_id IS NULL AND r.owner_workspace_id = ? AND ${tagMatch}))`,
+        params: [scope.workspaceId, scope.expertId, ...tagParams],
+      };
+    }
+    // A legacy row's owning expert keeps reaching it from any workspace (its
+    // authors' handle until backfill); every other expert stays confined to
+    // stamped rows in the requesting workspace.
     return {
-      sql: `(r.workspace_id = ? OR r.workspace_id IS NULL) AND EXISTS (SELECT 1 FROM team_memory_tags t WHERE t.record_id = r.id AND (${ors.join(" OR ")}))`,
-      params: [scope.workspaceId, ...params],
+      sql: `((r.workspace_id = ? AND ${tagMatch}) OR (r.workspace_id IS NULL AND r.owner_workspace_id = ? AND ${tagMatch}))`,
+      params: [scope.workspaceId, ...tagParams, scope.expertId, ...tagParams],
     };
   }
 
@@ -828,9 +873,36 @@ export class TeamMemoryStore {
     });
   }
 
-  async versions(id: string): Promise<MemoryVersion[]> {
-    await this.require(id);
-    const rows = await this.db.all("SELECT * FROM team_memory_versions WHERE memory_id = ? ORDER BY version DESC", id);
+  /**
+   * True when the scope may see the record: the get/versions gate. Uses the
+   * same workspace confinement as search, so a record page never shows a row
+   * its own list hides. A scope with no expert (`-`, from the single-record
+   * routes) passes any stamped row of this workspace — the Memory page and
+   * the proxy's lookup list the whole workspace, and mutating verbs still
+   * need the actor and the base version. Legacy null-workspace expert rows
+   * never pass the bare gate; they need their owning expert named.
+   * No citation: checking visibility must not touch expiry.
+   */
+  async visible(id: string, scope: MemoryScope): Promise<boolean> {
+    if (scope.expertId === "-") {
+      const row = await this.db.get("SELECT 1 AS hit FROM team_memory_records r WHERE r.id = ? AND r.workspace_id = ?", id, scope.workspaceId);
+      return row !== undefined;
+    }
+    const vis = this.visibility(scope);
+    const row = await this.db.get(
+      `SELECT 1 AS hit FROM team_memory_records r WHERE r.id = ? AND ${vis.sql}`,
+      id,
+      ...vis.params,
+    );
+    return row !== undefined;
+  }
+
+  async versions(id: string, scope?: MemoryScope): Promise<MemoryVersion[]> {
+    const record = await this.require(id);
+    if (scope !== undefined && !(await this.visible(id, scope))) {
+      throw new MemoryError(404, "NOT_FOUND", "no such memory record");
+    }
+    const rows = await this.db.all("SELECT * FROM team_memory_versions WHERE memory_id = ? ORDER BY version DESC", record.id);
     return rows.map(rowToVersion);
   }
 
@@ -850,13 +922,14 @@ export class TeamMemoryStore {
 
   private async recordVersion(record: MemoryRecord, action: string, actor: MemoryActor, reason: string, at: string): Promise<void> {
     await this.db.run(
-      `INSERT INTO team_memory_versions(memory_id, version, action, workspace_id, type, home_kind, home_ref, tags_json,
+      `INSERT INTO team_memory_versions(memory_id, version, action, workspace_id, owner_workspace_id, type, home_kind, home_ref, tags_json,
          title, body, attrs, priority, pinned, status, actor_kind, actor_id, reason, at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       record.id,
       record.version,
       action,
-      record.workspaceId,
+      record.workspaceId === "" ? null : record.workspaceId,
+      record.ownerWorkspaceId,
       record.type,
       record.home.kind,
       record.home.ref,
@@ -883,12 +956,13 @@ export class TeamMemoryStore {
 
   private async insert(record: MemoryRecord, actor: MemoryActor, reason: string): Promise<void> {
     await this.db.run(
-      `INSERT INTO team_memory_records(id, workspace_id, type, title, body, attrs, home_kind, home_ref, priority, pinned,
+      `INSERT INTO team_memory_records(id, workspace_id, owner_workspace_id, type, title, body, attrs, home_kind, home_ref, priority, pinned,
          status, flag, supersedes, superseded_by, conflicts_with, task_ref, unique_key, author_kind, author_id,
          created_at, updated_at, version)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       record.id,
-      record.workspaceId,
+      record.workspaceId === "" ? null : record.workspaceId,
+      record.ownerWorkspaceId,
       record.type,
       record.title,
       record.body,
@@ -918,7 +992,7 @@ export class TeamMemoryStore {
   private async commit(next: MemoryRecord, action: string, actor: MemoryActor, reason: string): Promise<MemoryRecord> {
     await this.db.run(
       `UPDATE team_memory_records SET title = ?, body = ?, attrs = ?, home_kind = ?, home_ref = ?, priority = ?, pinned = ?,
-         status = ?, flag = ?, superseded_by = ?, unique_key = ?, updated_at = ?, version = ?
+         status = ?, flag = ?, superseded_by = ?, unique_key = ?, updated_at = ?, version = ?, owner_workspace_id = ?
        WHERE id = ?`,
       next.title,
       next.body,
@@ -933,6 +1007,7 @@ export class TeamMemoryStore {
       next.uniqueKey,
       next.updatedAt,
       next.version,
+      next.ownerWorkspaceId,
       next.id,
     );
     await this.recordVersion(next, action, actor, reason, next.updatedAt);
@@ -952,19 +1027,22 @@ export class TeamMemoryStore {
 
   /**
    * A home's always-load set (active rules and pinned records) with each
-   * record's token count. An expert home spans every Workspace; the others are
-   * one Workspace's. The write-time cap and the Memory page's usage read share
-   * this, so the page never shows a number the cap does not enforce.
+   * record's token count. Every home is one Workspace's, expert homes included:
+   * the always-load cap applies per workspace, so a Role's pinned memory in one
+   * workspace never spends another's budget. The write-time cap and the Memory
+   * page's usage read share this, so the page never shows a number the cap
+   * does not enforce.
    */
-  private async alwaysLoad(workspaceId: string | null, home: MemoryHome): Promise<BudgetConsumer[]> {
-    const params: unknown[] = [home.kind, home.ref];
-    let sql = `SELECT * FROM team_memory_records WHERE home_kind = ? AND home_ref = ? AND status = 'active'
-               AND (type = 'rule' OR pinned = 1)`;
-    if (home.kind !== "expert") {
-      sql += " AND workspace_id = ?";
-      params.push(workspaceId);
-    }
-    return (await this.db.all(sql, ...params)).map(budgetConsumer);
+  private async alwaysLoad(workspaceId: string, home: MemoryHome): Promise<BudgetConsumer[]> {
+    return (
+      await this.db.all(
+        `SELECT * FROM team_memory_records WHERE home_kind = ? AND home_ref = ? AND status = 'active'
+         AND (type = 'rule' OR pinned = 1) AND workspace_id = ?`,
+        home.kind,
+        home.ref,
+        workspaceId,
+      )
+    ).map(budgetConsumer);
   }
 
   /**
@@ -972,7 +1050,7 @@ export class TeamMemoryStore {
    * records) past the cap. The refusal names the largest consumers, so a human
    * or orchestrator can unpin or retract the right thing.
    */
-  private async assertBudget(workspaceId: string | null, home: MemoryHome, addTokens: number, excludeId: string | null): Promise<void> {
+  private async assertBudget(workspaceId: string, home: MemoryHome, addTokens: number, excludeId: string | null): Promise<void> {
     const consumers = (await this.alwaysLoad(workspaceId, home)).filter((c) => c.id !== excludeId);
     const used = consumers.reduce((sum, c) => sum + c.tokens, 0);
     if (used + addTokens <= MEMORY_INJECT_LAYER_CAP_TOKENS) return;
@@ -988,17 +1066,15 @@ export class TeamMemoryStore {
 
   /**
    * The Memory page's budget view: every home with an always-load record or a
-   * pending record blocked by a full home, with its use against the cap. Team,
-   * channel and task homes are this Workspace's. An expert's how_to_work belongs
-   * to no Workspace, so every expert home with an always-load record is listed
-   * and counted across Workspaces, as the cap counts it; a client that shows one
-   * Workspace narrows them to its Members. Read-only; no citation.
+   * pending record blocked by a full home in this workspace, with its use
+   * against the cap. Expert homes are this workspace's too: the write-time cap
+   * is per workspace. Read-only; no citation.
    */
   async usage(workspaceId: string): Promise<MemoryUsage> {
     if (!nonEmpty(workspaceId)) throw new MemoryError(400, "INVALID_SCOPE", "workspaceId is required");
     const rows = await this.db.all(
       `SELECT DISTINCT home_kind, home_ref FROM team_memory_records
-       WHERE (workspace_id = ? OR (home_kind = 'expert' AND workspace_id IS NULL))
+       WHERE workspace_id = ?
          AND ((status = 'active' AND (type = 'rule' OR pinned = 1)) OR (status = 'pending' AND flag = 'blocked_budget'))`,
       workspaceId,
     );
@@ -1007,9 +1083,11 @@ export class TeamMemoryStore {
       const home: MemoryHome = { kind: row["home_kind"] as HomeKind, ref: String(row["home_ref"]) };
       const consumers = (await this.alwaysLoad(workspaceId, home)).sort(byTokens);
       const blocked = await this.db.get(
-        `SELECT count(*) AS n FROM team_memory_records WHERE home_kind = ? AND home_ref = ? AND status = 'pending'
-         AND flag = 'blocked_budget'${home.kind === "expert" ? "" : " AND workspace_id = ?"}`,
-        ...(home.kind === "expert" ? [home.kind, home.ref] : [home.kind, home.ref, workspaceId]),
+        `SELECT count(*) AS n FROM team_memory_records WHERE workspace_id = ? AND home_kind = ? AND home_ref = ? AND status = 'pending'
+         AND flag = 'blocked_budget'`,
+        workspaceId,
+        home.kind,
+        home.ref,
       );
       homes.push({
         home,
@@ -1030,7 +1108,7 @@ export class TeamMemoryStore {
 
   /** Link a record to the task record its cited taskRef names. The model never names link targets. */
   private async linkTask(record: MemoryRecord): Promise<void> {
-    if (record.workspaceId === null) return;
+    if (record.workspaceId === "") return;
     if (record.type === "task") {
       // A new task record collects the decisions and branches that cited it earlier.
       const taskRef = String(record.attrs?.["taskRef"]);
@@ -1060,17 +1138,13 @@ export class TeamMemoryStore {
     await this.db.run("INSERT OR IGNORE INTO team_memory_links(from_id, to_id, kind) VALUES (?, ?, ?)", fromId, toId, kind);
   }
 
-  private async nearMatches(type: MemoryType, workspaceId: string | null, home: MemoryHome, title: string): Promise<NearMatch[]> {
-    const params: unknown[] = [type];
-    let sql = "SELECT * FROM team_memory_records WHERE type = ? AND status IN ('active', 'pending')";
-    if (workspaceId === null) {
-      sql += " AND home_kind = 'expert' AND home_ref = ?";
-      params.push(home.ref);
-    } else {
-      sql += " AND workspace_id = ?";
-      params.push(workspaceId);
-    }
-    const rows = await this.db.all(`${sql} ORDER BY updated_at DESC, id`, ...params);
+  private async nearMatches(type: MemoryType, workspaceId: string, _home: MemoryHome, title: string): Promise<NearMatch[]> {
+    // Dedupes compare one expert home inside one workspace, never across them.
+    const rows = await this.db.all(
+      "SELECT * FROM team_memory_records WHERE type = ? AND status IN ('active', 'pending') AND workspace_id = ? ORDER BY updated_at DESC, id",
+      type,
+      workspaceId,
+    );
     const out: NearMatch[] = [];
     for (const row of rows) {
       const other = (row["title"] as string | null) ?? null;
@@ -1108,8 +1182,8 @@ export class TeamMemoryStore {
     if ((type === "task" || type === "branch") && role === "worker") {
       throw new MemoryError(403, "SCOPE_FORBIDDEN", `${type} records are kept by orchestrators`);
     }
-    const workspaceId = type === "how_to_work" ? null : input.workspaceId;
-    if (workspaceId !== null && !nonEmpty(workspaceId)) throw invalid("workspaceId is required");
+    const workspaceId = input.workspaceId;
+    if (!nonEmpty(workspaceId)) throw invalid("workspaceId is required");
     if (home.kind === "team" && home.ref !== workspaceId) throw new MemoryError(403, "SCOPE_FORBIDDEN", "team home must be the workspace");
     if (home.kind === "expert" && role === "worker" && home.ref !== input.actor.id) {
       throw new MemoryError(403, "SCOPE_FORBIDDEN", "an expert may write only its own how_to_work");
@@ -1121,7 +1195,7 @@ export class TeamMemoryStore {
     if (taskRef !== null && !taskRef.startsWith("task:")) throw invalid("taskRef must be a task:… ref");
     const uniqueKey = uniqueKeyFor(type, text.attrs);
 
-    if (uniqueKey !== null) return this.upsert(type, workspaceId!, home, text, uniqueKey, taskRef, input, role);
+    if (uniqueKey !== null) return this.upsert(type, workspaceId, home, text, uniqueKey, taskRef, input, role);
 
     let replaced: MemoryRecord | null = null;
     if (nonEmpty(input.supersedes)) {
@@ -1144,6 +1218,9 @@ export class TeamMemoryStore {
     const record: MemoryRecord = {
       id: `mem_${randomUUID()}`,
       workspaceId,
+      // Legacy null-workspace v8 rows keep their owner until backfilled; every
+      // v9 write is stamped, so its owner never matters.
+      ownerWorkspaceId: null,
       type,
       title: text.title,
       body: text.body,
@@ -1201,6 +1278,7 @@ export class TeamMemoryStore {
         const record: MemoryRecord = {
           id: `mem_${randomUUID()}`,
           workspaceId,
+          ownerWorkspaceId: null,
           type,
           title: text.title,
           body: text.body,
@@ -1286,6 +1364,7 @@ export class TeamMemoryStore {
       pinned?: unknown;
       priority?: unknown;
       reason?: string;
+      scope?: MemoryScope;
     },
   ): Promise<MemoryRecord> {
     const textChange = input.title !== undefined || input.body !== undefined || input.attrs !== undefined;
@@ -1293,7 +1372,7 @@ export class TeamMemoryStore {
     if (kinds !== 1) throw new MemoryError(400, "INVALID_PATCH", "send exactly one of: text (title/body/attrs), pinned, priority");
     const role = await this.role(input.actor);
     return this.db.transaction(async () => {
-      const record = await this.require(id);
+      const record = await this.requireVisible(id, input.scope);
       this.checkBase(record, input.baseVersion);
       if (record.status !== "active" && record.status !== "pending") throw new MemoryError(409, "NOT_ACTIVE", `record is ${record.status}`);
       const next: MemoryRecord = { ...record, version: record.version + 1, updatedAt: this.iso() };
@@ -1352,10 +1431,10 @@ export class TeamMemoryStore {
    * follows its new home's budget and expiry. A rule widened into the team home
    * by anyone but the human goes back to pending for the human.
    */
-  async widen(id: string, input: { to: { kind: unknown; ref: unknown }; baseVersion: number; actor: MemoryActor; reason?: string }): Promise<MemoryRecord> {
+  async widen(id: string, input: { to: { kind: unknown; ref: unknown }; baseVersion: number; actor: MemoryActor; reason?: string; scope?: MemoryScope }): Promise<MemoryRecord> {
     const role = await this.requireOrchestrator(input.actor, "widen");
     return this.db.transaction(async () => {
-      const record = await this.require(id);
+      const record = await this.requireVisible(id, input.scope);
       this.checkBase(record, input.baseVersion);
       if (record.status !== "active" && record.status !== "pending") throw new MemoryError(409, "NOT_ACTIVE", `record is ${record.status}`);
       const to = input.to?.kind;
@@ -1397,10 +1476,10 @@ export class TeamMemoryStore {
    * that would overflow its home's always-load set stays pending, is flagged
    * "blocked_budget", and the refusal names the largest consumers.
    */
-  async approve(id: string, input: { baseVersion: number; actor: MemoryActor; reason?: string }): Promise<MemoryRecord> {
+  async approve(id: string, input: { baseVersion: number; actor: MemoryActor; reason?: string; scope?: MemoryScope }): Promise<MemoryRecord> {
     const role = await this.role(input.actor);
     if (role === "worker") throw new MemoryError(403, "APPROVER_ONLY", "approve is reserved for orchestrators and the human");
-    const record = await this.require(id);
+    const record = await this.requireVisible(id, input.scope);
     if (isAuthor(record, input.actor) || (await this.wroteText(id, input.actor))) {
       throw new MemoryError(403, "SELF_APPROVAL", "a writer of this record's text cannot approve it");
     }
@@ -1434,10 +1513,10 @@ export class TeamMemoryStore {
     });
   }
 
-  async retract(id: string, input: { baseVersion: number; actor: MemoryActor; reason?: string }): Promise<MemoryRecord> {
+  async retract(id: string, input: { baseVersion: number; actor: MemoryActor; reason?: string; scope?: MemoryScope }): Promise<MemoryRecord> {
     const role = await this.role(input.actor);
     return this.db.transaction(async () => {
-      const record = await this.require(id);
+      const record = await this.requireVisible(id, input.scope);
       this.checkBase(record, input.baseVersion);
       if (role === "worker" && !isAuthor(record, input.actor)) throw new MemoryError(403, "NOT_OWNER", "an expert may retract only its own records");
       if (record.status !== "active" && record.status !== "pending") throw new MemoryError(409, "NOT_ACTIVE", `record is ${record.status}`);
@@ -1446,10 +1525,10 @@ export class TeamMemoryStore {
   }
 
   /** Bring an earlier version's text back as the current one. Human only; the text is filtered again. */
-  async restore(id: string, input: { version: number; baseVersion: number; actor: MemoryActor; reason?: string }): Promise<MemoryRecord> {
+  async restore(id: string, input: { version: number; baseVersion: number; actor: MemoryActor; reason?: string; scope?: MemoryScope }): Promise<MemoryRecord> {
     requireHuman(input.actor, "restore");
     return this.db.transaction(async () => {
-      const record = await this.require(id);
+      const record = await this.requireVisible(id, input.scope);
       this.checkBase(record, input.baseVersion);
       if (record.status === "purged") throw new MemoryError(409, "PURGED", "a purged record cannot be restored");
       const row = await this.db.get("SELECT * FROM team_memory_versions WHERE memory_id = ? AND version = ?", id, input.version);
@@ -1482,10 +1561,10 @@ export class TeamMemoryStore {
    * version keeps who, when and why. Backup copies taken before the purge still
    * hold the text: purge cannot reach files outside this database.
    */
-  async purge(id: string, input: { actor: MemoryActor; reason?: string }): Promise<MemoryRecord> {
+  async purge(id: string, input: { actor: MemoryActor; reason?: string; scope?: MemoryScope }): Promise<MemoryRecord> {
     requireHuman(input.actor, "purge");
     const purged = await this.db.transaction(async () => {
-      const record = await this.require(id);
+      const record = await this.requireVisible(id, input.scope);
       if (record.status === "purged") return record;
       const versions = await this.db.all(
         "SELECT version, title, body, attrs FROM team_memory_versions WHERE memory_id = ? AND (title IS NOT NULL OR body IS NOT NULL OR attrs IS NOT NULL)",
@@ -1574,13 +1653,14 @@ export class TeamMemoryStore {
     for (const kind of INJECT_ORDER) {
       const ref = homes[kind];
       if (ref === null) continue;
-      const params: unknown[] = [kind, ref];
-      let sql = "SELECT * FROM team_memory_records WHERE status = 'active' AND home_kind = ? AND home_ref = ?";
-      if (kind !== "expert") {
-        sql += " AND workspace_id = ?";
-        params.push(query.workspaceId);
-      }
-      const rows = [...(await this.db.all(sql, ...params))];
+      const rows = [
+        ...(await this.db.all(
+          `SELECT * FROM team_memory_records WHERE status = 'active' AND home_kind = ? AND home_ref = ? AND workspace_id = ?`,
+          kind,
+          ref,
+          query.workspaceId,
+        )),
+      ];
       if (kind === "task") {
         // The task picture: whatever is linked to the current task record.
         rows.push(
@@ -1588,9 +1668,10 @@ export class TeamMemoryStore {
             `SELECT r.* FROM team_memory_records t
              JOIN team_memory_links l ON l.from_id = t.id OR l.to_id = t.id
              JOIN team_memory_records r ON r.id = CASE WHEN l.from_id = t.id THEN l.to_id ELSE l.from_id END
-             WHERE t.workspace_id = ? AND t.unique_key = ? AND r.status = 'active'`,
+             WHERE t.workspace_id = ? AND t.unique_key = ? AND r.status = 'active' AND r.workspace_id = ?`,
             query.workspaceId,
             ref,
+            query.workspaceId,
           )),
         );
       }

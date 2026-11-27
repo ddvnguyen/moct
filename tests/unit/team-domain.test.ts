@@ -106,14 +106,15 @@ describe("team domain DDL (schema v3)", () => {
       world.dbPath,
       "SELECT key FROM meta WHERE key LIKE 'schema_version:%' ORDER BY key",
     );
-    // v6 is the Team Room DDL (moct contract §2), v7 its read models, v8 team memory;
-    // v4/v5 are reserved for paseo #68/#69.
+    // v6 is the Team Room DDL (moct contract §2), v7 its read models, v8 team memory,
+    // v9 its workspace containment; v4/v5 are reserved for paseo #68/#69.
     expect(versions.map((r) => r["key"])).toEqual([
       "schema_version:2",
       "schema_version:3",
       "schema_version:6",
       "schema_version:7",
       "schema_version:8",
+      "schema_version:9",
     ]);
   });
 

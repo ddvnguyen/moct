@@ -235,6 +235,17 @@ export class TursoRepository implements Store {
       /* best-effort */
     }
     await repo.db.exec(FLEET_SCHEMA_SQL);
+    // v9 migration: a v8 team_memory_records table keeps NULL workspace_id on
+    // expert-home rows, and its old table CHECK rejects stamped writes, which
+    // CREATE TABLE IF NOT EXISTS cannot change. When the table still carries
+    // the old CHECK, rebuild it in one transaction: create the new table, copy
+    // every row (stamping nothing — legacy NULLs stay NULL, owned by their
+    // home expert), drop the old table, rename, recreate its indexes. Tags,
+    // links and versions are untouched (they name records by id, which never
+    // changes). The old CHECK is detected with a plain sqlite_master SELECT:
+    // on this Turso version a table-valued pragma SELECT poisons the
+    // connection for later readers of the same file.
+    await repo.migrateMemoryRecordsV9();
     // Record every applied schema version (idempotent, one meta row each).
     // FLEET_SCHEMA_SQL is CREATE TABLE IF NOT EXISTS, so opening a fleet.db
     // written by an older build applies the newer tables in place; stamping
@@ -249,6 +260,78 @@ export class TursoRepository implements Store {
       }
     }
     return repo;
+  }
+
+  /**
+   * v9 rebuild of team_memory_records, in one lock-held transaction (BEGIN
+   * IMMEDIATE … COMMIT, rolled back on error). A v8 table keeps NULL
+   * workspace_id on expert-home rows and its old table CHECK rejects stamped
+   * writes; CREATE TABLE IF NOT EXISTS cannot change either. New tables
+   * (already v9) and already-rebuilt tables match neither condition below and
+   * return in one cheap SELECT. Tags, links and versions are untouched (they
+   * name records by id, which never changes).
+   */
+  private async migrateMemoryRecordsV9(): Promise<void> {
+    const row = (await this.conn().get("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'team_memory_records'")) as
+      | Record<string, unknown>
+      | undefined;
+    const sql = typeof row?.["sql"] === "string" ? (row["sql"] as string) : "";
+    // The v9 shape names the new column and never the old NULL-only rule.
+    if (!sql.includes("workspace_id IS NULL") || sql.includes("owner_workspace_id")) return;
+    await this.lock("team-room", async () => {
+      const db = this.conn();
+      // Versions carry no CHECK to rebuild: a plain ADD COLUMN plus the same
+      // owner backfill suffices (ALTER is not re-runnable, so only v8 tables
+      // take this path — new tables already have the column).
+      await db.exec(`ALTER TABLE team_memory_versions ADD COLUMN owner_workspace_id TEXT`);
+      await db.exec(
+        `UPDATE team_memory_versions SET owner_workspace_id = home_ref
+         WHERE home_kind = 'expert' AND workspace_id IS NULL AND owner_workspace_id IS NULL`,
+      );
+      await db.exec(`CREATE TABLE team_memory_records_v9 (
+        id TEXT PRIMARY KEY,
+        -- Nullable like the new DDL: the copy carries legacy NULL-workspace
+        -- expert rows, owned by their home expert until backfilled.
+        workspace_id TEXT,
+        type TEXT NOT NULL CHECK (type IN ('rule', 'decision', 'convention', 'how_to_work', 'task', 'branch')),
+        title TEXT,
+        body TEXT,
+        attrs TEXT,
+        home_kind TEXT NOT NULL CHECK (home_kind IN ('task', 'channel', 'team', 'expert')),
+        home_ref TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'superseded', 'retracted', 'expired', 'purged')),
+        flag TEXT,
+        supersedes TEXT,
+        superseded_by TEXT,
+        conflicts_with TEXT NOT NULL DEFAULT '[]',
+        task_ref TEXT,
+        unique_key TEXT,
+        author_kind TEXT NOT NULL CHECK (author_kind IN ('human', 'member')),
+        author_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_used_at TEXT,
+        use_count INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL,
+        embedding BLOB,
+        owner_workspace_id TEXT
+      )`);
+      await db.exec(`INSERT INTO team_memory_records_v9
+        (id, workspace_id, type, title, body, attrs, home_kind, home_ref, priority, pinned,
+         status, flag, supersedes, superseded_by, conflicts_with, task_ref, unique_key, author_kind, author_id,
+         created_at, updated_at, last_used_at, use_count, version, embedding, owner_workspace_id)
+       SELECT id, workspace_id, type, title, body, attrs, home_kind, home_ref, priority, pinned,
+         status, flag, supersedes, superseded_by, conflicts_with, task_ref, unique_key, author_kind, author_id,
+         created_at, updated_at, last_used_at, use_count, version, embedding,
+         CASE WHEN home_kind = 'expert' AND workspace_id IS NULL THEN home_ref ELSE NULL END
+       FROM team_memory_records`);
+      await db.exec(`DROP TABLE team_memory_records`);
+      await db.exec(`ALTER TABLE team_memory_records_v9 RENAME TO team_memory_records`);
+      await db.exec(`CREATE INDEX IF NOT EXISTS idx_team_memory_records_home ON team_memory_records(workspace_id, home_kind, home_ref, status)`);
+      await db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_memory_records_unique_key ON team_memory_records(workspace_id, unique_key)`);
+    });
   }
 
   /**

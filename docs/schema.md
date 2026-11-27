@@ -14,6 +14,7 @@ from that list.
 | 6 | MOCT Team Room (contract v0.3 §2) | `team_operations`, `team_session_runs`, `team_thread_summaries` | applied |
 | 7 | MOCT Team Room read models | `team_turns`, `team_thread_bindings` | applied |
 | 8 | MOCT team memory | `team_memory_records`, `team_memory_tags`, `team_memory_links`, `team_memory_versions`, `team_memory_settings` | applied |
+| 9 | MOCT team memory workspace containment (M-546) | `team_memory_records.owner_workspace_id`, `team_memory_versions.owner_workspace_id` | applied |
 
 Versions 4 and 5 are held for paseo #68 and #69. Both PRs are still open, with
 merge blockers, so they are not in this tree. When they are cherry-picked, their
@@ -97,6 +98,47 @@ New routes (read-only, loopback, additive):
 - `GET /team/v1/bindings?workspaceId=&threadRef=` or `&memberId=` (exactly one).
 
 Rollback: an older build ignores the v7 tables and routes. The DB stays valid for it.
+
+## v9 — Team memory workspace containment (M-546)
+
+Every record belongs to one workspace. v9 stamps `workspace_id` on every write
+(expert homes included; v8 stored `NULL` for `how_to_work`). The store enforces
+this (`note()` requires `workspaceId`; `TYPE_HOMES` pins each type to its
+homes), not a table CHECK: a CHECK change cannot migrate an existing v8 table,
+whose old CHECK (`(type = 'how_to_work') = (workspace_id IS NULL)`) would then
+reject stamped writes. Legacy null-workspace expert rows are owned by their
+home expert (`owner_workspace_id`, backfilled from `home_ref`): the owning
+expert keeps reaching them from any workspace until backfilled, and nobody
+else does. Nothing crosses workspaces. The visibility table stays, with
+`how_to_work` reading "that expert **in that workspace**". The always-load cap
+and `usage` are per workspace, expert homes included.
+
+Migration (`TursoRepository.open`, one lock-held transaction, rolled back on
+error): when `team_memory_records` still carries the old CHECK (detected with
+a plain `sqlite_master` SELECT — a table-valued pragma SELECT poisons this
+Turso version's connection for later readers), the table is rebuilt: create
+the new table, copy every row (legacy NULLs stay NULL under their owning
+expert), drop the old table, rename, recreate its indexes. Tags, links and
+versions are untouched (they name records by id). The versions table carries
+no CHECK, so it takes a plain `ADD COLUMN` plus the same owner backfill. New
+and already-migrated tables return after one cheap SELECT.
+
+Reads: search, getMany and links confine stamped rows to the requesting
+workspace and legacy rows to their owning expert (`all` adds legacy rows only
+when the same request names that expert). `inject` loads the expert bucket of
+the requesting workspace only. Single-record `GET`, `versions`, `PATCH` and the
+`widen`/`approve`/`retract`/`restore`/`purge` verbs take an optional
+`?workspaceId=` scope: a foreign-workspace id answers 404 (never 403), so a
+foreign id reveals nothing and mutates nothing. The Memory page and the
+proxy's lookup call these routes with the workspace; no expert is needed.
+
+Backfill for existing null-workspace rows: re-home each to the workspace it
+belongs to (`UPDATE team_memory_records SET workspace_id = ... WHERE id = ...`
+plus the matching `UPDATE` on `team_memory_versions`), or leave the row to its
+owning expert. Count them with
+`SELECT count(*) FROM team_memory_records WHERE workspace_id IS NULL;`
+(lane z has 0 active; production count unknown — run the query before relying
+on containment there).
 
 ## v8 — Team memory
 
@@ -204,20 +246,24 @@ still holds the text. Delete or re-take those copies to finish removal.
 - `GET /team/v1/memory?workspaceId=&expertId=&channels=&tasks=&all=1&q=&types=&homes=&status=&limit=&cursor=` — search (not a citation)
 - `POST /team/v1/memory` — note (create, supersede, or task/branch upsert)
 - `POST /team/v1/memory/get?workspaceId=&expertId=&channels=&tasks=&all=1` with `{ids}` — get (a citation)
-- `GET|PATCH /team/v1/memory/:id` — read, or one change (text, `pinned` or `priority`)
-- `GET /team/v1/memory/:id/versions`
-- `POST /team/v1/memory/:id/{widen|approve|retract|restore|purge}`
+- `GET|PATCH /team/v1/memory/:id[?workspaceId=]` — read, or one change (text, `pinned` or `priority`); with a workspace, a foreign-workspace id is 404
+- `GET /team/v1/memory/:id/versions[?workspaceId=]` — same scoping
+- `POST /team/v1/memory/:id/{widen|approve|retract|restore|purge}[?workspaceId=]` — same scoping
 - `GET|PUT /team/v1/memory/settings`
 - `GET /team/v1/memory/inject?expertId=&workspaceId=&channelRef=&taskRef=&layerTokens=`
 - `GET /team/v1/memory/rule-feed?workspaceId=&limit=`
-- `GET /team/v1/memory/usage?workspaceId=` — each home's always-load use against the cap, with the `injectLayerTokens` bounds (read-only, not a citation). `how_to_work` belongs to no Workspace, so every expert home with an always-load record is listed in every Workspace and counted as the cap counts it; a client narrows them to the Workspace's Members.
+- `GET /team/v1/memory/usage?workspaceId=` — each home's always-load use against the cap, with the `injectLayerTokens` bounds (read-only, not a citation). Every home is one workspace's, expert homes included; the cap is enforced per workspace.
 
 Refusals answer `{ok:false, code, error[, details]}` with status 400, 403, 404, 409 or 422.
 
-Rollback: measured on the final DDL. The 0.10.0 dist was run on a copy of a v8
-`fleet.db` holding every record type, tags, links, settings, both unique keys and
-a purged record. It started with 0 error lines, `/team/v1/health` answered 200
-with `schema: 7`, the operations routes answered 200, and a new operation write
-answered 201. Rolling forward to 0.11.0 kept every memory row, tag, link, version
-and both operations, and a new memory write read back. An older build ignores the
-v8 tables and routes.
+Rollback: a v8 build on a v9 `fleet.db` ignores the `owner_workspace_id`
+columns and keeps enforcing v8 visibility (null-workspace expert rows visible
+across workspaces); the DB stays valid for it, and rolling forward to v9
+rebuilds the records table (dropping the old CHECK), backfills both owners,
+and keeps every row, tag, link and version. Measured on the final v8 DDL. The
+0.10.0 dist was run on a copy of a v8 `fleet.db` holding every record type,
+tags, links, settings, both unique keys and a purged record. It started with 0
+error lines, `/team/v1/health` answered 200 with `schema: 7`, the operations
+routes answered 200, and a new operation write answered 201. Rolling forward to
+0.11.0 kept every memory row, tag, link, version and both operations, and a new
+memory write read back. An older build ignores the v8 tables and routes.
