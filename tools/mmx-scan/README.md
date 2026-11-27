@@ -55,7 +55,7 @@ measured (for back-filled days it postdates the day).
 Derived metrics (`compare`, `chart`): `correction_rate` = corrected/cards,
 `request_changes_per_pr`, `tokens_per_card` (input+output+cache write),
 `days_in_review`, `failed_run_rate` = (failed+blocked)/runs, `resume_rate`,
-`asks_per_run`, `mmx_share`, `memory_calls_per_run`.
+`asks_per_run`, `mmx_share`, `memory_calls_per_run`, `harness_edit_per_run`.
 
 ## Harness-edit records and the acceptance rule
 

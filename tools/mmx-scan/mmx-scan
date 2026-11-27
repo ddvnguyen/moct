@@ -756,6 +756,7 @@ METRICS = {
     "asks_per_run": (("asks",), ("completed",), True),
     "mmx_share": (("mmx_runs",), ("completed",), False),
     "memory_calls_per_run": (("memory_search", "memory_get", "memory_note"), ("completed",), False),
+    "harness_edit_per_run": (("harness_edit",), ("completed",), False),
 }
 
 
