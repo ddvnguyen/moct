@@ -395,6 +395,28 @@ The path, in order:
    `exit`, so an ERR-only rollback would miss every failure after the install
    step. The rollback happens before the script returns.
 
+   The rollback then **asserts what it restored** instead of trusting the
+   install: every patched target must be back in `node_modules` (a target that
+   was only a transitive dependency is not put back by pnpm), every manifest
+   package the snapshot's `package.json` depended on must be back, and
+   `dshmarket` must be the exact version that `package.json` pins (a range pin
+   cannot be compared and is skipped with a warning). A failed
+   assertion prints `FATAL: rollback left <target> missing from the profile`
+   or `FATAL: rollback restored dshmarket <got>, package.json pins <want>` and
+   leaves the deploy red.
+
+   `rollback done: the profile is back at the state of <backup dir>` is
+   printed **only** when those assertions hold, so its absence in a failed run
+   is itself a signal: the profile was not proven restored and must be repaired
+   by hand. Its presence means the restored package set was checked, not
+   assumed.
+
+   One failure never reaches the rollback: a manifest that still carries the
+   legacy single `patch` object stops the deploy before the profile is touched
+   with `manifest uses the legacy single 'patch' key — migrate it to
+   'patches[]'`. Fix the manifest to use `patches[]`; nothing was installed, so
+   there is nothing to roll back.
+
 The deploy's **stdout** is its data channel (the manifest and the packed
 packages are read back from it) and its **log** goes to stderr. Both streams
 show up in the CI log.
