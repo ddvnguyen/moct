@@ -64,6 +64,50 @@ Derived metrics (`compare`, `chart`): `correction_rate` = corrected/cards,
 `days_in_review`, `failed_run_rate` = (failed+blocked)/runs, `resume_rate`,
 `asks_per_run`, `mmx_share`, `memory_calls_per_run`, `harness_edit_per_run`.
 
+## SIM ledger, composite gate and rounds (M-612)
+
+The SIM record lives in Knowledge_Documents (`sim/`, same data repo as
+`mmx-harness`, because `moct` is public): `problems/P-<n>.json`, immutable
+attempt files `attempts/A-<round>-<n>.json`, one verdict file per judged attempt
+`attempts/A-<round>-<n>.verdict.json`, and the generated `INDEX.json`.
+Files are written once and never rewritten; a verdict is a new file, and a
+close is a `P-<n>.closed.json` marker. The problem→attempts link is derived by
+scanning attempt files (`problem_id`), so later attempts never rewrite a
+problem file.
+
+- `mmx-scan sim new-problem --sim DIR --name .. --root-cause .. [--round N]`
+- `mmx-scan sim new-attempt --sim DIR --round N --problem P-n --layer L4 --component mmx --what .. --rationale .. [...]`
+  — records the adoption time (all-agent rollout); refuses a second live
+  (unjudged) attempt on the same component.
+- `mmx-scan sim index --sim DIR` — regenerate `INDEX.json` (the only writer;
+  never hand-edited) and check ledger integrity.
+- `mmx-scan sim read --sim DIR` — proposer input: the index plus every open
+  problem with all its attempts, in full. Closed problems come through the
+  index only.
+- `mmx-scan gate --sim DIR --metrics DIR --attempt A-<r>-<n> [--start DAY] [--end DAY] [--write]`
+  — the composite gate as a calculation. Each of the three components
+  (`owner_corrections_per_card`, `tokens_per_card`, `days_in_review`) is a
+  z-score against the 14 days before adoption, weighted equally. Kept only if
+  the after window has ≥ 10 cards (cap: 14 days), the composite improves beyond
+  its bootstrap noise band, and no component regresses beyond its own band;
+  `rejected` the moment a component is worse beyond its band; otherwise
+  `inconclusive` (revert the edit from the snapshot, record the verdict, do
+  not re-propose without new evidence). Overlapping edits: per-agent composite
+  gains are reported alongside. `--write` stores the verdict file (immutable,
+  once). `Claude Architect adopts when the gate passes; the Owner gets a
+  native `ask` only when an edit changes the meaning of Owner directive text.
+- `mmx-scan rounds next [--runs N | --last-round-date DAY --round-no K] [--reset]`
+  — round 1 after 10 runs, rounds 2 and 3 one day later, round 4+ every 3 days;
+  a model/executor change resets the sequence.
+- `mmx-scan rounds arm --last-round-date DAY --round-no K [--issue CARD] [--reset]`
+  — self-arming: prints (or with `--issue`, creates) the issue wakeup that
+  starts the next round on the curator card. No new cron. At most 3 new edits
+  per round, at most one live edit per component.
+
+Seed problems: P1 no loop after a correction (M-604), P2 friction writing to
+memory (M-605), P3 cards reach `in_review` on the artifact alone (rule
+`mem_ca39eeae`).
+
 ## Harness-edit records and the acceptance rule
 
 One card per harness edit, `multica issue metadata set <card> --key K --value V`

@@ -165,5 +165,155 @@ for branch, push, want in [("integration", None, "checkout branch"), ("mmx-harne
     ok = want in got
     fail += not ok
     print(("ok  " if ok else "FAIL"), "nightly guard refuses", branch, push)
+# --- M-612: composite gate, rounds scheduler, SIM index rebuild ---------------
+import shutil
+import tempfile
+
+
+def grow(day, agent, cards, corrected, tok, done, din):
+    r = {k: 0 for k in mod.COUNT_KEYS}
+    r.update(date=day, agent=agent, agent_id=agent, cards_in_review=cards, corrected_cards=corrected,
+             tokens_input=tok, tokens_cache_write=tok // 4, done_cards=done,
+             days_in_review_sum=round(din, 3), runs=20, completed=18, failed=1)
+    return r
+
+
+def gate_rows(after_tok):
+    r2 = random.Random(3)
+    out = []
+    for d in days(14, "2026-11-01"):
+        out += [grow(d, "C", 3, r2.choice([1, 2]), 30000 + r2.randint(0, 4000), 2, 4.0 + r2.random() * 3),
+                grow(d, "K", 3, r2.choice([1, 2]), 30000 + r2.randint(0, 4000), 2, 4.0 + r2.random() * 3)]
+    for d in days(4, "2026-11-15"):
+        out += [grow(d, "C", 3, 0, after_tok, 3, 6.0), grow(d, "K", 3, 0, after_tok, 3, 6.0)]
+    return out
+
+
+# Clear win on all three components -> kept, with per-agent gains reported.
+j = mod.gate_judge(gate_rows(22000), "2026-11-15", "2026-11-18")
+ok = j["verdict"] == "kept" and all(v is not None for v in j["per_agent_gain"].values())
+fail += not ok
+print(("ok  " if ok else "FAIL"), "gate: clear win kept",
+      round(j["composite_gain"], 2), round(j["composite_band"], 2), j["verdict"])
+
+# Composite improves but tokens regress beyond their band -> rejected (non-compensatory).
+j = mod.gate_judge(gate_rows(90000), "2026-11-15", "2026-11-18")
+ok = j["verdict"] == "rejected" and any("tokens_per_card" in r for r in j["reasons"])
+fail += not ok
+print(("ok  " if ok else "FAIL"), "gate: one component regresses -> rejected",
+      j["verdict"], j["reasons"] if not ok else "")
+
+# Inside the noise at the cap -> inconclusive (edit reverted, verdict recorded).
+j = mod.gate_judge(gate_rows(22000), "2026-11-15", "2026-11-18", min_cards=1000)
+ok = j["verdict"] == "inconclusive"
+fail += not ok
+print(("ok  " if ok else "FAIL"), "gate: too few cards -> inconclusive", j["verdict"])
+
+# Too few cards in a noisy window -> inconclusive, never kept.
+thin = [grow(d, "C", 1, r2, 30000, 0, 0.0) for d, r2 in zip(days(14, "2026-11-01"), [0, 1] * 7)]
+thin += [grow(d, "C", 1, 0, 30000, 0, 0.0) for d in days(4, "2026-11-15")]
+j = mod.gate_judge(thin, "2026-11-15", "2026-11-18")
+ok = j["verdict"] == "inconclusive"
+fail += not ok
+print(("ok  " if ok else "FAIL"), "gate: noise stays inconclusive", j["verdict"],
+      j["reasons"] if not ok else "")
+
+# Scheduler: 10 runs unlock round 1; then +1 day, +1 day, then every 3 days.
+class _A:
+    pass
+
+
+ok = mod.rounds_schedule(9) == [] and len(mod.rounds_schedule(10, "2026-11-28")) == 1
+fail += not ok
+print(("ok  " if ok else "FAIL"), "rounds: round 1 gates on 10 runs")
+ok = (mod.rounds_next("2026-11-28", 1) == "2026-11-29"
+      and mod.rounds_next("2026-11-29", 2) == "2026-11-30"
+      and mod.rounds_next("2026-11-30", 3) == "2026-12-03"
+      and mod.rounds_next("2026-12-03", 5) == "2026-12-06"
+      and mod.rounds_next("2026-12-03", 5, reset=True) == "2026-12-04")
+fail += not ok
+print(("ok  " if ok else "FAIL"), "rounds: +1d, +1d, then every 3d; reset restarts")
+
+# rounds arm: the printed wakeup command must re-parse to one --instruction argv
+# (regression: `cmd.split()` used to split the quoted instruction into pieces).
+import io
+from contextlib import redirect_stdout
+import shlex as _shlex
+
+
+class _A:
+    pass
+
+
+a = _A()
+a.last_round_date = "2026-11-28"
+a.round_no = 1
+a.reset = False
+a.issue = None
+buf = io.StringIO()
+with redirect_stdout(buf):
+    mod.rounds_arm(a)
+toks = _shlex.split(buf.getvalue().strip().splitlines()[0])
+ok = (toks[toks.index("--instruction") + 1].startswith("MMX round 2:")
+      and toks[toks.index("--at") + 1] == "2026-11-29T01:00:00Z"
+      and "--expires-in" not in toks and "--on-timeout" not in toks
+      and "--expires-at" not in toks)  # an `at` wakeup ends when it fires: no deadline flags
+fail += not ok
+print(("ok  " if ok else "FAIL"), "rounds arm: instruction survives argv round-trip, no deadline flags")
+# Index rebuild: derived linkage survives a fresh regeneration; live edit guard fires.
+tmp = tempfile.mkdtemp(prefix="mmx-sim-test-")
+simd = os.path.join(tmp, "sim")
+os.makedirs(os.path.join(simd, "problems"))
+
+
+def _mk_problem(name):
+    a = _A()
+    a.sim = simd
+    a.repo = None
+    a.sim_dir = "sim"
+    a.name = name
+    a.root_cause = "test"
+    a.round = 1
+    mod.sim_problem(a)
+
+
+_mk_problem("P one")
+_mk_problem("P two")
+os.remove(os.path.join(simd, "INDEX.json")) if os.path.exists(os.path.join(simd, "INDEX.json")) else None
+
+
+def _mk_attempt(prob, comp, rnd_no=1):
+    a = _A()
+    a.sim = simd
+    a.repo = None
+    a.problem = prob
+    a.round = rnd_no
+    a.layer = "L4"
+    a.component = comp
+    a.what = "w"
+    a.rationale = "r"
+    a.predicted_metric = "owner_corrections_per_card"
+    a.predicted_delta = -0.1
+    a.harness_commit = None
+    a.agent = a.executor = a.model = a.tier = None
+    a.card = "M-612"
+    mod.sim_attempt(a)
+
+
+_mk_attempt("P-1", "mmx")
+idx = mod.sim_index_data(simd)
+ok = (len(idx["problems"]) == 2 and len(idx["attempts"]) == 1
+      and idx["problems"][0]["attempt_ids"] == ["A-1-1"]
+      and idx["live_components"] == ["mmx"] and idx["open_problems"] == 2)
+fail += not ok
+print(("ok  " if ok else "FAIL"), "sim: index rebuild derives linkage, tracks live edits")
+try:
+    _mk_attempt("P-2", "mmx")  # second live edit on mmx must be refused
+    ok = False
+except SystemExit:
+    ok = True
+fail += not ok
+print(("ok  " if ok else "FAIL"), "sim: at most one live edit per component")
+shutil.rmtree(tmp, ignore_errors=True)
 
 sys.exit(1 if fail else 0)
