@@ -8,6 +8,8 @@ import importlib.util
 import os
 import sys
 
+sys.dont_write_bytecode = True  # keep __pycache__ out of the repo
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 loader = importlib.machinery.SourceFileLoader("mmx_scan", os.path.join(HERE, "mmx-scan"))
 spec = importlib.util.spec_from_loader("mmx_scan", loader)
