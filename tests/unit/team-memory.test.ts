@@ -55,6 +55,54 @@ async function makeWorld(): Promise<World> {
   return { root, repo, memory: team.memory, clock };
 }
 
+/**
+ * A v8-shaped legacy database: team_memory_records without the v9
+ * owner_workspace_id column, holding one null-workspace expert row
+ * (how_to_work was the only type that stored NULL). Runs the same migration
+ * statements TursoRepository.open applies to such a file: add the column and
+ * backfill the owner to the home expert, with no data loss. (A real
+ * close/reopen round-trip is not used: this Turso version drops
+ * uncheckpointed WAL rows on close.)
+ */
+async function makeV8World(): Promise<World> {
+  const root = mkdtempSync(path.join(tmpdir(), "moct-memory-v8-"));
+  dirs.push(root);
+  const dbPath = path.join(root, "fleet.db");
+  const repo = await TursoRepository.open(root, dbPath);
+  repos.push(repo);
+  const db = repo.teamDb();
+  const columns = (await db.all(`SELECT name FROM pragma_table_info('team_memory_records')`)).map((c) => String(c["name"]));
+  expect(columns).toContain("owner_workspace_id");
+  // Drop back to the v8 shape: rebuild without the column, then insert the
+  // legacy row the v8 store wrote (NULL workspace, no owner).
+  const kept = columns.filter((c) => c !== "owner_workspace_id");
+  await db.run(`CREATE TABLE team_memory_records_v8 AS SELECT ${kept.join(", ")} FROM team_memory_records`);
+  await db.run(`DROP TABLE team_memory_records`);
+  await db.run(`ALTER TABLE team_memory_records_v8 RENAME TO team_memory_records`);
+  await db.run(
+    `INSERT INTO team_memory_records(id, workspace_id, type, title, body, attrs, home_kind, home_ref, priority, pinned,
+       status, flag, supersedes, superseded_by, conflicts_with, task_ref, unique_key, author_kind, author_id,
+       created_at, updated_at, last_used_at, use_count, version)
+     VALUES ('mem_v8legacy', NULL, 'how_to_work', 'v8 habit', 'v8 habit — body', NULL, 'expert', 'member:alice',
+       60, 0, 'active', NULL, NULL, NULL, '[]', NULL, NULL, 'member', 'member:alice',
+       '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', NULL, 0, 1)`,
+  );
+  await db.run("INSERT INTO team_memory_tags(record_id, kind, ref) VALUES ('mem_v8legacy', 'expert', 'member:alice')");
+  // The v9 migration, exactly as TursoRepository.open runs it for a file
+  // whose meta has no schema_version:9 row yet.
+  await db.run(`ALTER TABLE team_memory_records ADD COLUMN owner_workspace_id TEXT`);
+  await db.run(
+    `UPDATE team_memory_records SET owner_workspace_id = home_ref
+     WHERE home_kind = 'expert' AND workspace_id IS NULL AND owner_workspace_id IS NULL`,
+  );
+  const after = (await db.all(`SELECT name FROM pragma_table_info('team_memory_records')`)).map((c) => String(c["name"]));
+  expect(after).toContain("owner_workspace_id");
+  const clock = { t: Date.parse("2026-10-01T00:00:00Z") };
+  const team = new TeamRoomStore(repo.teamDb(), dbPath, null, () => new Date(clock.t));
+  await team.memory.updateSettings({ orchestrators: [LEAD.id, ARCH.id], actor: HUMAN });
+  return { root, repo, memory: team.memory, clock };
+}
+
 async function refusal(promise: Promise<unknown>): Promise<MemoryError> {
   try {
     await promise;
@@ -182,7 +230,7 @@ describe("team memory — types, homes and validation", () => {
     );
     expect(b.uniqueKey).toBe("branch:ddvnguyen/moct#feat/team-memory-v8");
     const how = await write(memory, howTo("I review diffs before tests", ALICE), ALICE);
-    expect(how.workspaceId).toBeNull();
+    expect(how.workspaceId).toBe(WS);
   });
 });
 
@@ -232,6 +280,116 @@ describe("team memory — visibility", () => {
     expect(page.total).toBe(2);
     expect(page.nextCursor).toBe("1");
     expect((await memory.search({ scope: scope(ALICE), limit: 1, cursor: page.nextCursor })).nextCursor).toBeNull();
+  });
+});
+describe("team memory — workspace containment (M-546)", () => {
+  interface ScopeWs {
+    workspaceId: string;
+    expertId: string;
+    channels?: string[];
+    tasks?: string[];
+    all?: boolean;
+  }
+  const scopeWs = (workspaceId: string, expert: MemoryActor, extra: { channels?: string[]; tasks?: string[]; all?: boolean } = {}): ScopeWs => ({
+    workspaceId,
+    expertId: expert.id,
+    ...extra,
+  });
+  const other = (title: string): Input => ({ ...howTo(title, ALICE), workspaceId: "ws-2" });
+
+  it("stamps the workspace on expert-home writes", async () => {
+    const { memory } = await makeWorld();
+    expect((await write(memory, howTo("alice habit", ALICE), HUMAN)).workspaceId).toBe(WS);
+  });
+
+  it("keeps one expert's stamped memory out of another workspace", async () => {
+    const { memory } = await makeWorld();
+    const mine = await write(memory, howTo("alice habit", ALICE), HUMAN);
+    const theirs = await write(memory, other("alice other habit"), HUMAN);
+
+    const ids = async (s: ScopeWs) => (await memory.search({ scope: s, limit: 20 })).results.map((r) => r.id).sort();
+    expect(await ids(scopeWs(WS, ALICE))).toEqual([mine.id]);
+    expect(await ids(scopeWs("ws-2", ALICE))).toEqual([theirs.id]);
+    expect(await ids(scopeWs(WS, BOB))).toEqual([]);
+    // Orchestrator scope stays inside its own workspace.
+    expect(await ids(scopeWs(WS, LEAD, { all: true }))).toEqual([mine.id]);
+    expect(await ids(scopeWs("ws-2", LEAD, { all: true }))).toEqual([theirs.id]);
+
+    // getMany answers a foreign-workspace id as missing, never as a record.
+    const cross = await memory.getMany([mine.id], scopeWs("ws-2", ALICE));
+    expect(cross.records).toEqual([]);
+    expect(cross.missing).toEqual([mine.id]);
+
+    // inject loads the expert bucket of this workspace only.
+    const here = await memory.inject({ expertId: ALICE.id, workspaceId: WS });
+    const there = await memory.inject({ expertId: ALICE.id, workspaceId: "ws-2" });
+    expect(here.entries.map((e) => e.id)).toEqual([mine.id]);
+    expect(there.entries.map((e) => e.id)).toEqual([theirs.id]);
+
+    // A scoped versions check sees the home workspace and nothing else.
+    expect(await memory.visible(mine.id, scopeWs(WS, ALICE))).toBe(true);
+    expect(await memory.visible(mine.id, scopeWs("ws-2", ALICE))).toBe(false);
+    expect(await memory.visible(mine.id, scopeWs(WS, BOB))).toBe(false);
+  });
+
+  it("confines legacy null-workspace rows to their owning expert", async () => {
+    const { memory, repo } = await makeWorld();
+    const db = repo.teamDb();
+    const at = "2026-10-01T00:00:00.000Z";
+    await db.run(
+      `INSERT INTO team_memory_records(id, workspace_id, owner_workspace_id, type, title, body, attrs, home_kind, home_ref, priority, pinned,
+         status, flag, supersedes, superseded_by, conflicts_with, task_ref, unique_key, author_kind, author_id,
+         created_at, updated_at, last_used_at, use_count, version)
+       VALUES (?, NULL, ?, 'how_to_work', ?, ?, NULL, 'expert', ?, 60, 0, 'active', NULL, NULL, NULL, '[]', NULL, NULL,
+         'member', ?, ?, ?, NULL, 0, 1)`,
+      "mem_legacy",
+      ALICE.id,
+      "legacy habit",
+      "legacy habit — body",
+      ALICE.id,
+      ALICE.id,
+      at,
+      at,
+    );
+    await db.run("INSERT INTO team_memory_tags(record_id, kind, ref) VALUES (?, 'expert', ?)", "mem_legacy", ALICE.id);
+
+    const ids = async (s: ScopeWs) => (await memory.search({ scope: s, limit: 20 })).results.map((r) => r.id);
+    // The owning expert still sees its legacy row, in any workspace; nobody else does.
+    expect(await ids(scopeWs(WS, ALICE))).toEqual(["mem_legacy"]);
+    expect(await ids(scopeWs("ws-2", ALICE))).toEqual(["mem_legacy"]);
+    expect(await ids(scopeWs(WS, BOB))).toEqual([]);
+    // Even the orchestrator scope no longer leaks it across experts.
+    expect(await ids(scopeWs(WS, LEAD, { all: true }))).toEqual([]);
+    expect(await memory.visible("mem_legacy", scopeWs(WS, BOB))).toBe(false);
+  });
+
+  it("migrates a v8 database to v9, scoping its legacy row to the owning expert", async () => {
+    const { memory } = await makeV8World();
+    const ids = async (s: ScopeWs) => (await memory.search({ scope: s, limit: 20 })).results.map((r) => r.id);
+    // The owning expert keeps its row in any workspace; nobody else sees it.
+    expect(await ids(scopeWs(WS, ALICE))).toEqual(["mem_v8legacy"]);
+    expect(await ids(scopeWs("ws-2", ALICE))).toEqual(["mem_v8legacy"]);
+    expect(await ids(scopeWs(WS, BOB))).toEqual([]);
+    // New writes in the reopened database are stamped.
+    expect((await write(memory, howTo("stamped after migrate", ALICE), HUMAN)).workspaceId).toBe(WS);
+  });
+
+  it("dedupes near matches inside one workspace, not across them", async () => {
+    const { memory } = await makeWorld();
+    await write(memory, howTo("alice habit", ALICE), HUMAN);
+    const again = await note(memory, other("alice habit"), HUMAN);
+    expect(again.record?.workspaceId).toBe("ws-2");
+  });
+
+  it("scopes the expert always-load budget to the requesting workspace", async () => {
+    const { memory } = await makeWorld();
+    const mine = await write(memory, howTo("squash before merging", ALICE), HUMAN);
+    await memory.patch(mine.id, { baseVersion: 1, actor: HUMAN, pinned: true });
+    const usage = await memory.usage(WS);
+    expect(usage.homes.find((h) => h.home.kind === "expert")?.largest.map((c) => c.id)).toEqual([mine.id]);
+    expect(await memory.usage("ws-other")).toEqual(
+      expect.objectContaining({ workspaceId: "ws-other", homes: [] }),
+    );
   });
 });
 
@@ -624,7 +782,7 @@ describe("team memory — usage", () => {
     expect(b.homes.find((h) => h.home.ref === CH)?.blockedPending).toBe(1);
   });
 
-  it("lists an expert home in every Workspace, since how_to_work belongs to none", async () => {
+  it("scopes an expert home to its workspace, like every other home", async () => {
     const { memory } = await makeWorld();
     const mine = await write(memory, howTo("squash before merging", ALICE), ALICE);
     await memory.approve(mine.id, { baseVersion: 1, actor: HUMAN });
@@ -637,9 +795,9 @@ describe("team memory — usage", () => {
     expect(expert.home).toEqual({ kind: "expert", ref: ALICE.id });
     expect(expert.records).toBe(2);
     expect(expert.largest.every((c) => c.pinned)).toBe(true);
-    expect(mine.workspaceId).toBeNull();
-    // Another Workspace sees the same expert home and no team, channel or task home.
-    expect((await memory.usage("ws-other")).homes).toEqual([expert]);
+    expect(mine.workspaceId).toBe(WS);
+    // Another Workspace sees none of this workspace's expert memory.
+    expect((await memory.usage("ws-other")).homes).toEqual([]);
     expect((await refusal(memory.usage(""))).code).toBe("INVALID_SCOPE");
   });
 });
@@ -661,11 +819,11 @@ describe("team memory — HTTP surface", () => {
     expect(((await search.json()) as { total: number }).total).toBe(1);
     const got = await h.request(`/team/v1/memory/get?workspaceId=${WS}&expertId=${BOB.id}`, json("POST", { ids: [record.id] }));
     expect(await got.json()).toMatchObject({ records: [], missing: [record.id] });
-    const patched = await h.request(`/team/v1/memory/${record.id}`, json("PATCH", { baseVersion: 1, body: "revised", actor: ALICE }));
+    const patched = await h.request(`/team/v1/memory/${record.id}?workspaceId=${WS}`, json("PATCH", { baseVersion: 1, body: "revised", actor: ALICE }));
     expect(patched.status).toBe(200);
-    const widened = await h.request(`/team/v1/memory/${record.id}/widen`, json("POST", { to: homes.team, baseVersion: 2, actor: LEAD }));
+    const widened = await h.request(`/team/v1/memory/${record.id}/widen?workspaceId=${WS}`, json("POST", { to: homes.team, baseVersion: 2, actor: LEAD }));
     expect(await widened.json()).toMatchObject({ home: homes.team, version: 3 });
-    const versions = (await (await h.get(`/team/v1/memory/${record.id}/versions`)).json()) as { versions: unknown[] };
+    const versions = (await (await h.get(`/team/v1/memory/${record.id}/versions?workspaceId=${WS}`)).json()) as { versions: unknown[] };
     expect(versions.versions).toHaveLength(3);
   });
 
@@ -674,7 +832,7 @@ describe("team memory — HTTP surface", () => {
     const secret = await h.request("/team/v1/memory", json("POST", { ...convention(`sk-${"a1B2".repeat(8)}`), actor: ALICE }));
     expect(secret.status).toBe(422);
     expect(await secret.json()).toMatchObject({ ok: false, code: "SECRET_DETECTED" });
-    const purge = await h.request("/team/v1/memory/mem_x/purge", json("POST", { actor: ALICE }));
+    const purge = await h.request(`/team/v1/memory/mem_x/purge?workspaceId=${WS}`, json("POST", { actor: ALICE }));
     expect(await purge.json()).toMatchObject({ code: "HUMAN_ONLY" });
     const workerTask = await h.request("/team/v1/memory", json("POST", { ...task(), actor: ALICE }));
     expect(workerTask.status).toBe(403);

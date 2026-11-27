@@ -235,6 +235,33 @@ export class TursoRepository implements Store {
       /* best-effort */
     }
     await repo.db.exec(FLEET_SCHEMA_SQL);
+    // v9 migration: v8 tables have no owner_workspace_id column and keep NULL
+    // workspace_id on expert-home rows. FLEET_SCHEMA_SQL cannot ALTER (it runs
+    // on every open and ALTER is not re-runnable), so try the ADD COLUMN here
+    // and keep going when the column is already there, then backfill legacy
+    // NULL-workspace expert rows — records and their versions — to their home
+    // expert. The workspace those writes were sent with was never stored, so
+    // the requester cannot be recovered; the owning expert is the only safe
+    // scope. New tables already carry the column (ALTER is a caught no-op)
+    // and match zero backfill rows. The existence check is a blind ALTER, not
+    // a pragma_table_info query: on this Turso version a table-valued pragma
+    // SELECT poisons the connection for later readers of the same file.
+    for (const table of ["team_memory_records", "team_memory_versions"]) {
+      try {
+        await repo.db.exec(`ALTER TABLE ${table} ADD COLUMN owner_workspace_id TEXT`);
+      } catch (exc) {
+        if (!/duplicate column/i.test((exc as Error)?.message ?? String(exc))) throw exc;
+        // Column already there (a v9 table): nothing to do.
+      }
+    }
+    await repo.db.exec(
+      `UPDATE team_memory_records SET owner_workspace_id = home_ref
+       WHERE home_kind = 'expert' AND workspace_id IS NULL AND owner_workspace_id IS NULL`,
+    );
+    await repo.db.exec(
+      `UPDATE team_memory_versions SET owner_workspace_id = home_ref
+       WHERE home_kind = 'expert' AND workspace_id IS NULL AND owner_workspace_id IS NULL`,
+    );
     // Record every applied schema version (idempotent, one meta row each).
     // FLEET_SCHEMA_SQL is CREATE TABLE IF NOT EXISTS, so opening a fleet.db
     // written by an older build applies the newer tables in place; stamping
@@ -250,7 +277,6 @@ export class TursoRepository implements Store {
     }
     return repo;
   }
-
   /**
    * The Team Room seam (contract §2). Every statement goes through this
    * repository's connection; writes are wrapped in lock() by the caller.
