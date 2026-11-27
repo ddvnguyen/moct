@@ -97,6 +97,12 @@ for name, want in [("owner correction -> builder", ("owner_correction", "BUILDER
     ok = want in ev
     fail += not ok
     print(("ok  " if ok else "FAIL"), name, ev if not ok else "")
+ev2 = [k for k, _a, _b, _x in mod.card_events(
+    tl[:3] + [dict(cm(1, "Addressed the review: REQUEST_CHANGES fixed", "agent"), actor_id="BUILDER")],
+    D, D + timedelta(days=1), None)]
+ok = "request_changes" not in ev2
+fail += not ok
+print(("ok  " if ok else "FAIL"), "builder quoting REQUEST_CHANGES is not a verdict")
 ok = sum(1 for k, _ in ev if k == "request_changes") == 1
 fail += not ok
 print(("ok  " if ok else "FAIL"), "REQUEST_CHANGES listed as a signal is not a verdict")
@@ -145,5 +151,19 @@ e2 = mod.evaluate(rows2, "correction_rate", ["C"], "2026-11-15")
 ok = abs(e2["effect"]) <= e2["delta"]
 fail += not ok
 print(("ok  " if ok else "FAIL"), "compare: noise stays inside δ", round(e2["effect"], 3), round(e2["delta"], 3))
+
+import subprocess as sp
+import tempfile
+for branch, push, want in [("integration", None, "checkout branch"), ("mmx-harness", "master", "--push target")]:
+    with tempfile.TemporaryDirectory(dir=HERE) as d:
+        sp.run(["git", "init", "-q", "-b", branch, d], check=True)
+        try:
+            mod.guard_destination(d, push)
+            got = ""
+        except SystemExit as ex:
+            got = str(ex)
+    ok = want in got
+    fail += not ok
+    print(("ok  " if ok else "FAIL"), "nightly guard refuses", branch, push)
 
 sys.exit(1 if fail else 0)

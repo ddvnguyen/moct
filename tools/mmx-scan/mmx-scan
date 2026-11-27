@@ -506,7 +506,8 @@ def card_events(tl, since, until, assignee):
             body = e.get("content") or ""
             if e.get("actor_type") == "member" and status in DELIVERED and OWNER_CORRECTION_RE.search(body):
                 yield "owner_correction", at, b, None
-            elif e.get("actor_type") == "agent" and RC_VERDICT_RE.search(body[:600]):
+            elif e.get("actor_type") == "agent" and e.get("actor_id") != b and \
+                    RC_VERDICT_RE.search(body[:600]):  # the builder quoting the verdict is not one
                 yield "request_changes", at, b, None
 
 
@@ -717,8 +718,27 @@ def commit_if_changed(repo, path, msg):
     return True
 
 
+PROTECTED_BRANCHES = {"integration", "master", "main", "stable"}
+
+
+def guard_destination(repo, push):
+    """Data never lands on a code branch or in a public repo (M-608 review, Owner decision)."""
+    cur = git(repo, "symbolic-ref", "--short", "-q", "HEAD", check=False)
+    for name, what in ((cur, "checkout branch"), (push, "--push target")):
+        if name and name in PROTECTED_BRANCHES:
+            sys.exit(f"mmx-scan: refusing: {what} is `{name}`; MMX data goes to a data branch (e.g. mmx-harness)")
+    if push:
+        url = git(repo, "remote", "get-url", "origin")
+        p = subprocess.run(["gh", "repo", "view", url, "--json", "isPrivate", "-q", ".isPrivate"],
+                           capture_output=True, text=True)
+        if p.stdout.strip() != "true":
+            sys.exit(f"mmx-scan: refusing to push: origin {url} is not a private repo "
+                     f"(the export holds agent instructions and Workspace Context)")
+
+
 def nightly(a):
     """Export the incumbent, commit it, then snapshot each missing day against that commit."""
+    guard_destination(a.repo, a.push)
     repo, base = a.repo, os.path.join(a.repo, a.dir)
     inc, met = os.path.join(base, "incumbent"), os.path.join(base, "metrics")
     today = datetime.now(timezone.utc).date()
