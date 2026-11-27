@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""mmx-scan — M-606: read-only data feed for the MMX self-improvement loop.
+"""mmx-scan — M-606/M-608: data feed and measurement for the MMX self-improvement loop.
 
-Two modes, both read-only (they never change issues, comments, memory or
-agents; acting on the output is the curator agent's job):
+All modes are read-only on Multica and MOCT (they never change issues,
+comments, memory or agents; acting on the output is the curator agent's job).
+`nightly` writes only to the git checkout it is given. M-608 modes
+(snapshot, export, nightly, compare, chart) are documented in README.md.
+The two M-606 modes:
 
   mmx-scan baseline [--days 7] [--markdown]
       Weekly baseline over `multica issue run-messages` (M-571 metric):
@@ -41,6 +44,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -62,6 +66,8 @@ HE_RE = re.compile(r"(?:^|\n)[\s>*`#-]*Harness edit:(?!\s*<layer>)")
 MMX_SHELL_RE = re.compile(r"\b(?:cat|sed|head|less|more|bat|Get-Content|type)\b[^|;&\n]*mmx/SKILL\.md")
 SHELL_TOOLS = {"bash", "shell", "exec_command", "run_shell_command", "powershell", "eval"}
 CURSOR_RE = re.compile(r'--before "([^"]+)"')
+# Native Owner question card (`ask` on the multica MCP server).
+ASK_RE = re.compile(r"(?:^|__)ask$")
 
 
 def ts(s):
@@ -138,7 +144,7 @@ def scan_messages(run_id):
     if isinstance(msgs, dict):
         msgs = msgs.get("messages", [])
     r = {"mmx": 0, "memory_search": 0, "memory_get": 0, "memory_note": 0,
-         "harness_edit": 0, "notes": [], "ok": msgs is not None}
+         "harness_edit": 0, "ask": 0, "notes": [], "ok": msgs is not None}
     for m in msgs or []:
         t = m.get("type")
         tool = str(m.get("tool") or "")
@@ -153,6 +159,8 @@ def scan_messages(run_id):
                 except AttributeError:
                     pass
             tl = tool.lower()
+            if ASK_RE.search(tl):
+                r["ask"] += 1
             shell = tl in SHELL_TOOLS
             if (tl == "skill" and re.search(r"(?<![\w-])mmx(?![\w-])", inp)) or \
                     (shell and MMX_SHELL_RE.search(inp)) or \
@@ -399,6 +407,520 @@ def render_signals(o):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# M-608: measurement half — snapshot, export, nightly, compare, chart.
+# Metric lines store COUNTS (numerators and denominators), never ratios, so any
+# window can be re-aggregated exactly. Ratios are computed in `compare`/`chart`.
+# ---------------------------------------------------------------------------
+
+SCHEMA = 1
+WORKSPACE_ROW = "_workspace"
+RESUME_RE = re.compile(r"no live run and no live wakeup\. Resume the task now")
+# Owner comment that corrects delivered work ("no, do X"). Heuristic; only
+# counted while the card sits in agent_review_deploy/in_review/done.
+OWNER_CORRECTION_RE = re.compile(
+    r"(?:^|[\s>*])(?:no[,.!]|not what|wrong|instead\b|why (?:did|is|was|do|does)\b|how\?|"
+    r"should not\b|shouldn'?t\b|don'?t\b|do not\b|stop\b|revert\b|reopen|that'?s not|this is not|"
+    r"it not\b|isn'?t (?:done|working|right)|still (?:broken|wrong|not))", re.I)
+DELIVERED = {"agent_review_deploy", "in_review", "done"}
+# A review VERDICT of REQUEST_CHANGES, not a comment that lists it as a signal.
+RC_VERDICT_RE = re.compile(r"\b(?:verdict|review)\b[^\n]{0,80}?\bREQUEST_CHANGES\b|"
+                           r"(?:^|\n)[\s>*#_`]*REQUEST_CHANGES\b", re.I)
+COUNT_KEYS = (
+    # quality (cards are attributed to the agent that delivered them, see builder())
+    "cards_in_review", "corrected_cards", "reopens", "owner_correction_comments", "sent_back",
+    "request_changes", "prs_opened", "done_cards", "days_in_review_sum",
+    "tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_write",
+    # runs
+    "runs", "completed", "failed", "blocked", "cancelled", "resumes", "curator_runs",
+    "mmx_runs", "memory_search", "memory_get", "memory_note", "harness_edit", "asks",
+    "unreadable_runs",
+)
+HE_KEYS = ("component", "layer", "hypothesis", "target_metric", "guard_metrics", "baseline",
+           "canary_agents", "window", "result", "verdict", "tokens_added")
+# Secret-shaped strings are redacted before anything is written to disk.
+SECRET_RE = re.compile(
+    r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|"
+    r"xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"(?i:(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*['\"]?[^\s'\"]{8,}))")
+
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+
+
+def day_bounds(day):
+    since = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+    return since, since + timedelta(days=1)
+
+
+def issues_touched_since(since, until):
+    out, off = [], 0
+    while True:
+        page, _ = cli(["issue", "list", "--updated-since", since.isoformat(timespec="seconds"),
+                       "--updated-until", until.isoformat(timespec="seconds"),
+                       "--limit", "100", "--offset", str(off), "--output", "json",
+                       "--fields", "id,identifier,title,status,assignee_type,assignee_id"])
+        batch = page.get("issues", []) if isinstance(page, dict) else page
+        out += batch
+        if not (isinstance(page, dict) and page.get("has_more")) or not batch:
+            return out
+        off += len(batch)
+
+
+def card_events(tl, since, until, assignee):
+    """Replay one card's timeline; yield (kind, at, builder_agent_id, extra) for [since, until).
+
+    builder = the agent that last moved the card FORWARD out of a working
+    state (todo/planing_2/in_progress) into a delivered state — the agent whose
+    delivery a later correction judges. Falls back to the current assignee.
+    """
+    events = sorted(tl, key=lambda e: e.get("created_at") or "")
+    status, builder, entered_review = None, None, None
+    for e in events:
+        at = ts(e.get("created_at"))
+        if not at:
+            continue
+        inside = since <= at < until
+        b = builder or assignee
+        if e.get("type") == "activity" and e.get("action") == "status_changed":
+            d = e.get("details") or {}
+            f, t = d.get("from"), d.get("to")
+            if f in RANK and t in RANK and RANK[t] > RANK[f] and t in DELIVERED and \
+                    RANK[f] <= RANK["in_progress"] and e.get("actor_type") == "agent":
+                builder = e.get("actor_id")
+                b = builder
+            if inside:
+                if t == "in_review" and f != "in_review":
+                    yield "in_review", at, b, None
+                if t == "done" and entered_review:
+                    yield "done", at, b, (at - entered_review).total_seconds() / 86400
+                if f in ("in_review", "done") and t in RANK and RANK[t] < RANK[f]:
+                    yield "reopen", at, b, None
+                elif f in RANK and t in RANK and RANK[t] < RANK[f]:
+                    yield "sent_back", at, b, None
+            if t == "in_review":
+                entered_review = at
+            status = t
+        elif e.get("type") == "comment" and inside:
+            body = e.get("content") or ""
+            if e.get("actor_type") == "member" and status in DELIVERED and OWNER_CORRECTION_RE.search(body):
+                yield "owner_correction", at, b, None
+            elif e.get("actor_type") == "agent" and RC_VERDICT_RE.search(body[:600]):
+                yield "request_changes", at, b, None
+
+
+def usage_tokens(issue_id):
+    u, _ = cli(["issue", "usage", issue_id, "--output", "json"], allow_fail=True)
+    u = u or {}
+    return {"tokens_input": u.get("total_input_tokens", 0), "tokens_output": u.get("total_output_tokens", 0),
+            "tokens_cache_read": u.get("total_cache_read_tokens", 0),
+            "tokens_cache_write": u.get("total_cache_write_tokens", 0)}
+
+
+def prs_opened(day, slugs):
+    """PRs created on `day` in the workspace repos, attributed by head branch `agent/<slug>/`."""
+    ws, _ = cli(["workspace", "get", "--output", "json"], allow_fail=True)
+    repos = [r["url"].rstrip("/").split("github.com/")[-1] for r in (ws or {}).get("repos", [])]
+    out = Counter()
+    for repo in repos:
+        p = subprocess.run(["gh", "pr", "list", "-R", repo, "--state", "all", "--limit", "200",
+                            "--search", f"created:{day}", "--json", "headRefName"],
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            continue
+        for pr in json.loads(p.stdout or "[]"):
+            m = re.match(r"agent/([^/]+)/", pr.get("headRefName", ""))
+            if m and m.group(1) in slugs:
+                out[slugs[m.group(1)]] += 1
+    return out
+
+
+def snapshot_day(day, harness_commit=None, curator_agent=CURATOR_AGENT):
+    """One dict per agent with activity on `day` (UTC), plus a `_workspace` row."""
+    since, until = day_bounds(day)
+    names, runs = all_runs(since, until)
+    rows = defaultdict(Counter)
+    terminal = [t for t in runs if t["status"] in TERMINAL]
+    with ThreadPoolExecutor(8) as ex:
+        scans = dict(zip([t["id"] for t in terminal], ex.map(scan_messages, [t["id"] for t in terminal])))
+    for t in runs:
+        c = rows[t["agent_id"]]
+        c["runs"] += 1
+        if t["status"] in ("completed", "failed", "blocked", "cancelled"):
+            c[t["status"]] += 1
+        if RESUME_RE.search((t.get("handoff_note") or "") + (t.get("trigger_summary") or "")):
+            c["resumes"] += 1
+        if t["agent_id"] == curator_agent and t.get("kind") == "autopilot":
+            c["curator_runs"] += 1
+            continue  # the loop must not inflate its own usage metrics
+        r = scans.get(t["id"])
+        if not r:
+            continue
+        c["unreadable_runs"] += not r["ok"]
+        c["mmx_runs"] += bool(r["mmx"]) and t["status"] == "completed"
+        for k in ("memory_search", "memory_get", "memory_note", "harness_edit"):
+            c[k] += r[k]
+        c["asks"] += r["ask"]
+    issues = issues_touched_since(since, datetime.now(timezone.utc))
+    with ThreadPoolExecutor(8) as ex:
+        tls = dict(zip([i["id"] for i in issues], ex.map(timeline, [i["id"] for i in issues])))
+    review_cards, corrected = defaultdict(set), defaultdict(set)
+    for i in issues:
+        assignee = i.get("assignee_id") if i.get("assignee_type") == "agent" else None
+        for kind, _at, b, extra in card_events(tls[i["id"]], since, until, assignee):
+            if not b:
+                continue
+            c = rows[b]
+            if kind == "in_review":
+                review_cards[b].add(i["id"])
+            elif kind == "done":
+                c["done_cards"] += 1
+                c["days_in_review_sum"] += round(extra, 3)
+            elif kind == "reopen":
+                c["reopens"] += 1
+                corrected[b].add(i["id"])
+            elif kind == "owner_correction":
+                c["owner_correction_comments"] += 1
+                corrected[b].add(i["id"])
+            elif kind in ("sent_back", "request_changes"):
+                c[kind] += 1
+    for b, cards in review_cards.items():
+        rows[b]["cards_in_review"] += len(cards)
+        with ThreadPoolExecutor(8) as ex:
+            for u in ex.map(usage_tokens, list(cards)):
+                rows[b].update(u)
+    for b, cards in corrected.items():
+        rows[b]["corrected_cards"] += len(cards)
+    for b, n in prs_opened(day, {slug(v): k for k, v in names.items()}).items():
+        rows[b]["prs_opened"] += n
+    team = moct_records("active", ["convention", "rule"], ["team"])
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    base = {"schema": SCHEMA, "date": day, "harness_commit": harness_commit, "measured_at": now}
+    out = []
+    tot = Counter()
+    for aid in sorted(rows, key=lambda a: names.get(a, a)):
+        c = rows[aid]
+        tot.update(c)
+        out.append({**base, "agent_id": aid, "agent": names.get(aid, aid[:8]),
+                    **{k: c.get(k, 0) for k in COUNT_KEYS}})
+    out.append({**base, "agent_id": None, "agent": WORKSPACE_ROW, **{k: tot.get(k, 0) for k in COUNT_KEYS},
+                "active_team_rules": None if isinstance(team, dict) else len(team),
+                "active_team_rules_as_of": now})
+    return out
+
+
+def write_jsonl(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def snapshot(a):
+    rows = snapshot_day(a.date, a.harness_commit, a.curator_agent)
+    if a.out:
+        path = os.path.join(a.out, f"{a.date}.jsonl")
+        write_jsonl(path, rows)
+        print(f"mmx-scan: wrote {len(rows)} rows to {path}", file=sys.stderr)
+    else:
+        for r in rows:
+            print(json.dumps(r, sort_keys=True, ensure_ascii=False))
+
+
+# --- incumbent export -------------------------------------------------------
+
+def redact(text):
+    return SECRET_RE.sub("[REDACTED]", text or "")
+
+
+def _write(root, rel, text):
+    p = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        f.write(redact(text).rstrip("\n") + "\n")
+
+
+def export(a):
+    """Write the portable harness (L1, L3, L4 + autopilot prompts) as plain files.
+
+    Deterministic output, so an unchanged harness produces no git diff. Agent
+    env, args and MCP config are never exported; secret-shaped strings are
+    redacted. The tree is rebuilt from scratch so deletions show up as diffs.
+    """
+    root = a.out
+    for sub in ("skills", "agents", "workspace", "autopilots"):
+        shutil.rmtree(os.path.join(root, sub), ignore_errors=True)
+    ws, _ = cli(["workspace", "get", "--output", "json"])
+    _write(root, "workspace/context.md", ws.get("context") or "")
+    skills, _ = cli(["skill", "list", "--output", "json"])
+    for s in sorted(skills, key=lambda x: x["name"]):
+        d, _ = cli(["skill", "get", s["id"], "--with-content", "--output", "json"])
+        base = f"skills/{slug(d['name'])}"
+        _write(root, f"{base}/SKILL.md", d.get("content") or "")
+        for f in d.get("files") or []:
+            rel = os.path.normpath(f.get("path") or "")
+            if rel and not rel.startswith("..") and not os.path.isabs(rel) and f.get("content") is not None:
+                _write(root, f"{base}/{rel}", f["content"])
+        _write(root, f"{base}/meta.json", json.dumps(
+            {"id": d["id"], "name": d["name"], "description": d.get("description"),
+             "updated_at": d.get("updated_at")}, indent=1, sort_keys=True))
+    skill_names = {s["id"]: s["name"] for s in skills}
+    for ag in sorted(agents_full(), key=lambda x: x["name"]):
+        base = f"agents/{slug(ag['name'])}"
+        _write(root, f"{base}/instructions.md", ag.get("instructions") or "")
+        meta = {k: ag.get(k) for k in ("id", "name", "description", "model", "role", "subtype",
+                                       "implements_role_id", "runtime_mode", "thinking_level",
+                                       "max_concurrent_tasks", "use_tiers", "tier_ids", "updated_at")}
+        meta["skills"] = sorted(skill_names.get(x.get("id") if isinstance(x, dict) else x,
+                                                (x.get("name") if isinstance(x, dict) else x))
+                                for x in ag.get("skills") or [])
+        _write(root, f"{base}/meta.json", json.dumps(meta, indent=1, sort_keys=True))
+    aps, _ = cli(["autopilot", "list", "--output", "json"], allow_fail=True)
+    aps = aps if isinstance(aps, list) else (aps or {}).get("autopilots", [])
+    for ap in sorted(aps, key=lambda x: x.get("title") or ""):
+        d, _ = cli(["autopilot", "get", ap["id"], "--output", "json"], allow_fail=True)
+        if not d:
+            continue
+        p = d.get("autopilot", d)
+        base = f"autopilots/{slug(p.get('title'))}"
+        _write(root, f"{base}/prompt.md", p.get("description") or "")
+        _write(root, f"{base}/meta.json", json.dumps(
+            {"id": p.get("id"), "title": p.get("title"), "assignee_id": p.get("assignee_id"),
+             "status": p.get("status"), "execution_mode": p.get("execution_mode"),
+             "triggers": [{k: t.get(k) for k in ("kind", "cron_expression", "timezone", "enabled")}
+                          for t in d.get("triggers") or []]}, indent=1, sort_keys=True))
+    print(f"mmx-scan: exported harness to {root}", file=sys.stderr)
+
+
+def agents_full():
+    lst, _ = cli(["agent", "list", "--output", "json"])
+    with ThreadPoolExecutor(8) as ex:
+        return [d for d, _ in ex.map(lambda a: cli(["agent", "get", a["id"], "--output", "json"]), lst)]
+
+
+# --- nightly: export + snapshot + commit ------------------------------------
+
+def git(repo, *args, check=True):
+    p = subprocess.run(["git", "-C", repo] + list(args), capture_output=True, text=True)
+    if check and p.returncode != 0:
+        sys.exit(f"mmx-scan: git {' '.join(args)} failed: {p.stderr.strip()}")
+    return p.stdout.strip()
+
+
+def commit_if_changed(repo, path, msg):
+    path = os.path.relpath(os.path.abspath(path), os.path.abspath(repo))
+    git(repo, "add", "-A", "--", path)
+    if subprocess.run(["git", "-C", repo, "diff", "--cached", "--quiet", "--", path]).returncode == 0:
+        return False
+    git(repo, "commit", "-q", "-m", msg, "--", path)
+    return True
+
+
+def nightly(a):
+    """Export the incumbent, commit it, then snapshot each missing day against that commit."""
+    repo, base = a.repo, os.path.join(a.repo, a.dir)
+    inc, met = os.path.join(base, "incumbent"), os.path.join(base, "metrics")
+    today = datetime.now(timezone.utc).date()
+    a.out = inc
+    export(a)
+    changed = commit_if_changed(repo, inc, f"mmx-harness: incumbent {today.isoformat()}")
+    sha = git(repo, "log", "-1", "--format=%H", "--", os.path.relpath(inc, repo)) or git(repo, "rev-parse", "HEAD")
+    days = []
+    start = datetime.fromisoformat(a.backfill_from).date() if a.backfill_from else today - timedelta(days=1)
+    d = start
+    while d < today:
+        if a.force or not os.path.exists(os.path.join(met, f"{d.isoformat()}.jsonl")):
+            days.append(d.isoformat())
+        d += timedelta(days=1)
+    for day in days[-a.max_days:]:
+        write_jsonl(os.path.join(met, f"{day}.jsonl"), snapshot_day(day, sha, a.curator_agent))
+    if days:
+        commit_if_changed(repo, met, f"mmx-harness: metrics {', '.join(days[-a.max_days:])} (harness {sha[:10]})")
+    if a.push:
+        git(repo, "push", "-q", "origin", f"HEAD:{a.push}")
+    print(json.dumps({"incumbent_changed": changed, "harness_commit": sha, "snapshot_days": days[-a.max_days:],
+                      "head": git(repo, "rev-parse", "HEAD"), "pushed": a.push or None}))
+
+
+# --- compare: the acceptance rule as a calculation ---------------------------
+
+METRICS = {
+    # name: (numerator keys, denominator keys, lower_is_better)
+    "correction_rate": (("corrected_cards",), ("cards_in_review",), True),
+    "request_changes_per_pr": (("request_changes",), ("prs_opened",), True),
+    "tokens_per_card": (("tokens_input", "tokens_output", "tokens_cache_write"), ("cards_in_review",), True),
+    "days_in_review": (("days_in_review_sum",), ("done_cards",), True),
+    "failed_run_rate": (("failed", "blocked"), ("runs",), True),
+    "resume_rate": (("resumes",), ("runs",), True),
+    "asks_per_run": (("asks",), ("completed",), True),
+    "mmx_share": (("mmx_runs",), ("completed",), False),
+    "memory_calls_per_run": (("memory_search", "memory_get", "memory_note"), ("completed",), False),
+    "harness_edit_per_run": (("harness_edit",), ("completed",), False),
+}
+
+
+def load_metrics(d):
+    rows = []
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".jsonl"):
+            with open(os.path.join(d, f)) as fh:
+                rows += [json.loads(line) for line in fh if line.strip()]
+    return rows
+
+
+def pooled(rows, metric):
+    num, den, _ = METRICS[metric]
+    n = sum(r.get(k, 0) or 0 for r in rows for k in num)
+    dd = sum(r.get(k, 0) or 0 for r in rows for k in den)
+    return (n / dd) if dd else None
+
+
+def evaluate(rows, metric, canary, start, before_days=14, after_end=None, iters=2000, seed=7):
+    """Effect of an edit started on `start` and its noise band δ.
+
+    canary = list of agent names/ids, or [] for an L0/global edit (before/after on all
+    agents). With canaries the effect is difference-in-differences against the
+    other agents. δ = 95th percentile of |effect| under placebo splits of the
+    `before_days` baseline (day-level bootstrap), so an effect is real only if
+    it exceeds what baseline noise alone produces.
+    """
+    import random
+    agent_rows = [r for r in rows if r["agent"] != WORKSPACE_ROW]
+    s = datetime.fromisoformat(start).date()
+    b0 = (s - timedelta(days=before_days)).isoformat()
+    before = [r for r in agent_rows if b0 <= r["date"] < start]
+    after = [r for r in agent_rows if r["date"] >= start and (not after_end or r["date"] <= after_end)]
+    is_c = (lambda r: r["agent"] in canary or r["agent_id"] in canary) if canary else (lambda r: True)
+
+    def stat(bef, aft):
+        if not canary:
+            x, y = pooled(bef, metric), pooled(aft, metric)
+            return None if x is None or y is None else y - x
+        parts = [pooled([r for r in g if is_c(r) == want], metric) for g in (bef, aft) for want in (True, False)]
+        if None in parts:
+            return None
+        cb, kb, ca, ka = parts
+        return (ca - cb) - (ka - kb)
+
+    effect = stat(before, after)
+    days_b = sorted({r["date"] for r in before})
+    by_day = defaultdict(list)
+    for r in before:
+        by_day[r["date"]].append(r)
+    n_after = len({r["date"] for r in after})
+    rnd = random.Random(seed)
+    placebo = []
+    if days_b and n_after:
+        for _ in range(iters):
+            p1 = [x for d in rnd.choices(days_b, k=len(days_b)) for x in by_day[d]]
+            p2 = [x for d in rnd.choices(days_b, k=n_after) for x in by_day[d]]
+            v = stat(p1, p2)
+            if v is not None:
+                placebo.append(abs(v))
+    placebo.sort()
+    delta = placebo[int(0.95 * (len(placebo) - 1))] if placebo else None
+
+    def arm(rs, want):
+        sel = [r for r in rs if not canary or is_c(r) == want]
+        return {"days": len({r["date"] for r in sel}), "cards": sum(r.get("cards_in_review", 0) for r in sel),
+                "value": pooled(sel, metric)}
+    arms = {"canary_before": arm(before, True), "canary_after": arm(after, True)}
+    if canary:
+        arms.update({"control_before": arm(before, False), "control_after": arm(after, False)})
+    return {"metric": metric, "effect": effect, "delta": delta, "arms": arms,
+            "baseline_days": len(days_b), "lower_is_better": METRICS[metric][2]}
+
+
+def compare(a):
+    rows = load_metrics(a.metrics)
+    canary = [x.strip() for x in a.canary.split(",") if x.strip()] if a.canary else []
+    target = evaluate(rows, a.target, canary, a.start, a.baseline_days, a.end)
+    guards = [evaluate(rows, g, canary, a.start, a.baseline_days, a.end) for g in a.guards.split(",") if g]
+    reasons = []
+    for k, v in target["arms"].items():
+        if k.endswith("after") and (v["days"] < 7 or v["cards"] < 10):
+            reasons.append(f"{k}: {v['days']} days / {v['cards']} cards (< 7 days or < 10 cards)")
+    if target["baseline_days"] < 14:
+        reasons.append(f"baseline has {target['baseline_days']} days (< 14)")
+
+    def better(e):
+        if e["effect"] is None or e["delta"] is None:
+            return None
+        gain = -e["effect"] if e["lower_is_better"] else e["effect"]
+        return gain > e["delta"], gain < -e["delta"]
+    t = better(target)
+    if reasons or t is None:
+        verdict = "insufficient-data"
+    elif not t[0]:
+        verdict = "revert"
+        reasons.append(f"target gain within or below δ ({target['effect']} vs δ {target['delta']})")
+    else:
+        verdict = "adopt"
+    for g in guards:
+        gb = better(g)
+        if gb and gb[1]:
+            verdict = "revert" if verdict != "insufficient-data" else verdict
+            reasons.append(f"guard {g['metric']} worse by more than δ ({g['effect']} vs δ {g['delta']})")
+    out = {"edit_start": a.start, "canary": canary or "all (before/after)", "target": target,
+           "guards": guards, "suggested_verdict": verdict, "reasons": reasons,
+           "note": "Suggestion only. Claude Architect decides and also checks tokens_added is paid for."}
+    print(json.dumps(out, indent=1))
+
+
+# --- chart: weekly loop view -------------------------------------------------
+
+def harness_edit_cards():
+    out, off = [], 0
+    while True:
+        page, _ = cli(["issue", "list", "--metadata", "kind=harness-edit", "--limit", "100",
+                       "--offset", str(off), "--output", "json",
+                       "--fields", "id,identifier,status,metadata,created_at"], allow_fail=True)
+        batch = (page.get("issues", []) if isinstance(page, dict) else page) or []
+        out += batch
+        if not (isinstance(page, dict) and page.get("has_more")) or not batch:
+            return out
+        off += len(batch)
+
+
+def week_of(day):
+    d = datetime.fromisoformat(day[:10]).date()
+    return (d - timedelta(days=d.weekday())).isoformat()
+
+
+def chart(a):
+    rows = [r for r in load_metrics(a.metrics) if r["agent"] != WORKSPACE_ROW]
+    weeks = defaultdict(list)
+    for r in rows:
+        weeks[week_of(r["date"])].append(r)
+    ks = sorted(weeks)[-a.weeks:]
+    corr = [pooled(weeks[w], "correction_rate") for w in ks]
+    tok = [pooled(weeks[w], "tokens_per_card") for w in ks]
+    edits = Counter()
+    for c in harness_edit_cards():
+        v = str((c.get("metadata") or {}).get("verdict") or "").lower()
+        if v in ("adopted", "reverted", "falsified"):
+            edits[(week_of(c.get("created_at") or "1970-01-01"), "adopted" if v == "adopted" else "reverted")] += 1
+    fmt = lambda xs, f: "[" + ", ".join(f(x) if x is not None else "0" for x in xs) + "]"
+    lab = "[" + ", ".join(f'"{w[5:]}"' for w in ks) + "]"
+    lines = ["### MMX loop: is it improving?", "",
+             "```mermaid", "xychart-beta", '  title "Owner-correction rate per card reaching in_review"',
+             f"  x-axis {lab}", '  y-axis "corrected / delivered"',
+             f"  line {fmt(corr, lambda x: f'{x:.3f}')}", "```", "",
+             "```mermaid", "xychart-beta", '  title "Tokens per card reaching in_review (k, excl. cache reads)"',
+             f"  x-axis {lab}", '  y-axis "k tokens"',
+             f"  bar {fmt(tok, lambda x: f'{x / 1000:.0f}')}", "```", "",
+             "| Week | delivered cards | corrected | correction rate | k tokens/card | edits adopted | reverted |",
+             "|---|---|---|---|---|---|---|"]
+    for w, c, t in zip(ks, corr, tok):
+        rs = weeks[w]
+        lines.append(f"| {w} | {sum(r['cards_in_review'] for r in rs)} | {sum(r['corrected_cards'] for r in rs)} | "
+                     f"{'-' if c is None else f'{c:.2f}'} | {'-' if t is None else f'{t / 1000:.0f}'} | "
+                     f"{edits[(w, 'adopted')]} | {edits[(w, 'reverted')]} |")
+    lines += ["", "Improving = correction rate falls while tokens per card does not rise."]
+    print("\n".join(lines))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="mode", required=True)
@@ -411,8 +933,36 @@ def main():
     s.add_argument("--exclude-title", default="MMX curator",
                    help="skip cards whose title starts with this (the curator's own triage cards)")
     s.add_argument("--markdown", action="store_true")
+    yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    n = sub.add_parser("snapshot", help="per-agent metric counts for one UTC day (JSON lines)")
+    n.add_argument("--date", default=yday, help="UTC day YYYY-MM-DD (default: yesterday)")
+    n.add_argument("--out", help="metrics dir; writes <dir>/<date>.jsonl (default: stdout)")
+    n.add_argument("--harness-commit", help="incumbent export commit the day ran on")
+    n.add_argument("--curator-agent", default=CURATOR_AGENT)
+    e = sub.add_parser("export", help="write skills, agent/Role instructions, Workspace Context, autopilot prompts")
+    e.add_argument("--out", required=True, help="incumbent dir (rebuilt from scratch)")
+    g = sub.add_parser("nightly", help="export + commit, then snapshot missing days against that commit")
+    g.add_argument("--repo", required=True, help="git checkout of the data branch")
+    g.add_argument("--dir", default="mmx-harness", help="folder inside the repo")
+    g.add_argument("--backfill-from", help="first UTC day to snapshot if its file is missing")
+    g.add_argument("--max-days", type=int, default=7)
+    g.add_argument("--force", action="store_true", help="re-snapshot days that already have a file")
+    g.add_argument("--push", metavar="BRANCH", help="push HEAD to origin/BRANCH after committing")
+    g.add_argument("--curator-agent", default=CURATOR_AGENT)
+    c = sub.add_parser("compare", help="acceptance rule: effect vs bootstrap noise band δ")
+    c.add_argument("--metrics", required=True, help="metrics dir with <date>.jsonl files")
+    c.add_argument("--target", required=True, choices=sorted(METRICS))
+    c.add_argument("--guards", default="tokens_per_card,failed_run_rate,asks_per_run")
+    c.add_argument("--canary", default="", help="comma list of agent names/ids; empty = all agents before/after (L0)")
+    c.add_argument("--start", required=True, help="first UTC day the edit was live")
+    c.add_argument("--end", help="last UTC day of the after window")
+    c.add_argument("--baseline-days", type=int, default=14)
+    h = sub.add_parser("chart", help="weekly loop chart (mermaid) for the Monday triage card")
+    h.add_argument("--metrics", required=True)
+    h.add_argument("--weeks", type=int, default=8)
     a = ap.parse_args()
-    (baseline if a.mode == "baseline" else signals)(a)
+    {"baseline": baseline, "signals": signals, "snapshot": snapshot, "export": export,
+     "nightly": nightly, "compare": compare, "chart": chart}[a.mode](a)
 
 
 if __name__ == "__main__":
