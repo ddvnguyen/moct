@@ -52,6 +52,13 @@ measured (for back-filled days it postdates the day).
 | `mmx_runs` `memory_*` `harness_edit` `asks` | loop usage from run messages (curator autopilot runs excluded, counted in `curator_runs`) |
 | `active_team_rules` | `_workspace` row only: active team `convention`/`rule` records at measurement time |
 
+Known limits (accepted in review): `corrected_cards` is counted on the day of
+the correction, not the delivery day, so a single day's ratio mixes cohorts
+(pool over a window); whole-card tokens are credited to the builder, reviewer
+runs on that card included; a card reopened and delivered again counts its
+tokens twice. A REQUEST_CHANGES comment by the builder itself (quoting the
+verdict) is not counted.
+
 Derived metrics (`compare`, `chart`): `correction_rate` = corrected/cards,
 `request_changes_per_pr`, `tokens_per_card` (input+output+cache write),
 `days_in_review`, `failed_run_rate` = (failed+blocked)/runs, `resume_rate`,
@@ -94,5 +101,13 @@ The curator autopilot runs the deployed copy:
 cp tools/mmx-scan/mmx-scan /mnt/workspace/bin/mmx-scan
 ```
 
-Data (metrics + incumbent) is committed by `nightly` to a data branch/repo,
-not to `integration`. Rollback: pause the autopilot (`multica autopilot update <id> --status paused`).
+Data (metrics + incumbent) lives in the **private** repo
+`ddvnguyen/Knowledge_Documents`, branch `mmx-harness`, folder `mmx-harness/`
+(Owner decision on M-608). `nightly` refuses a checkout on, or a push to,
+`integration`/`master`/`main`/`stable`, and refuses to push to a non-private
+origin. The curator autopilot runs it daily:
+
+```sh
+multica repo checkout https://github.com/ddvnguyen/Knowledge_Documents --ref mmx-harness
+/mnt/workspace/bin/mmx-scan nightly --repo <checkout> --push mmx-harness
+``` Rollback: pause the autopilot (`multica autopilot update <id> --status paused`).
