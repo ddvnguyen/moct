@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""mmx-scan — M-606: read-only data feed for the MMX self-improvement loop.
+
+Two modes, both read-only (they never change issues, comments, memory or
+agents; acting on the output is the curator agent's job):
+
+  mmx-scan baseline [--days 7] [--markdown]
+      Weekly baseline over `multica issue run-messages` (M-571 metric):
+      share of completed runs that loaded the `mmx` skill, memory_search /
+      memory_get / memory_note call counts, "Harness edit:" proposals, and
+      team convention/rule records created in the window. Baseline to beat
+      (M-571, 2026-11-25..27): 1/429 completed runs loaded `mmx`.
+
+  mmx-scan signals [--hours 24] [--markdown]
+      Daily correction signals for the curator autopilot: reopens, backward
+      status moves (Needs changes), moves to blocked, plan_verdict runs,
+      REQUEST_CHANGES / reject comments, Owner (member) comments, cards with
+      >=2 failed runs, and pending MOCT records waiting for approval.
+      Owner comments are CANDIDATES: the curator decides which are corrections.
+
+Detection rules (baseline):
+  * mmx loaded = a `Skill` tool call naming `mmx`, a file-read tool on a path
+    containing `mmx/SKILL.md`, or a shell `cat/sed/head/...` of that file.
+    A grep or script that only names the path is not counted.
+  * memory_* = tool_use whose tool name contains `memory_search`,
+    `memory_get` or `memory_note` (covers `mcp__moct__memory_note` etc.).
+  * Harness edit = assistant text or a non-shell tool input (comment file
+    write) with a line starting "Harness edit:", except the skill template
+    "Harness edit: <layer>".
+
+The curator's own autopilot runs are excluded from the baseline ratio
+(`--curator-agent`, default Opus Architect) so the loop does not inflate its
+own metric.
+
+Only stdlib. Uses "$MULTICA_CLI_PATH" (falls back to `multica`). MOCT records
+are read through `multica moct-mcp` (stdio JSON-RPC); if moct-be is not
+reachable the MOCT fields report "unavailable" instead of failing the scan.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
+CLI = os.environ.get("MULTICA_CLI_PATH") or "multica"
+CURATOR_AGENT = "7895c8ca-aed6-461e-9fea-a115b2681872"  # Opus Architect
+TERMINAL = {"completed", "failed", "cancelled", "blocked"}
+# Forward order of the Default workflow; side states are excluded on purpose.
+RANK = {"backlog": 0, "todo": 1, "planing_2": 2, "in_progress": 3,
+        "agent_review_deploy": 4, "in_review": 5, "done": 6}
+SIDE = {"blocked", "wait_for_decision", "cancelled"}
+REJECT_RE = re.compile(r"REQUEST_CHANGES|\bNeeds changes\b|\bVerdict:?\W{0,3}(?:reject|request changes)|"
+                       r"\bplan (?:is |was )?rejected\b|\breject(?:ed|ing)? (?:the |this |your )?plan\b", re.I)
+# A proposal starts a line; mentions inside prose or grep patterns do not count.
+HE_RE = re.compile(r"(?:^|\n)[\s>*`#-]*Harness edit:(?!\s*<layer>)")
+# A shell read of the skill file (not a grep/analysis that merely names it).
+MMX_SHELL_RE = re.compile(r"\b(?:cat|sed|head|less|more|bat|Get-Content|type)\b[^|;&\n]*mmx/SKILL\.md")
+SHELL_TOOLS = {"bash", "shell", "exec_command", "run_shell_command", "powershell", "eval"}
+CURSOR_RE = re.compile(r'--before "([^"]+)"')
+
+
+def ts(s):
+    if not s:
+        return None
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def cli(args, allow_fail=False):
+    p = subprocess.run([CLI] + args, capture_output=True, text=True)
+    if p.returncode != 0:
+        if allow_fail:
+            return None, p.stderr
+        sys.exit(f"mmx-scan: `multica {' '.join(args)}` failed: {p.stderr.strip()}")
+    try:
+        return json.loads(p.stdout or "null"), p.stderr
+    except json.JSONDecodeError:
+        if allow_fail:
+            return None, p.stderr
+        raise
+
+
+def agents():
+    data, _ = cli(["agent", "list", "--output", "json"])
+    return {a["id"]: a["name"] for a in data}
+
+
+def agent_runs(agent_id, since, until):
+    """All runs of one agent created in [since, until), newest first."""
+    out, before = [], None
+    while True:
+        args = ["agent", "tasks", agent_id, "--limit", "200", "--output", "json"]
+        if before:
+            args += ["--before", before]
+        page, err = cli(args, allow_fail=True)
+        if not page:
+            return out
+        stop = False
+        for t in page:
+            c = ts(t.get("created_at"))
+            if c and c < since:
+                stop = True
+                break
+            if c and c < until:
+                out.append(t)
+        m = CURSOR_RE.search(err or "")
+        if stop or not m:
+            return out
+        before = m.group(1)
+
+
+def all_runs(since, until):
+    names = agents()
+    with ThreadPoolExecutor(8) as ex:
+        lists = ex.map(lambda a: agent_runs(a, since, until), names)
+    runs = [t for lst in lists for t in lst]
+    return names, runs
+
+
+def _text(v):
+    return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+
+
+def _untext(v):
+    """Tool input as text with JSON string escapes resolved (so \\n is a newline)."""
+    if isinstance(v, dict):
+        return "\n".join(_untext(x) for x in v.values())
+    return v if isinstance(v, str) else _text(v)
+
+
+def scan_messages(run_id):
+    msgs, _ = cli(["issue", "run-messages", run_id, "--output", "json"],
+                  allow_fail=True)
+    if isinstance(msgs, dict):
+        msgs = msgs.get("messages", [])
+    r = {"mmx": 0, "memory_search": 0, "memory_get": 0, "memory_note": 0,
+         "harness_edit": 0, "notes": [], "ok": msgs is not None}
+    for m in msgs or []:
+        t = m.get("type")
+        tool = str(m.get("tool") or "")
+        if t == "tool_use":
+            inp = _text(m.get("input") or "")
+            for k in ("memory_search", "memory_get", "memory_note"):
+                if k in tool:
+                    r[k] += 1
+            if "memory_note" in tool:
+                try:
+                    r["notes"].append((m.get("input") or {}).get("title", "")[:120])
+                except AttributeError:
+                    pass
+            tl = tool.lower()
+            shell = tl in SHELL_TOOLS
+            if (tl == "skill" and re.search(r"(?<![\w-])mmx(?![\w-])", inp)) or \
+                    (shell and MMX_SHELL_RE.search(inp)) or \
+                    (not shell and tl != "skill" and "mmx/SKILL.md" in inp):
+                r["mmx"] += 1
+            if not shell and HE_RE.search(_untext(m.get("input"))):
+                r["harness_edit"] += 1
+        elif t == "text" and HE_RE.search(_text(m.get("content") or "")):
+            r["harness_edit"] += 1
+    return r
+
+
+class MoctMCP:
+    """Minimal stdio JSON-RPC client for `multica moct-mcp` (read-only use)."""
+
+    def __init__(self):
+        env = dict(os.environ)
+        ws = env.get("MULTICA_WORKSPACE_ID", "")
+        env.setdefault("MOCT_WORKSPACE_ID", f"multica:ws:{ws}" if ws else "")
+        ag = env.get("MULTICA_AGENT_ID", "")
+        env.setdefault("MOCT_EXPERT_ID", f"multica:agent:{ag}" if ag else "")
+        self.p = subprocess.Popen([CLI, "moct-mcp"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, env=env)
+        self.n = 0
+        self.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                 "clientInfo": {"name": "mmx-scan", "version": "1"}})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _send(self, msg):
+        self.p.stdin.write(json.dumps(msg) + "\n")
+        self.p.stdin.flush()
+
+    def call(self, method, params):
+        self.n += 1
+        self._send({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params})
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("moct-mcp closed")
+            msg = json.loads(line)
+            if msg.get("id") == self.n:
+                if "error" in msg:
+                    raise RuntimeError(msg["error"])
+                return msg["result"]
+
+    def search(self, **args):
+        res = self.call("tools/call", {"name": "memory_search", "arguments": args})
+        if res.get("isError"):
+            raise RuntimeError(res["content"][0]["text"])
+        return json.loads(res["content"][0]["text"])
+
+    def close(self):
+        self.p.stdin.close()
+        self.p.wait(timeout=10)
+
+
+def moct_records(status, types, homes=None, since=None):
+    try:
+        m = MoctMCP()
+        try:
+            out, cursor = [], None
+            while True:
+                args = {"status": status, "types": types, "limit": 20}
+                if homes:
+                    args["homes"] = homes
+                if cursor:
+                    args["cursor"] = cursor
+                d = m.search(**args)
+                out += d.get("results", [])
+                cursor = d.get("nextCursor")
+                if not cursor:
+                    break
+        finally:
+            m.close()
+    except Exception as e:  # moct-be down must not fail the scan
+        return {"unavailable": str(e)[:200]}
+    if since:
+        out = [r for r in out if ts(r.get("createdAt")) and ts(r["createdAt"]) >= since]
+    return [{"id": r["id"], "type": r["type"], "status": r["status"],
+             "home": r["home"]["kind"], "title": r["title"][:140],
+             "createdAt": r["createdAt"], "useCount": r.get("useCount")}
+            for r in out]
+
+
+def baseline(a):
+    until = datetime.now(timezone.utc)
+    since = until - timedelta(days=a.days)
+    names, runs = all_runs(since, until)
+    runs = [t for t in runs if t["status"] in TERMINAL and not (
+        t.get("agent_id") == a.curator_agent and t.get("kind") == "autopilot")]
+    with ThreadPoolExecutor(8) as ex:
+        res = dict(zip([t["id"] for t in runs], ex.map(scan_messages, [t["id"] for t in runs])))
+    tot = Counter()
+    per_agent = defaultdict(Counter)
+    notes, hits = [], defaultdict(list)
+    for t in runs:
+        r = res[t["id"]]
+        name = names.get(t["agent_id"], t["agent_id"][:8])
+        done = t["status"] == "completed"
+        tot["runs"] += 1
+        tot["completed"] += done
+        tot["unreadable"] += not r["ok"]
+        per_agent[name]["completed"] += done
+        for k in ("mmx", "harness_edit"):
+            if r[k]:
+                hits[k].append({"run": t["id"], "agent": name, "issue": t.get("issue_id")})
+        if done and r["mmx"]:
+            tot["mmx_runs"] += 1
+            per_agent[name]["mmx_runs"] += 1
+        for k in ("memory_search", "memory_get", "memory_note", "harness_edit"):
+            tot[k] += r[k]
+            per_agent[name][k] += r[k]
+            if r[k]:
+                tot[k + "_runs"] += 1
+        notes += [{"run": t["id"], "agent": name, "title": n} for n in r["notes"]]
+    out = {
+        "at": until.isoformat(timespec="seconds"), "tool": "mmx-scan", "mode": "baseline",
+        "window": {"since": since.isoformat(timespec="seconds"),
+                   "until": until.isoformat(timespec="seconds")},
+        "totals": dict(tot),
+        "mmx_ratio": f"{tot['mmx_runs']}/{tot['completed']}",
+        "per_agent": {k: dict(v) for k, v in sorted(per_agent.items())},
+        "memory_note_titles": notes,
+        "hit_runs": dict(hits),
+        "new_team_records": moct_records("active", ["convention", "rule"], ["team"], since),
+        "baseline_to_beat": "1/429 (M-571, 2026-11-25..27)",
+    }
+    print(render_baseline(out) if a.markdown else json.dumps(out, indent=1))
+
+
+def render_baseline(o):
+    t = o["totals"]
+    w = o["window"]
+    lines = [f"## MMX baseline scan ({w['since'][:10]} .. {w['until'][:10]})", "",
+             "| Metric | Value |", "|---|---|",
+             f"| Completed runs scanned | {t.get('completed', 0)} (of {t.get('runs', 0)} terminal; {t.get('unreadable', 0)} unreadable) |",
+             f"| Runs that loaded `mmx` | **{o['mmx_ratio']}** (baseline {o['baseline_to_beat']}) |",
+             f"| `memory_search` / `memory_get` calls | {t.get('memory_search', 0)} / {t.get('memory_get', 0)} |",
+             f"| `memory_note` calls | {t.get('memory_note', 0)} in {t.get('memory_note_runs', 0)} runs |",
+             f"| \"Harness edit:\" proposals | {t.get('harness_edit', 0)} in {t.get('harness_edit_runs', 0)} runs |"]
+    rec = o["new_team_records"]
+    if isinstance(rec, dict):
+        lines.append(f"| New active team convention/rule records | unavailable ({rec['unavailable']}) |")
+    else:
+        lines.append(f"| New active team convention/rule records | {len(rec)} |")
+    lines += ["", "| Agent | completed | mmx | search | get | note | harness edit |",
+              "|---|---|---|---|---|---|---|"]
+    for name, c in o["per_agent"].items():
+        if c.get("completed"):
+            lines.append(f"| {name.replace('|', '/')} | {c.get('completed', 0)} | {c.get('mmx_runs', 0)} | "
+                         f"{c.get('memory_search', 0)} | {c.get('memory_get', 0)} | "
+                         f"{c.get('memory_note', 0)} | {c.get('harness_edit', 0)} |")
+    if not isinstance(rec, dict) and rec:
+        lines += ["", "New team records: " + "; ".join(f"`{r['id'][:12]}` {r['title']}" for r in rec)]
+    return "\n".join(lines)
+
+
+def timeline(issue_id):
+    d, _ = cli(["issue", "timeline", issue_id, "--output", "json"], allow_fail=True)
+    return d or []
+
+
+def signals(a):
+    until = datetime.now(timezone.utc)
+    since = until - timedelta(hours=a.hours)
+    issues, off = [], 0
+    while True:
+        page, _ = cli(["issue", "list", "--updated-since", since.isoformat(timespec="seconds"),
+                       "--updated-until", until.isoformat(timespec="seconds"),
+                       "--limit", "100", "--offset", str(off), "--output", "json",
+                       "--fields", "id,identifier,title,status,assignee_id"])
+        batch = page.get("issues", []) if isinstance(page, dict) else page
+        issues += batch
+        if not (isinstance(page, dict) and page.get("has_more")) or not batch:
+            break
+        off += len(batch)
+    if a.exclude_title:
+        issues = [i for i in issues if not i["title"].startswith(a.exclude_title)]
+    by_id = {i["id"]: i for i in issues}
+    with ThreadPoolExecutor(8) as ex:
+        tls = dict(zip(by_id, ex.map(timeline, list(by_id))))
+    names, runs = all_runs(since, until)
+    items = []
+
+    def add(issue, kind, at, actor, detail):
+        items.append({"card": issue["identifier"], "title": issue["title"][:80],
+                      "kind": kind, "at": at, "actor": actor, "detail": detail})
+
+    for iid, tl in tls.items():
+        iss = by_id[iid]
+        for e in tl:
+            at = ts(e.get("created_at"))
+            if not at or at < since:
+                continue
+            actor = e.get("actor_name") or names.get(e.get("actor_id"), e.get("actor_type"))
+            if e.get("type") == "activity" and e.get("action") == "status_changed":
+                f, t = (e.get("details") or {}).get("from"), (e.get("details") or {}).get("to")
+                if t == "blocked":
+                    add(iss, "blocked", e["created_at"], actor, f"{f}->{t}")
+                elif f in ("done", "in_review", "cancelled") and t in RANK and RANK[t] < RANK.get(f, 7):
+                    add(iss, "reopen", e["created_at"], actor, f"{f}->{t}")
+                elif f in RANK and t in RANK and RANK[t] < RANK[f]:
+                    add(iss, "needs_changes", e["created_at"], actor, f"{f}->{t}")
+            elif e.get("type") == "comment":
+                body = e.get("content") or ""
+                if e.get("actor_type") == "member":
+                    add(iss, "owner_comment", e["created_at"], actor, body[:300])
+                elif REJECT_RE.search(body):
+                    add(iss, "reject_comment", e["created_at"], actor,
+                        body[max(0, REJECT_RE.search(body).start() - 80):][:300])
+    fails = Counter()
+    for t in runs:
+        if t.get("trigger_evidence_kind") == "plan_verdict" and t.get("issue_id") in by_id:
+            add(by_id[t["issue_id"]], "plan_verdict_run", t["created_at"],
+                names.get(t["agent_id"], "?"), "run triggered by a plan verdict; check if rejected")
+        if t["status"] == "failed" and t.get("issue_id"):
+            fails[t["issue_id"]] += 1
+    for iid, n in fails.items():
+        if n >= 2:
+            iss = by_id.get(iid) or {"identifier": iid[:13], "title": ""}
+            add(iss, "repeat_failure", None, None, f"{n} failed runs in window")
+    items.sort(key=lambda x: (x["card"], x["at"] or ""))
+    out = {"at": until.isoformat(timespec="seconds"), "tool": "mmx-scan", "mode": "signals",
+           "window": {"since": since.isoformat(timespec="seconds"),
+                      "until": until.isoformat(timespec="seconds")},
+           "counts": dict(Counter(i["kind"] for i in items)),
+           "items": items,
+           "pending_memory": moct_records("pending", ["rule", "convention", "how_to_work", "decision"])}
+    print(render_signals(out) if a.markdown else json.dumps(out, indent=1, ensure_ascii=False))
+
+
+def render_signals(o):
+    lines = [f"## MMX signals {o['window']['since'][:16]} .. {o['window']['until'][:16]} UTC",
+             "", "Counts: " + (", ".join(f"{k} {v}" for k, v in sorted(o["counts"].items())) or "none"), ""]
+    for i in o["items"]:
+        lines.append(f"- {i['card']} `{i['kind']}` {i['at'] or ''} {i['actor'] or ''}: "
+                     + i["detail"].replace("\n", " ")[:200])
+    pm = o["pending_memory"]
+    lines += ["", "Pending MOCT records: " + (f"unavailable ({pm['unavailable']})" if isinstance(pm, dict)
+                                             else str(len(pm)))]
+    if not isinstance(pm, dict):
+        lines += [f"- `{r['id']}` {r['type']}/{r['home']}: {r['title']}" for r in pm]
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="mode", required=True)
+    b = sub.add_parser("baseline")
+    b.add_argument("--days", type=float, default=7)
+    b.add_argument("--curator-agent", default=CURATOR_AGENT)
+    b.add_argument("--markdown", action="store_true")
+    s = sub.add_parser("signals")
+    s.add_argument("--hours", type=float, default=24)
+    s.add_argument("--exclude-title", default="MMX curator",
+                   help="skip cards whose title starts with this (the curator's own triage cards)")
+    s.add_argument("--markdown", action="store_true")
+    a = ap.parse_args()
+    (baseline if a.mode == "baseline" else signals)(a)
+
+
+if __name__ == "__main__":
+    main()
