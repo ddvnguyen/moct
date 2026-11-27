@@ -1401,8 +1401,7 @@ def rounds_arm(a):
             "--instruction",
             f"MMX round {a.round_no + 1}: run mmx-scan sim read, propose at most 3 "
             f"edits (one live edit per component), then arm round {a.round_no + 2} "
-            "with mmx-scan rounds arm",
-            "--expires-in", "96h", "--on-timeout", "wake"]
+            "with mmx-scan rounds arm"]
     if a.issue:
         p = subprocess.run([CLI] + argv, capture_output=True, text=True)
         if p.returncode != 0:
