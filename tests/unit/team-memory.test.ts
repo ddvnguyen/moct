@@ -5,6 +5,8 @@
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { TursoRepository } from "../../src/store/turso-repository.js";
 import { TeamRoomStore } from "../../src/team-room/store.js";
@@ -15,7 +17,6 @@ import {
   type MemoryActor,
   type MemoryRecord,
   type NoteInput,
-  type TeamMemoryStore,
 } from "../../src/team-room/memory.js";
 import { startHarness } from "./http-harness.js";
 
@@ -56,48 +57,39 @@ async function makeWorld(): Promise<World> {
 }
 
 /**
- * A v8-shaped legacy database: team_memory_records without the v9
- * owner_workspace_id column, holding one null-workspace expert row
- * (how_to_work was the only type that stored NULL). Runs the same migration
- * statements TursoRepository.open applies to such a file: add the column and
- * backfill the owner to the home expert, with no data loss. (A real
- * close/reopen round-trip is not used: this Turso version drops
- * uncheckpointed WAL rows on close.)
+ * A real v8 fleet.db: the v8 DDL straight from main, with one legacy
+ * null-workspace expert row, its tag and its version row. Opening it must run
+ * the v9 rebuild (which drops the old table CHECK), keep the legacy row, and
+ * let a stamped write land afterwards. Written with node:sqlite so the file
+ * is a genuine v8 file, not a simulation; the Turso connection only opens it.
+ * Reopen is not asserted here: this Turso version drops uncheckpointed WAL
+ * rows on close, which would make a close/reopen round-trip lose the seed.
  */
 async function makeV8World(): Promise<World> {
   const root = mkdtempSync(path.join(tmpdir(), "moct-memory-v8-"));
   dirs.push(root);
   const dbPath = path.join(root, "fleet.db");
-  const repo = await TursoRepository.open(root, dbPath);
-  repos.push(repo);
-  const db = repo.teamDb();
-  const columns = (await db.all(`SELECT name FROM pragma_table_info('team_memory_records')`)).map((c) => String(c["name"]));
-  expect(columns).toContain("owner_workspace_id");
-  // Drop back to the v8 shape: rebuild without the column, then insert the
-  // legacy row the v8 store wrote (NULL workspace, no owner).
-  const kept = columns.filter((c) => c !== "owner_workspace_id");
-  await db.run(`CREATE TABLE team_memory_records_v8 AS SELECT ${kept.join(", ")} FROM team_memory_records`);
-  await db.run(`DROP TABLE team_memory_records`);
-  await db.run(`ALTER TABLE team_memory_records_v8 RENAME TO team_memory_records`);
-  await db.run(
-    `INSERT INTO team_memory_records(id, workspace_id, type, title, body, attrs, home_kind, home_ref, priority, pinned,
+  const ddl = execFileSync("git", ["show", "main:src/store/schema.ts"], { encoding: "utf8" }) as string;
+  const sql = ddl.split("export const FLEET_SCHEMA_SQL = `")[1].split("`;")[0];
+  const seed = new DatabaseSync(dbPath);
+  seed.exec(sql);
+  seed.prepare(`INSERT INTO team_memory_records(id, workspace_id, type, title, body, attrs, home_kind, home_ref, priority, pinned,
        status, flag, supersedes, superseded_by, conflicts_with, task_ref, unique_key, author_kind, author_id,
        created_at, updated_at, last_used_at, use_count, version)
      VALUES ('mem_v8legacy', NULL, 'how_to_work', 'v8 habit', 'v8 habit — body', NULL, 'expert', 'member:alice',
        60, 0, 'active', NULL, NULL, NULL, '[]', NULL, NULL, 'member', 'member:alice',
-       '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', NULL, 0, 1)`,
-  );
-  await db.run("INSERT INTO team_memory_tags(record_id, kind, ref) VALUES ('mem_v8legacy', 'expert', 'member:alice')");
-  // The v9 migration, exactly as TursoRepository.open runs it for a file
-  // whose meta has no schema_version:9 row yet.
-  await db.run(`ALTER TABLE team_memory_records ADD COLUMN owner_workspace_id TEXT`);
-  await db.run(
-    `UPDATE team_memory_records SET owner_workspace_id = home_ref
-     WHERE home_kind = 'expert' AND workspace_id IS NULL AND owner_workspace_id IS NULL`,
-  );
-  const after = (await db.all(`SELECT name FROM pragma_table_info('team_memory_records')`)).map((c) => String(c["name"]));
-  expect(after).toContain("owner_workspace_id");
-  const clock = { t: Date.parse("2026-10-01T00:00:00Z") };
+       '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', NULL, 0, 1)`).run();
+  seed.prepare("INSERT INTO team_memory_tags(record_id, kind, ref) VALUES ('mem_v8legacy', 'expert', 'member:alice')").run();
+  seed.prepare(`INSERT INTO team_memory_versions(memory_id, version, action, workspace_id, type, home_kind, home_ref, tags_json,
+       title, body, attrs, priority, pinned, status, actor_kind, actor_id, reason, at)
+     VALUES ('mem_v8legacy', 1, 'create', NULL, 'how_to_work', 'expert', 'member:alice', '[]',
+       'v8 habit', 'v8 habit — body', NULL, 60, 0, 'active', 'member', 'member:alice', '', '2026-10-01T00:00:00.000Z')`).run();
+  seed.close();
+  // Opening with the PR head must rebuild the records table (dropping the old
+  // CHECK), backfill both owners, and leave tags, links and versions intact.
+  const repo = await TursoRepository.open(root, dbPath);
+  repos.push(repo);
+  const clock = { t: Date.parse("2026-10-01T00:00:00.000Z") };
   const team = new TeamRoomStore(repo.teamDb(), dbPath, null, () => new Date(clock.t));
   await team.memory.updateSettings({ orchestrators: [LEAD.id, ARCH.id], actor: HUMAN });
   return { root, repo, memory: team.memory, clock };
@@ -363,15 +355,24 @@ describe("team memory — workspace containment (M-546)", () => {
     expect(await memory.visible("mem_legacy", scopeWs(WS, BOB))).toBe(false);
   });
 
-  it("migrates a v8 database to v9, scoping its legacy row to the owning expert", async () => {
-    const { memory } = await makeV8World();
+  it("migrates a v8 database to v9: legacy row survives, stamped writes land", async () => {
+    const { memory, repo } = await makeV8World();
     const ids = async (s: ScopeWs) => (await memory.search({ scope: s, limit: 20 })).results.map((r) => r.id);
-    // The owning expert keeps its row in any workspace; nobody else sees it.
+    // The legacy row survives with its tag and version intact.
     expect(await ids(scopeWs(WS, ALICE))).toEqual(["mem_v8legacy"]);
     expect(await ids(scopeWs("ws-2", ALICE))).toEqual(["mem_v8legacy"]);
     expect(await ids(scopeWs(WS, BOB))).toEqual([]);
-    // New writes in the reopened database are stamped.
-    expect((await write(memory, howTo("stamped after migrate", ALICE), HUMAN)).workspaceId).toBe(WS);
+    expect((await memory.versions("mem_v8legacy")).map((v) => v.action)).toEqual(["create"]);
+    // A stamped write lands on the rebuilt table (the old CHECK is gone).
+    const stamped = await write(memory, howTo("stamped after migrate", ALICE), HUMAN);
+    expect(stamped.workspaceId).toBe(WS);
+    expect(await ids(scopeWs(WS, ALICE))).toEqual(["mem_v8legacy", stamped.id].sort());
+    expect(await ids(scopeWs("ws-2", ALICE))).toEqual(["mem_v8legacy"]);
+    // The rebuilt table carries no old CHECK and the owner backfill stuck.
+    const rebuilt = (await repo.teamDb().get("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'team_memory_records'")) as Record<string, unknown>;
+    expect(String(rebuilt["sql"])).not.toContain("workspace_id IS NULL");
+    expect(String(rebuilt["sql"])).toContain("owner_workspace_id");
+    expect((await memory.get("mem_v8legacy"))?.ownerWorkspaceId).toBe(ALICE.id);
   });
 
   it("dedupes near matches inside one workspace, not across them", async () => {

@@ -394,6 +394,12 @@ CREATE INDEX IF NOT EXISTS idx_team_thread_bindings_member ON team_thread_bindin
 --   title/body/attrs are NULL only after a purge. embedding is reserved.
 CREATE TABLE IF NOT EXISTS team_memory_records (
     id TEXT PRIMARY KEY,
+    -- v9: every new write stamps its workspace (expert homes included); the
+    -- store enforces this (note() requires workspaceId; TYPE_HOMES pins each
+    -- type to its homes), not a table CHECK: a CHECK change cannot migrate an
+    -- existing v8 table, whose old CHECK would then reject stamped writes.
+    -- The column stays nullable so the v9 rebuild can carry legacy
+    -- null-workspace expert rows, owned by their home expert until backfilled.
     workspace_id TEXT,
     type TEXT NOT NULL CHECK (type IN ('rule', 'decision', 'convention', 'how_to_work', 'task', 'branch')),
     title TEXT,
@@ -419,7 +425,6 @@ CREATE TABLE IF NOT EXISTS team_memory_records (
     version INTEGER NOT NULL,
     embedding BLOB,
     owner_workspace_id TEXT,
-    CHECK ((type = 'how_to_work' AND home_kind = 'expert') OR workspace_id IS NOT NULL),
     CHECK (
         (type IN ('rule', 'convention') AND home_kind IN ('team', 'channel'))
         OR (type = 'decision' AND home_kind IN ('channel', 'task'))
@@ -431,9 +436,8 @@ CREATE TABLE IF NOT EXISTS team_memory_records (
 CREATE INDEX IF NOT EXISTS idx_team_memory_records_home ON team_memory_records(workspace_id, home_kind, home_ref, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_team_memory_records_unique_key ON team_memory_records(workspace_id, unique_key);
 -- v9 migration (owner_workspace_id + workspace stamping) lives in
--- TursoRepository.open, which adds the column where missing and backfills
--- legacy NULL-workspace expert rows to their home expert. It cannot live here:
--- this file runs on every open and ALTER TABLE is not re-runnable.
+-- TursoRepository.open, which rebuilds the table when it still carries the v8
+-- CHECK. It cannot live here: this file runs on every open.
 
 -- team_memory_tags: who and what a record belongs to (v8). team / channel / task /
 -- expert grant visibility; repo / branch only describe and never widen it.

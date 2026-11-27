@@ -102,14 +102,26 @@ Rollback: an older build ignores the v7 tables and routes. The DB stays valid fo
 ## v9 — Team memory workspace containment (M-546)
 
 Every record belongs to one workspace. v9 stamps `workspace_id` on every write
-(expert homes included; v8 stored `NULL` for `how_to_work`). Legacy
-null-workspace expert rows are owned by their home expert
-(`owner_workspace_id`, backfilled from `home_ref` by `TursoRepository.open`
-when the column is missing): the owning expert keeps reaching them from any
-workspace until backfilled, and nobody else does. Nothing crosses workspaces.
-The visibility table stays, with `how_to_work` reading "that expert **in that
-workspace**". The always-load cap and `usage` are per workspace, expert homes
-included.
+(expert homes included; v8 stored `NULL` for `how_to_work`). The store enforces
+this (`note()` requires `workspaceId`; `TYPE_HOMES` pins each type to its
+homes), not a table CHECK: a CHECK change cannot migrate an existing v8 table,
+whose old CHECK (`(type = 'how_to_work') = (workspace_id IS NULL)`) would then
+reject stamped writes. Legacy null-workspace expert rows are owned by their
+home expert (`owner_workspace_id`, backfilled from `home_ref`): the owning
+expert keeps reaching them from any workspace until backfilled, and nobody
+else does. Nothing crosses workspaces. The visibility table stays, with
+`how_to_work` reading "that expert **in that workspace**". The always-load cap
+and `usage` are per workspace, expert homes included.
+
+Migration (`TursoRepository.open`, one lock-held transaction, rolled back on
+error): when `team_memory_records` still carries the old CHECK (detected with
+a plain `sqlite_master` SELECT — a table-valued pragma SELECT poisons this
+Turso version's connection for later readers), the table is rebuilt: create
+the new table, copy every row (legacy NULLs stay NULL under their owning
+expert), drop the old table, rename, recreate its indexes. Tags, links and
+versions are untouched (they name records by id). The versions table carries
+no CHECK, so it takes a plain `ADD COLUMN` plus the same owner backfill. New
+and already-migrated tables return after one cheap SELECT.
 
 Reads: search, getMany and links confine stamped rows to the requesting
 workspace and legacy rows to their owning expert (`all` adds legacy rows only
@@ -247,7 +259,8 @@ Refusals answer `{ok:false, code, error[, details]}` with status 400, 403, 404, 
 Rollback: a v8 build on a v9 `fleet.db` ignores the `owner_workspace_id`
 columns and keeps enforcing v8 visibility (null-workspace expert rows visible
 across workspaces); the DB stays valid for it, and rolling forward to v9
-backfills the owners with no data loss. Measured on the final v8 DDL. The
+rebuilds the records table (dropping the old CHECK), backfills both owners,
+and keeps every row, tag, link and version. Measured on the final v8 DDL. The
 0.10.0 dist was run on a copy of a v8 `fleet.db` holding every record type,
 tags, links, settings, both unique keys and a purged record. It started with 0
 error lines, `/team/v1/health` answered 200 with `schema: 7`, the operations
