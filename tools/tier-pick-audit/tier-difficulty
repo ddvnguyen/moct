@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""tier-difficulty — M-598: deterministic difficulty derivation + apply/rollback.
+
+Derives `important_level` / `complexity` (1..5 integers) for open cards from
+card facts only — no LLM. Extends the M-588 B4 audit (`tier-pick-audit`,
+moct#54): the audit proved 588/591 cards carry no values so the M-423 resolver
+floor never rises; this tool writes the values the audit's recommendation (ii)
+calls for, and the plan-approve default keeps writing planned cards.
+
+Derivation inputs (all from `multica issue ... --output json`):
+  issue list --resolve-properties  id, properties, status, priority, labels,
+                                   description, parent_issue_id, project
+  issue children (via parent_issue_id inversion — free, no extra calls)
+  issue runs <id>                  failed-run count (only with --with-runs)
+  issue pull-requests <id>         open linked PR (only with --with-prs)
+
+Rules are written down in README.md ("Derivation rules"). Summary:
+  important = 1 + (priority high/urgent) + (risk label) + (>=3 open children),
+              clamped to 1..3 (4/5 are human-only; see M-595 G7).
+  complexity = 1 + (desc>=1500) + (desc>=4000) + (>=3 failed runs)
+               + (open linked PR), clamped to 1..4 (5 is human-only).
+
+Safety:
+  * a field already holding a valid 2..5 the script did not set is human-owned
+    and is never overwritten;
+  * --dry-run is the default: prints the before/after table, writes nothing;
+  * --apply touches open/new cards only
+    (backlog|todo|planing_2|in_progress|blocked|wait_for_decision) through
+    `multica issue property set` on the two existing property definitions;
+  * every write is recorded in a ledger file (default: next to this script) as
+    {card, field, previous (null = was unset), set}; --unset restores each
+    entry to its previous value, so rollback is exact;
+  * idempotent: a re-run whose derivation matches the current value writes
+    nothing; a human edit over a script-set value is treated as an override
+    and left alone.
+
+Usage:
+  tier-difficulty [--dry-run] [--apply] [--unset] [--with-runs] [--with-prs]
+                  [--ledger PATH] [--fixture captured.json] [--cli PATH]
+                  [--out-dir DIR] [--stdout]
+
+Exit codes: 0 ok, 2 bad usage / unreadable input / a write failed.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+TOOL = "tier-difficulty"
+VERSION = 1
+DEFAULT_OUT_DIR = "/mnt/workspace/tier-pick-audit"
+DIFFICULTY = ("important_level", "complexity")
+
+# --apply scope: open/new cards only. agent_review_deploy is deliberately
+# excluded: a card awaiting deploy/review keeps the floor it was reviewed at.
+OPEN_STATUSES = {
+    "backlog", "todo", "planing_2", "in_progress", "blocked", "wait_for_decision",
+}
+
+RISK_LABELS = {"deploy", "production", "security", "owner-gate", "incident"}
+DESC_LONG = 1500
+DESC_VERY_LONG = 4000
+FAILS_THRESHOLD = 3
+PARENT_KIDS_THRESHOLD = 3
+IMPORTANT_MAX = 3   # 4/5 human-only: management 3/3 floor is 69 < claude 72
+COMPLEXITY_MAX = 4  # 5 human-only: only 5/5 reaches the cost-100 single-slot tier
+
+RULES_DOC = [
+    "important_level starts at 1; +1 when priority is high or urgent",
+    "important_level +1 when a label is in {deploy, production, security, owner-gate, incident}",
+    "important_level +1 when the card is a parent of >=3 non-closed children",
+    "important_level clamps to 1..3 derived (4/5 human-only)",
+    "complexity starts at 1; +1 for a description of at least 1500 chars",
+    "complexity +1 more for a description of at least 4000 chars",
+    "complexity +1 when failed runs >= 3 (needs --with-runs)",
+    "complexity +1 when an open linked PR exists (needs --with-prs)",
+    "complexity clamps to 1..4 derived (5 human-only)",
+    "a field holding 2..5 the script did not set is human-owned: never overwritten",
+]
+
+
+class DifficultyError(Exception):
+    """Bad usage or unreadable input."""
+
+
+class SourceError(Exception):
+    """One CLI read failed; carried per source so one failure is visible."""
+
+    def __init__(self, what, code):
+        super().__init__("%s: exit %s" % (what, code))
+        self.what = what
+        self.code = code
+
+
+# --------------------------------------------------------------------------- #
+# sources: live CLI and pre-captured fixture
+# --------------------------------------------------------------------------- #
+
+ISSUE_FIELDS = (
+    "id,identifier,title,status,priority,created_at,updated_at,properties,"
+    "parent_issue_id,labels,description,assignee_id,assignee_type"
+)
+PAGE = 100
+
+
+class CliSource:
+    """Reads through the multica CLI. Writes only via property set/unset."""
+
+    def __init__(self, cli=None):
+        self.cli = cli or os.environ.get("MULTICA_CLI_PATH") or "multica"
+
+    def _json(self, what, args):
+        try:
+            proc = subprocess.run(
+                [self.cli] + args, capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            raise SourceError(what, "spawn:%s" % exc.errno)
+        if proc.returncode != 0:
+            raise SourceError(what, proc.returncode)
+        text = proc.stdout.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise SourceError(what + " (bad json)", proc.returncode)
+
+    def _run(self, what, args):
+        try:
+            proc = subprocess.run(
+                [self.cli] + args, capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            raise SourceError(what, "spawn:%s" % exc.errno)
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+    def issues(self):
+        out, offset = [], 0
+        while True:
+            page = self._json(
+                "issue list",
+                ["issue", "list", "--output", "json", "--resolve-properties",
+                 "--fields", ISSUE_FIELDS, "--limit", str(PAGE),
+                 "--offset", str(offset)],
+            )
+            if not page:
+                break
+            rows = page.get("issues") or []
+            out.extend(rows)
+            offset += len(rows)
+            if not page.get("has_more") or not rows:
+                break
+        return out
+
+    def runs(self, issue_ref):
+        return self._json(
+            "issue runs %s" % issue_ref,
+            ["issue", "runs", issue_ref, "--output", "json"],
+        ) or []
+
+    def pull_requests(self, issue_ref):
+        return self._json(
+            "issue pull-requests %s" % issue_ref,
+            ["issue", "pull-requests", issue_ref, "--output", "json"],
+        ) or {}
+
+    def prop_set(self, issue_id, name, value):
+        return self._run(
+            "property set",
+            ["issue", "property", "set", issue_id,
+             "--name", name, "--value", str(value), "--output", "json"],
+        )
+
+    def prop_unset(self, issue_id, name):
+        return self._run(
+            "property unset",
+            ["issue", "property", "unset", issue_id,
+             "--name", name, "--output", "json"],
+        )
+
+
+class FixtureSource:
+    """Offline replay of captured CLI payloads; used by the seeded test.
+
+    Fixture shape: {"issues": [...], "runs": {id-or-identifier: [...]},
+    "pull_requests": {id-or-identifier: {...}}}. Writes are recorded in
+    memory (applied to the fixture rows) so idempotence and rollback are
+    testable without a board.
+    """
+
+    def __init__(self, data):
+        self.data = data or {}
+        self.writes = []
+
+    def issues(self):
+        return self.data.get("issues") or []
+
+    def _key(self, ref):
+        return str(ref)
+
+    def runs(self, issue_ref):
+        runs = self.data.get("runs") or {}
+        if self._key(issue_ref) in runs:
+            return runs[self._key(issue_ref)]
+        for issue in self.issues():
+            if issue.get("identifier") == issue_ref or issue.get("id") == issue_ref:
+                key = issue.get("id")
+                if key in runs:
+                    return runs[key]
+        return []
+
+    def pull_requests(self, issue_ref):
+        prs = self.data.get("pull_requests") or {}
+        if self._key(issue_ref) in prs:
+            return prs[self._key(issue_ref)]
+        for issue in self.issues():
+            if issue.get("identifier") == issue_ref or issue.get("id") == issue_ref:
+                key = issue.get("id")
+                if key in prs:
+                    return prs[key]
+        return {"pull_requests": []}
+
+    def _apply_row(self, issue_id, name, value):
+        for issue in self.issues():
+            if issue.get("id") != issue_id:
+                continue
+            rows = issue.setdefault("properties", [])
+            lname = str(name).strip().lower()
+            for row in rows:
+                if str(row.get("name") or "").strip().lower() == lname:
+                    if value is None:
+                        rows.remove(row)
+                    else:
+                        row["value"] = value
+                    return
+            if value is not None:
+                rows.append({"name": lname, "value": value})
+
+    def prop_set(self, issue_id, name, value):
+        self._apply_row(issue_id, name, value)
+        self.writes.append(("set", issue_id, name, value))
+        return 0, "{}", ""
+
+    def prop_unset(self, issue_id, name):
+        self._apply_row(issue_id, name, None)
+        self.writes.append(("unset", issue_id, name))
+        return 0, "{}", ""
+
+
+# --------------------------------------------------------------------------- #
+# derivation — mirrors the resolver's 1/1-on-missing read
+# --------------------------------------------------------------------------- #
+
+def prop_value(issue, name):
+    """Raw stored value for a difficulty field, or None when unset."""
+    lname = str(name).strip().lower()
+    for row in issue.get("properties") or []:
+        if str(row.get("name") or "").strip().lower() == lname:
+            return row.get("value")
+    return None
+
+
+def prop_level(raw):
+    """tierPropLevel: a JSON number in 1..5 that is integral; else None.
+
+    Returns None for missing/invalid (caller decides the base); the resolver
+    reads those as 1, and so do we for the "current" display.
+    """
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    import math
+    if value != math.trunc(value) or value < 1 or value > 5:
+        return None
+    return int(value)
+
+
+def open_children_map(issues):
+    """issue id -> count of non-closed children (from one issue-list pass)."""
+    closed = {"in_review", "done", "cancelled"}
+    kids = {}
+    for issue in issues:
+        parent = issue.get("parent_issue_id")
+        if not parent:
+            continue
+        if str(issue.get("status") or "") in closed:
+            continue
+        kids[str(parent)] = kids.get(str(parent), 0) + 1
+    return kids
+
+
+def failed_runs_count(source, issue, with_runs):
+    if not with_runs:
+        return None
+    try:
+        runs = source.runs(issue.get("id")) or []
+    except SourceError:
+        return None
+    return sum(1 for r in runs if str(r.get("status") or "").lower() == "failed")
+
+
+def open_pr_count(source, issue, with_prs):
+    if not with_prs:
+        return None
+    try:
+        payload = source.pull_requests(
+            issue.get("identifier") or issue.get("id")) or {}
+    except SourceError:
+        return None
+    prs = payload.get("pull_requests")
+    if not isinstance(prs, list):
+        return None
+    return sum(
+        1 for pr in prs
+        if str((pr.get("state") if isinstance(pr, dict) else "") or "").lower()
+        not in {"closed", "merged", "cancelled"}
+        or (isinstance(pr, dict) and not pr.get("state"))
+    )
+
+
+def derive(issue, kids, failed=None, prs=None):
+    """Returns (important, complexity, signals dict). Pure function."""
+    signals = {}
+    important = 1
+    if str(issue.get("priority") or "").lower() in {"high", "urgent"}:
+        important += 1
+        signals["priority_high"] = True
+    labels = {
+        str(x).strip().lower()
+        for x in (issue.get("labels") or [])
+        if isinstance(x, str)
+    }
+    hit = sorted(labels & RISK_LABELS)
+    if hit:
+        important += 1
+        signals["risk_labels"] = hit
+    n_kids = kids.get(str(issue.get("id")), 0)
+    signals["open_children"] = n_kids
+    if n_kids >= PARENT_KIDS_THRESHOLD:
+        important += 1
+        signals["epic_parent"] = True
+    important = min(max(important, 1), IMPORTANT_MAX)
+
+    complexity = 1
+    desc_len = len(str(issue.get("description") or ""))
+    signals["desc_len"] = desc_len
+    if desc_len >= DESC_LONG:
+        complexity += 1
+        signals["desc_long"] = True
+    if desc_len >= DESC_VERY_LONG:
+        complexity += 1
+        signals["desc_very_long"] = True
+    if failed is None:
+        signals["failed_runs"] = "unevaluated"
+    else:
+        signals["failed_runs"] = failed
+        if failed >= FAILS_THRESHOLD:
+            complexity += 1
+            signals["many_failures"] = True
+    if prs is None:
+        signals["open_prs"] = "unevaluated"
+    else:
+        signals["open_prs"] = prs
+        if prs >= 1:
+            complexity += 1
+            signals["rework_pr"] = True
+    complexity = min(max(complexity, 1), COMPLEXITY_MAX)
+    return important, complexity, signals
+
+
+# --------------------------------------------------------------------------- #
+# ledger + plan
+# --------------------------------------------------------------------------- #
+
+def load_ledger(path):
+    if not path or not os.path.exists(path):
+        return {"tool": TOOL, "version": VERSION, "entries": []}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        raise DifficultyError("cannot read ledger %s" % path)
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        raise DifficultyError("ledger %s has no entries[] list" % path)
+    return data
+
+
+def save_ledger(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def ledger_index(ledger):
+    """(card_id, field) -> entry. Last write wins."""
+    index = {}
+    for entry in ledger.get("entries") or []:
+        index[(entry.get("issue_id"), entry.get("field"))] = entry
+    return index
+
+
+def plan_card(issue, kids, source, with_runs, with_prs, ledger_by_key):
+    """One card's decision. Never writes; returns the row for table/report."""
+    card = issue.get("identifier") or issue.get("id")
+    cur_raw = {name: prop_value(issue, name) for name in DIFFICULTY}
+    cur = {name: prop_level(value) for name, value in cur_raw.items()}
+    derived = {}
+    signals = {}
+    if str(issue.get("status") or "") in OPEN_STATUSES:
+        failed = failed_runs_count(source, issue, with_runs)
+        prs = open_pr_count(source, issue, with_prs)
+        d_imp, d_cplx, signals = derive(issue, kids, failed, prs)
+        derived = {"important_level": d_imp, "complexity": d_cplx}
+    else:
+        derived = {"important_level": 1, "complexity": 1}
+    row = {
+        "identifier": card,
+        "issue_id": issue.get("id"),
+        "status": issue.get("status"),
+        "in_scope": str(issue.get("status") or "") in OPEN_STATUSES,
+        "current": {name: (cur[name] if cur[name] is not None else 1)
+                    for name in DIFFICULTY},
+        "current_raw_present": {name: cur_raw[name] is not None
+                                for name in DIFFICULTY},
+        "derived": derived,
+        "signals": signals,
+        "actions": {},
+    }
+    for name in DIFFICULTY:
+        if not row["in_scope"]:
+            row["actions"][name] = "skip-closed"
+            continue
+        current_level = cur[name]  # None = unset/invalid
+        entry = ledger_by_key.get((issue.get("id"), name))
+        script_set = entry.get("set") if entry else None
+        if (current_level is not None and current_level >= 2
+                and current_level != script_set):
+            # Valid 2..5 the script did not set (or a human changed ours):
+            # human-owned, never overwritten.
+            row["actions"][name] = "skip-human"
+        elif current_level == derived[name] and (
+                current_level is not None or entry is None):
+            # Already at the derived value (set before, or 1/1 by default):
+            # nothing to do. A script-set card the human reset to 1 falls
+            # through to set again below (re-derive wins over reset 1s).
+            if entry is not None and current_level != script_set:
+                row["actions"][name] = "set"
+            else:
+                row["actions"][name] = "skip-same"
+        else:
+            row["actions"][name] = "set"
+    return row
+
+
+def build_plan(source, with_runs, with_prs, ledger):
+    issues = source.issues()
+    if not issues:
+        raise DifficultyError("no issues returned by the source")
+    kids = open_children_map(issues)
+    ledger_by_key = ledger_index(ledger)
+    rows = [plan_card(issue, kids, source, with_runs, with_prs, ledger_by_key)
+            for issue in issues]
+    rows.sort(key=lambda r: str(r["identifier"] or ""))
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# apply / rollback
+# --------------------------------------------------------------------------- #
+
+def apply_plan(source, rows, ledger, ledger_path):
+    """Writes every row actioned 'set'. Returns (applied, errors)."""
+    applied, errors = [], []
+    entries = ledger.setdefault("entries", [])
+    for row in rows:
+        if not row["in_scope"]:
+            continue
+        for name in DIFFICULTY:
+            if row["actions"][name] != "set":
+                continue
+            want = row["derived"][name]
+            code, _, err = source.prop_set(row["issue_id"], name, want)
+            if code != 0:
+                errors.append({"card": row["identifier"], "field": name,
+                               "error": err[:200]})
+                continue
+            key = (row["issue_id"], name)
+            prev_entry = next(
+                (e for e in reversed(entries)
+                 if e.get("issue_id") == key[0] and e.get("field") == key[1]),
+                None,
+            )
+            if prev_entry is None:
+                raw = row["current_raw_present"][name]
+                previous = row["current"][name] if raw else None
+                entries.append({
+                    "issue_id": row["issue_id"],
+                    "identifier": row["identifier"],
+                    "field": name,
+                    "previous": previous,
+                    "set": want,
+                    "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                })
+            else:
+                # Keep the original `previous` so rollback stays exact;
+                # record the newest value set.
+                prev_entry["set"] = want
+                prev_entry["at"] = datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+            applied.append({"card": row["identifier"], "field": name,
+                            "from": row["current"][name], "to": want})
+    if ledger_path and (applied or True):
+        save_ledger(ledger_path, ledger)
+    return applied, errors
+
+
+def rollback(source, ledger, ledger_path):
+    """Restores every ledger entry to its previous value. Returns (restored, errors)."""
+    restored, errors = [], []
+    entries = ledger.get("entries") or []
+    for entry in entries:
+        issue_id, name = entry.get("issue_id"), entry.get("field")
+        previous = entry.get("previous")
+        if previous is None:
+            code, _, err = source.prop_unset(issue_id, name)
+        else:
+            code, _, err = source.prop_set(issue_id, name, previous)
+        if code != 0:
+            errors.append({"card": entry.get("identifier"), "field": name,
+                           "error": err[:200]})
+            continue
+        restored.append({"card": entry.get("identifier"), "field": name,
+                         "to": previous})
+    if ledger_path:
+        ledger["entries"] = []
+        save_ledger(ledger_path, ledger)
+    return restored, errors
+
+
+# --------------------------------------------------------------------------- #
+# rendering
+# --------------------------------------------------------------------------- #
+
+def _table(headers, rows):
+    lines = ["| " + " | ".join(headers) + " |",
+             "| " + " | ".join("---" for _ in headers) + " |"]
+    for row in rows:
+        lines.append("| " + " | ".join(str(cell) for cell in row) + " |")
+    return "\n".join(lines)
+
+
+def signal_str(signals):
+    bits = []
+    if signals.get("priority_high"):
+        bits.append("pri=high")
+    if signals.get("risk_labels"):
+        bits.append("label=%s" % ",".join(signals["risk_labels"]))
+    if signals.get("epic_parent"):
+        bits.append("kids=%d" % signals.get("open_children", 0))
+    bits.append("desc=%d" % signals.get("desc_len", 0))
+    if signals.get("many_failures"):
+        bits.append("fails=%d" % signals.get("failed_runs", 0))
+    elif signals.get("failed_runs") not in (None, "unevaluated"):
+        bits.append("fails=%d" % signals["failed_runs"])
+    if signals.get("rework_pr"):
+        bits.append("prs=%d" % signals.get("open_prs", 0))
+    return "; ".join(bits)
+
+
+def render_table(rows, mode):
+    scoped = [r for r in rows if r["in_scope"]]
+    lines = ["# tier-difficulty (%s) — %d open cards in scope" % (mode, len(scoped)), ""]
+    lines.append(_table(
+        ["card", "status", "current imp/cplx", "derived imp/cplx",
+         "action imp/cplx", "signals"],
+        [[r["identifier"], r["status"],
+          "%d/%d" % (r["current"]["important_level"], r["current"]["complexity"]),
+          "%d/%d" % (r["derived"]["important_level"], r["derived"]["complexity"]),
+          "%s/%s" % (r["actions"]["important_level"], r["actions"]["complexity"]),
+          signal_str(r["signals"])]
+         for r in scoped],
+    ))
+    return "\n".join(lines) + "\n"
+
+
+def build_report(rows, mode, with_runs, with_prs):
+    scoped = [r for r in rows if r["in_scope"]]
+    from collections import Counter
+    counts = Counter((r["derived"]["important_level"],
+                      r["derived"]["complexity"]) for r in scoped)
+    actions = Counter()
+    for r in scoped:
+        for name in DIFFICULTY:
+            actions[(name, r["actions"][name])] += 1
+    return {
+        "tool": TOOL,
+        "version": VERSION,
+        "mode": mode,
+        "scope": {"open_statuses": sorted(OPEN_STATUSES),
+                  "in_scope": len(scoped),
+                  "out_of_scope": len(rows) - len(scoped)},
+        "rules": RULES_DOC,
+        "signals": {"failed_runs": "read" if with_runs else "unevaluated",
+                    "linked_prs": "read" if with_prs else "unevaluated"},
+        "derived_counts": {"%d/%d" % k: v for k, v in sorted(counts.items())},
+        "actions": {"%s:%s" % k: v for k, v in sorted(actions.items())},
+        "cards": rows,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# entry point
+# --------------------------------------------------------------------------- #
+
+def default_ledger_path():
+    here = os.path.dirname(os.path.realpath(__file__))
+    return os.path.join(here, "tier-difficulty.ledger.json")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description="Deterministic difficulty derivation + apply/rollback (M-598).",
+    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the before/after table; write nothing (default)")
+    parser.add_argument("--apply", action="store_true",
+                        help="write derived values via `multica issue property set`")
+    parser.add_argument("--unset", action="store_true",
+                        help="rollback: restore every ledger entry to its previous value")
+    parser.add_argument("--with-runs", action="store_true",
+                        help="read per-card failed runs (one extra CLI call per card)")
+    parser.add_argument("--with-prs", action="store_true",
+                        help="read per-card linked PRs (one extra CLI call per card)")
+    parser.add_argument("--ledger", default=None,
+                        help="ledger file (default: next to this script)")
+    parser.add_argument("--fixture", help="replay captured CLI payloads (offline test)")
+    parser.add_argument("--cli", help="multica executable (default: $MULTICA_CLI_PATH)")
+    parser.add_argument("--out-dir", default=None,
+                        help="also write the JSON report here")
+    parser.add_argument("--stdout", action="store_true",
+                        help="print JSON instead of the table")
+    args = parser.parse_args(argv)
+
+    modes = [args.dry_run, args.apply, args.unset]
+    if sum(bool(m) for m in modes) > 1:
+        print("%s: pick at most one of --dry-run/--apply/--unset" % TOOL,
+              file=sys.stderr)
+        return 2
+    mode = "unset" if args.unset else ("apply" if args.apply else "dry-run")
+    ledger_path = args.ledger or default_ledger_path()
+
+    if args.fixture:
+        try:
+            with open(args.fixture, "r", encoding="utf-8") as handle:
+                source = FixtureSource(json.load(handle))
+        except (OSError, ValueError) as exc:
+            print("%s: cannot read fixture: %s" % (TOOL, exc), file=sys.stderr)
+            return 2
+    else:
+        source = CliSource(args.cli)
+
+    try:
+        ledger = load_ledger(ledger_path)
+    except DifficultyError as exc:
+        print("%s: %s" % (TOOL, exc), file=sys.stderr)
+        return 2
+
+    if mode == "unset":
+        try:
+            restored, errors = rollback(source, ledger, ledger_path)
+        except (SourceError, OSError) as exc:
+            print("%s: %s" % (TOOL, exc), file=sys.stderr)
+            return 2
+        print("restored %d values%s" % (
+            len(restored),
+            ("; ERRORS %d" % len(errors)) if errors else ""))
+        for item in restored:
+            print("  %s %s -> %s" % (item["card"], item["field"], item["to"]))
+        for item in errors:
+            print("  ERROR %s %s: %s" % (item["card"], item["field"], item["error"]),
+                  file=sys.stderr)
+        return 2 if errors else 0
+
+    try:
+        rows = build_plan(source, args.with_runs, args.with_prs, ledger)
+    except (DifficultyError, SourceError) as exc:
+        print("%s: %s" % (TOOL, exc), file=sys.stderr)
+        return 2
+
+    applied, errors = [], []
+    if mode == "apply":
+        try:
+            applied, errors = apply_plan(source, rows, ledger, ledger_path)
+        except (SourceError, OSError) as exc:
+            print("%s: %s" % (TOOL, exc), file=sys.stderr)
+            return 2
+        # Re-plan so the table shows post-write state (all skip-same).
+        try:
+            rows = build_plan(source, args.with_runs, args.with_prs, ledger)
+        except (DifficultyError, SourceError) as exc:
+            print("%s: re-read after apply failed: %s" % (TOOL, exc),
+                  file=sys.stderr)
+            return 2
+
+    report = build_report(rows, mode, args.with_runs, args.with_prs)
+    report["applied"] = applied
+    report["errors"] = errors
+    if args.out_dir:
+        os.makedirs(args.out_dir, exist_ok=True)
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = os.path.join(args.out_dir, "tier-difficulty-%s.json" % day)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        print("wrote %s" % path, file=sys.stderr)
+    if args.stdout:
+        sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    else:
+        sys.stdout.write(render_table(rows, mode))
+        if mode == "apply":
+            print("applied %d writes%s; ledger: %s" % (
+                len(applied),
+                ("; ERRORS %d" % len(errors)) if errors else "",
+                ledger_path), file=sys.stderr)
+    for item in errors:
+        print("ERROR %s %s: %s" % (item["card"], item["field"], item["error"]),
+              file=sys.stderr)
+    return 2 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1521 @@
+#!/usr/bin/env python3
+"""mmx-scan — M-606/M-608: data feed and measurement for the MMX self-improvement loop.
+
+All modes are read-only on Multica and MOCT (they never change issues,
+comments, memory or agents; acting on the output is the curator agent's job).
+`nightly` writes only to the git checkout it is given. M-608 modes
+(snapshot, export, nightly, compare, chart) are documented in README.md.
+The two M-606 modes:
+
+  mmx-scan baseline [--days 7] [--markdown]
+      Weekly baseline over `multica issue run-messages` (M-571 metric):
+      share of completed runs that loaded the `mmx` skill, memory_search /
+      memory_get / memory_note call counts, "Harness edit:" proposals, and
+      team convention/rule records created in the window. Baseline to beat
+      (M-571, 2026-11-25..27): 1/429 completed runs loaded `mmx`.
+
+  mmx-scan signals [--hours 24] [--markdown]
+      Daily correction signals for the curator autopilot: reopens, backward
+      status moves (Needs changes), moves to blocked, plan_verdict runs,
+      REQUEST_CHANGES / reject comments, Owner (member) comments, cards with
+      >=2 failed runs, and pending MOCT records waiting for approval.
+      Owner comments are CANDIDATES: the curator decides which are corrections.
+
+Detection rules (baseline):
+  * mmx loaded = a `Skill` tool call naming `mmx`, a file-read tool on a path
+    containing `mmx/SKILL.md`, or a shell `cat/sed/head/...` of that file.
+    A grep or script that only names the path is not counted.
+  * memory_* = tool_use whose tool name contains `memory_search`,
+    `memory_get` or `memory_note` (covers `mcp__moct__memory_note` etc.).
+  * Harness edit = assistant text or a non-shell tool input (comment file
+    write) with a line starting "Harness edit:", except the skill template
+    "Harness edit: <layer>".
+
+The curator's own autopilot runs are excluded from the baseline ratio
+(`--curator-agent`, default Opus Architect) so the loop does not inflate its
+own metric.
+
+Only stdlib. Uses "$MULTICA_CLI_PATH" (falls back to `multica`). MOCT records
+are read through `multica moct-mcp` (stdio JSON-RPC); if moct-be is not
+reachable the MOCT fields report "unavailable" instead of failing the scan.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import statistics
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
+CLI = os.environ.get("MULTICA_CLI_PATH") or "multica"
+CURATOR_AGENT = "7895c8ca-aed6-461e-9fea-a115b2681872"  # Opus Architect
+TERMINAL = {"completed", "failed", "cancelled", "blocked"}
+# Forward order of the Default workflow; side states are excluded on purpose.
+RANK = {"backlog": 0, "todo": 1, "planing_2": 2, "in_progress": 3,
+        "agent_review_deploy": 4, "in_review": 5, "done": 6}
+SIDE = {"blocked", "wait_for_decision", "cancelled"}
+REJECT_RE = re.compile(r"REQUEST_CHANGES|\bNeeds changes\b|\bVerdict:?\W{0,3}(?:reject|request changes)|"
+                       r"\bplan (?:is |was )?rejected\b|\breject(?:ed|ing)? (?:the |this |your )?plan\b", re.I)
+# A proposal starts a line; mentions inside prose or grep patterns do not count.
+HE_RE = re.compile(r"(?:^|\n)[\s>*`#-]*Harness edit:(?!\s*<layer>)")
+# A shell read of the skill file (not a grep/analysis that merely names it).
+MMX_SHELL_RE = re.compile(r"\b(?:cat|sed|head|less|more|bat|Get-Content|type)\b[^|;&\n]*mmx/SKILL\.md")
+SHELL_TOOLS = {"bash", "shell", "exec_command", "run_shell_command", "powershell", "eval"}
+CURSOR_RE = re.compile(r'--before "([^"]+)"')
+# Native Owner question card (`ask` on the multica MCP server).
+ASK_RE = re.compile(r"(?:^|__)ask$")
+
+
+def ts(s):
+    if not s:
+        return None
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def cli(args, allow_fail=False):
+    p = subprocess.run([CLI] + args, capture_output=True, text=True)
+    if p.returncode != 0:
+        if allow_fail:
+            return None, p.stderr
+        sys.exit(f"mmx-scan: `multica {' '.join(args)}` failed: {p.stderr.strip()}")
+    try:
+        return json.loads(p.stdout or "null"), p.stderr
+    except json.JSONDecodeError:
+        if allow_fail:
+            return None, p.stderr
+        raise
+
+
+def agents():
+    data, _ = cli(["agent", "list", "--output", "json"])
+    return {a["id"]: a["name"] for a in data}
+
+
+def agent_runs(agent_id, since, until):
+    """All runs of one agent created in [since, until), newest first."""
+    out, before = [], None
+    while True:
+        args = ["agent", "tasks", agent_id, "--limit", "200", "--output", "json"]
+        if before:
+            args += ["--before", before]
+        page, err = cli(args, allow_fail=True)
+        if not page:
+            return out
+        stop = False
+        for t in page:
+            c = ts(t.get("created_at"))
+            if c and c < since:
+                stop = True
+                break
+            if c and c < until:
+                out.append(t)
+        m = CURSOR_RE.search(err or "")
+        if stop or not m:
+            return out
+        before = m.group(1)
+
+
+def all_runs(since, until):
+    names = agents()
+    with ThreadPoolExecutor(8) as ex:
+        lists = ex.map(lambda a: agent_runs(a, since, until), names)
+    runs = [t for lst in lists for t in lst]
+    return names, runs
+
+
+def _text(v):
+    return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+
+
+def _untext(v):
+    """Tool input as text with JSON string escapes resolved (so \\n is a newline)."""
+    if isinstance(v, dict):
+        return "\n".join(_untext(x) for x in v.values())
+    return v if isinstance(v, str) else _text(v)
+
+
+def scan_messages(run_id):
+    msgs, _ = cli(["issue", "run-messages", run_id, "--output", "json"],
+                  allow_fail=True)
+    if isinstance(msgs, dict):
+        msgs = msgs.get("messages", [])
+    r = {"mmx": 0, "memory_search": 0, "memory_get": 0, "memory_note": 0,
+         "harness_edit": 0, "ask": 0, "notes": [], "ok": msgs is not None}
+    for m in msgs or []:
+        t = m.get("type")
+        tool = str(m.get("tool") or "")
+        if t == "tool_use":
+            inp = _text(m.get("input") or "")
+            for k in ("memory_search", "memory_get", "memory_note"):
+                if k in tool:
+                    r[k] += 1
+            if "memory_note" in tool:
+                try:
+                    r["notes"].append((m.get("input") or {}).get("title", "")[:120])
+                except AttributeError:
+                    pass
+            tl = tool.lower()
+            if ASK_RE.search(tl):
+                r["ask"] += 1
+            shell = tl in SHELL_TOOLS
+            if (tl == "skill" and re.search(r"(?<![\w-])mmx(?![\w-])", inp)) or \
+                    (shell and MMX_SHELL_RE.search(inp)) or \
+                    (not shell and tl != "skill" and "mmx/SKILL.md" in inp):
+                r["mmx"] += 1
+            if not shell and HE_RE.search(_untext(m.get("input"))):
+                r["harness_edit"] += 1
+        elif t == "text" and HE_RE.search(_text(m.get("content") or "")):
+            r["harness_edit"] += 1
+    return r
+
+
+class MoctMCP:
+    """Minimal stdio JSON-RPC client for `multica moct-mcp` (read-only use)."""
+
+    def __init__(self):
+        env = dict(os.environ)
+        ws = env.get("MULTICA_WORKSPACE_ID", "")
+        env.setdefault("MOCT_WORKSPACE_ID", f"multica:ws:{ws}" if ws else "")
+        ag = env.get("MULTICA_AGENT_ID", "")
+        env.setdefault("MOCT_EXPERT_ID", f"multica:agent:{ag}" if ag else "")
+        self.p = subprocess.Popen([CLI, "moct-mcp"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, env=env)
+        self.n = 0
+        self.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                 "clientInfo": {"name": "mmx-scan", "version": "1"}})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _send(self, msg):
+        self.p.stdin.write(json.dumps(msg) + "\n")
+        self.p.stdin.flush()
+
+    def call(self, method, params):
+        self.n += 1
+        self._send({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params})
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("moct-mcp closed")
+            msg = json.loads(line)
+            if msg.get("id") == self.n:
+                if "error" in msg:
+                    raise RuntimeError(msg["error"])
+                return msg["result"]
+
+    def search(self, **args):
+        res = self.call("tools/call", {"name": "memory_search", "arguments": args})
+        if res.get("isError"):
+            raise RuntimeError(res["content"][0]["text"])
+        return json.loads(res["content"][0]["text"])
+
+    def close(self):
+        self.p.stdin.close()
+        self.p.wait(timeout=10)
+
+
+def moct_records(status, types, homes=None, since=None):
+    try:
+        m = MoctMCP()
+        try:
+            out, cursor = [], None
+            while True:
+                args = {"status": status, "types": types, "limit": 20}
+                if homes:
+                    args["homes"] = homes
+                if cursor:
+                    args["cursor"] = cursor
+                d = m.search(**args)
+                out += d.get("results", [])
+                cursor = d.get("nextCursor")
+                if not cursor:
+                    break
+        finally:
+            m.close()
+    except Exception as e:  # moct-be down must not fail the scan
+        return {"unavailable": str(e)[:200]}
+    if since:
+        out = [r for r in out if ts(r.get("createdAt")) and ts(r["createdAt"]) >= since]
+    return [{"id": r["id"], "type": r["type"], "status": r["status"],
+             "home": r["home"]["kind"], "title": r["title"][:140],
+             "createdAt": r["createdAt"], "useCount": r.get("useCount")}
+            for r in out]
+
+
+def baseline(a):
+    until = datetime.now(timezone.utc)
+    since = until - timedelta(days=a.days)
+    names, runs = all_runs(since, until)
+    runs = [t for t in runs if t["status"] in TERMINAL and not (
+        t.get("agent_id") == a.curator_agent and t.get("kind") == "autopilot")]
+    with ThreadPoolExecutor(8) as ex:
+        res = dict(zip([t["id"] for t in runs], ex.map(scan_messages, [t["id"] for t in runs])))
+    tot = Counter()
+    per_agent = defaultdict(Counter)
+    notes, hits = [], defaultdict(list)
+    for t in runs:
+        r = res[t["id"]]
+        name = names.get(t["agent_id"], t["agent_id"][:8])
+        done = t["status"] == "completed"
+        tot["runs"] += 1
+        tot["completed"] += done
+        tot["unreadable"] += not r["ok"]
+        per_agent[name]["completed"] += done
+        for k in ("mmx", "harness_edit"):
+            if r[k]:
+                hits[k].append({"run": t["id"], "agent": name, "issue": t.get("issue_id")})
+        if done and r["mmx"]:
+            tot["mmx_runs"] += 1
+            per_agent[name]["mmx_runs"] += 1
+        for k in ("memory_search", "memory_get", "memory_note", "harness_edit"):
+            tot[k] += r[k]
+            per_agent[name][k] += r[k]
+            if r[k]:
+                tot[k + "_runs"] += 1
+        notes += [{"run": t["id"], "agent": name, "title": n} for n in r["notes"]]
+    out = {
+        "at": until.isoformat(timespec="seconds"), "tool": "mmx-scan", "mode": "baseline",
+        "window": {"since": since.isoformat(timespec="seconds"),
+                   "until": until.isoformat(timespec="seconds")},
+        "totals": dict(tot),
+        "mmx_ratio": f"{tot['mmx_runs']}/{tot['completed']}",
+        "per_agent": {k: dict(v) for k, v in sorted(per_agent.items())},
+        "memory_note_titles": notes,
+        "hit_runs": dict(hits),
+        "new_team_records": moct_records("active", ["convention", "rule"], ["team"], since),
+        "baseline_to_beat": "1/429 (M-571, 2026-11-25..27)",
+    }
+    print(render_baseline(out) if a.markdown else json.dumps(out, indent=1))
+
+
+def render_baseline(o):
+    t = o["totals"]
+    w = o["window"]
+    lines = [f"## MMX baseline scan ({w['since'][:10]} .. {w['until'][:10]})", "",
+             "| Metric | Value |", "|---|---|",
+             f"| Completed runs scanned | {t.get('completed', 0)} (of {t.get('runs', 0)} terminal; {t.get('unreadable', 0)} unreadable) |",
+             f"| Runs that loaded `mmx` | **{o['mmx_ratio']}** (baseline {o['baseline_to_beat']}) |",
+             f"| `memory_search` / `memory_get` calls | {t.get('memory_search', 0)} / {t.get('memory_get', 0)} |",
+             f"| `memory_note` calls | {t.get('memory_note', 0)} in {t.get('memory_note_runs', 0)} runs |",
+             f"| \"Harness edit:\" proposals | {t.get('harness_edit', 0)} in {t.get('harness_edit_runs', 0)} runs |"]
+    rec = o["new_team_records"]
+    if isinstance(rec, dict):
+        lines.append(f"| New active team convention/rule records | unavailable ({rec['unavailable']}) |")
+    else:
+        lines.append(f"| New active team convention/rule records | {len(rec)} |")
+    lines += ["", "| Agent | completed | mmx | search | get | note | harness edit |",
+              "|---|---|---|---|---|---|---|"]
+    for name, c in o["per_agent"].items():
+        if c.get("completed"):
+            lines.append(f"| {name.replace('|', '/')} | {c.get('completed', 0)} | {c.get('mmx_runs', 0)} | "
+                         f"{c.get('memory_search', 0)} | {c.get('memory_get', 0)} | "
+                         f"{c.get('memory_note', 0)} | {c.get('harness_edit', 0)} |")
+    if not isinstance(rec, dict) and rec:
+        lines += ["", "New team records: " + "; ".join(f"`{r['id'][:12]}` {r['title']}" for r in rec)]
+    return "\n".join(lines)
+
+
+def timeline(issue_id):
+    d, _ = cli(["issue", "timeline", issue_id, "--output", "json"], allow_fail=True)
+    return d or []
+
+
+def signals(a):
+    until = datetime.now(timezone.utc)
+    since = until - timedelta(hours=a.hours)
+    issues, off = [], 0
+    while True:
+        page, _ = cli(["issue", "list", "--updated-since", since.isoformat(timespec="seconds"),
+                       "--updated-until", until.isoformat(timespec="seconds"),
+                       "--limit", "100", "--offset", str(off), "--output", "json",
+                       "--fields", "id,identifier,title,status,assignee_id"])
+        batch = page.get("issues", []) if isinstance(page, dict) else page
+        issues += batch
+        if not (isinstance(page, dict) and page.get("has_more")) or not batch:
+            break
+        off += len(batch)
+    if a.exclude_title:
+        issues = [i for i in issues if not i["title"].startswith(a.exclude_title)]
+    by_id = {i["id"]: i for i in issues}
+    with ThreadPoolExecutor(8) as ex:
+        tls = dict(zip(by_id, ex.map(timeline, list(by_id))))
+    names, runs = all_runs(since, until)
+    items = []
+
+    def add(issue, kind, at, actor, detail):
+        items.append({"card": issue["identifier"], "title": issue["title"][:80],
+                      "kind": kind, "at": at, "actor": actor, "detail": detail})
+
+    for iid, tl in tls.items():
+        iss = by_id[iid]
+        for e in tl:
+            at = ts(e.get("created_at"))
+            if not at or at < since:
+                continue
+            actor = e.get("actor_name") or names.get(e.get("actor_id"), e.get("actor_type"))
+            if e.get("type") == "activity" and e.get("action") == "status_changed":
+                f, t = (e.get("details") or {}).get("from"), (e.get("details") or {}).get("to")
+                if t == "blocked":
+                    add(iss, "blocked", e["created_at"], actor, f"{f}->{t}")
+                elif f in ("done", "in_review", "cancelled") and t in RANK and RANK[t] < RANK.get(f, 7):
+                    add(iss, "reopen", e["created_at"], actor, f"{f}->{t}")
+                elif f in RANK and t in RANK and RANK[t] < RANK[f]:
+                    add(iss, "needs_changes", e["created_at"], actor, f"{f}->{t}")
+            elif e.get("type") == "comment":
+                body = e.get("content") or ""
+                if e.get("actor_type") == "member":
+                    add(iss, "owner_comment", e["created_at"], actor, body[:300])
+                elif REJECT_RE.search(body):
+                    add(iss, "reject_comment", e["created_at"], actor,
+                        body[max(0, REJECT_RE.search(body).start() - 80):][:300])
+    fails = Counter()
+    for t in runs:
+        if t.get("trigger_evidence_kind") == "plan_verdict" and t.get("issue_id") in by_id:
+            add(by_id[t["issue_id"]], "plan_verdict_run", t["created_at"],
+                names.get(t["agent_id"], "?"), "run triggered by a plan verdict; check if rejected")
+        if t["status"] == "failed" and t.get("issue_id"):
+            fails[t["issue_id"]] += 1
+    for iid, n in fails.items():
+        if n >= 2:
+            iss = by_id.get(iid) or {"identifier": iid[:13], "title": ""}
+            add(iss, "repeat_failure", None, None, f"{n} failed runs in window")
+    items.sort(key=lambda x: (x["card"], x["at"] or ""))
+    out = {"at": until.isoformat(timespec="seconds"), "tool": "mmx-scan", "mode": "signals",
+           "window": {"since": since.isoformat(timespec="seconds"),
+                      "until": until.isoformat(timespec="seconds")},
+           "counts": dict(Counter(i["kind"] for i in items)),
+           "items": items,
+           "pending_memory": moct_records("pending", ["rule", "convention", "how_to_work", "decision"])}
+    print(render_signals(out) if a.markdown else json.dumps(out, indent=1, ensure_ascii=False))
+
+
+def render_signals(o):
+    lines = [f"## MMX signals {o['window']['since'][:16]} .. {o['window']['until'][:16]} UTC",
+             "", "Counts: " + (", ".join(f"{k} {v}" for k, v in sorted(o["counts"].items())) or "none"), ""]
+    for i in o["items"]:
+        lines.append(f"- {i['card']} `{i['kind']}` {i['at'] or ''} {i['actor'] or ''}: "
+                     + i["detail"].replace("\n", " ")[:200])
+    pm = o["pending_memory"]
+    lines += ["", "Pending MOCT records: " + (f"unavailable ({pm['unavailable']})" if isinstance(pm, dict)
+                                             else str(len(pm)))]
+    if not isinstance(pm, dict):
+        lines += [f"- `{r['id']}` {r['type']}/{r['home']}: {r['title']}" for r in pm]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# M-608: measurement half — snapshot, export, nightly, compare, chart.
+# Metric lines store COUNTS (numerators and denominators), never ratios, so any
+# window can be re-aggregated exactly. Ratios are computed in `compare`/`chart`.
+# ---------------------------------------------------------------------------
+
+SCHEMA = 1
+WORKSPACE_ROW = "_workspace"
+RESUME_RE = re.compile(r"no live run and no live wakeup\. Resume the task now")
+# Owner comment that corrects delivered work ("no, do X"). Heuristic; only
+# counted while the card sits in agent_review_deploy/in_review/done.
+OWNER_CORRECTION_RE = re.compile(
+    r"(?:^|[\s>*])(?:no[,.!]|not what|wrong|instead\b|why (?:did|is|was|do|does)\b|how\?|"
+    r"should not\b|shouldn'?t\b|don'?t\b|do not\b|stop\b|revert\b|reopen|that'?s not|this is not|"
+    r"it not\b|isn'?t (?:done|working|right)|still (?:broken|wrong|not))", re.I)
+DELIVERED = {"agent_review_deploy", "in_review", "done"}
+# A review VERDICT of REQUEST_CHANGES, not a comment that lists it as a signal.
+RC_VERDICT_RE = re.compile(r"\b(?:verdict|review)\b[^\n]{0,80}?\bREQUEST_CHANGES\b|"
+                           r"(?:^|\n)[\s>*#_`]*REQUEST_CHANGES\b", re.I)
+COUNT_KEYS = (
+    # quality (cards are attributed to the agent that delivered them, see builder())
+    "cards_in_review", "corrected_cards", "reopens", "owner_correction_comments", "sent_back",
+    "request_changes", "prs_opened", "done_cards", "days_in_review_sum",
+    "tokens_input", "tokens_output", "tokens_cache_read", "tokens_cache_write",
+    # runs
+    "runs", "completed", "failed", "blocked", "cancelled", "resumes", "curator_runs",
+    "mmx_runs", "memory_search", "memory_get", "memory_note", "harness_edit", "asks",
+    "unreadable_runs",
+)
+# Secret-shaped strings are redacted before anything is written to disk.
+SECRET_RE = re.compile(
+    r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|"
+    r"xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"(?i:(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*['\"]?[^\s'\"]{8,}))")
+
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+
+
+def day_bounds(day):
+    since = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+    return since, since + timedelta(days=1)
+
+
+def issues_touched_since(since, until):
+    out, off = [], 0
+    while True:
+        page, _ = cli(["issue", "list", "--updated-since", since.isoformat(timespec="seconds"),
+                       "--updated-until", until.isoformat(timespec="seconds"),
+                       "--limit", "100", "--offset", str(off), "--output", "json",
+                       "--fields", "id,identifier,title,status,assignee_type,assignee_id"])
+        batch = page.get("issues", []) if isinstance(page, dict) else page
+        out += batch
+        if not (isinstance(page, dict) and page.get("has_more")) or not batch:
+            return out
+        off += len(batch)
+
+
+def card_events(tl, since, until, assignee):
+    """Replay one card's timeline; yield (kind, at, builder_agent_id, extra) for [since, until).
+
+    builder = the agent that last moved the card FORWARD out of a working
+    state (todo/planing_2/in_progress) into a delivered state — the agent whose
+    delivery a later correction judges. Falls back to the current assignee.
+    """
+    events = sorted(tl, key=lambda e: e.get("created_at") or "")
+    status, builder, entered_review = None, None, None
+    for e in events:
+        at = ts(e.get("created_at"))
+        if not at:
+            continue
+        inside = since <= at < until
+        b = builder or assignee
+        if e.get("type") == "activity" and e.get("action") == "status_changed":
+            d = e.get("details") or {}
+            f, t = d.get("from"), d.get("to")
+            if f in RANK and t in RANK and RANK[t] > RANK[f] and t in DELIVERED and \
+                    RANK[f] <= RANK["in_progress"] and e.get("actor_type") == "agent":
+                builder = e.get("actor_id")
+                b = builder
+            if inside:
+                if t == "in_review" and f != "in_review":
+                    yield "in_review", at, b, None
+                if t == "done" and entered_review:
+                    yield "done", at, b, (at - entered_review).total_seconds() / 86400
+                if f in ("in_review", "done") and t in RANK and RANK[t] < RANK[f]:
+                    yield "reopen", at, b, None
+                elif f in RANK and t in RANK and RANK[t] < RANK[f]:
+                    yield "sent_back", at, b, None
+            if t == "in_review":
+                entered_review = at
+            status = t
+        elif e.get("type") == "comment" and inside:
+            body = e.get("content") or ""
+            if e.get("actor_type") == "member" and status in DELIVERED and OWNER_CORRECTION_RE.search(body):
+                yield "owner_correction", at, b, None
+            elif e.get("actor_type") == "agent" and e.get("actor_id") != b and \
+                    RC_VERDICT_RE.search(body[:600]):  # the builder quoting the verdict is not one
+                yield "request_changes", at, b, None
+
+
+def usage_tokens(issue_id):
+    u, _ = cli(["issue", "usage", issue_id, "--output", "json"], allow_fail=True)
+    u = u or {}
+    return {"tokens_input": u.get("total_input_tokens", 0), "tokens_output": u.get("total_output_tokens", 0),
+            "tokens_cache_read": u.get("total_cache_read_tokens", 0),
+            "tokens_cache_write": u.get("total_cache_write_tokens", 0)}
+
+
+def prs_opened(day, slugs):
+    """PRs created on `day` in the workspace repos, attributed by head branch `agent/<slug>/`."""
+    ws, _ = cli(["workspace", "get", "--output", "json"], allow_fail=True)
+    repos = [r["url"].rstrip("/").split("github.com/")[-1] for r in (ws or {}).get("repos", [])]
+    out = Counter()
+    for repo in repos:
+        p = subprocess.run(["gh", "pr", "list", "-R", repo, "--state", "all", "--limit", "200",
+                            "--search", f"created:{day}", "--json", "headRefName"],
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            continue
+        for pr in json.loads(p.stdout or "[]"):
+            m = re.match(r"agent/([^/]+)/", pr.get("headRefName", ""))
+            if m and m.group(1) in slugs:
+                out[slugs[m.group(1)]] += 1
+    return out
+
+
+def snapshot_day(day, harness_commit=None, curator_agent=CURATOR_AGENT):
+    """One dict per agent with activity on `day` (UTC), plus a `_workspace` row."""
+    since, until = day_bounds(day)
+    names, runs = all_runs(since, until)
+    rows = defaultdict(Counter)
+    terminal = [t for t in runs if t["status"] in TERMINAL]
+    with ThreadPoolExecutor(8) as ex:
+        scans = dict(zip([t["id"] for t in terminal], ex.map(scan_messages, [t["id"] for t in terminal])))
+    for t in runs:
+        c = rows[t["agent_id"]]
+        c["runs"] += 1
+        if t["status"] in ("completed", "failed", "blocked", "cancelled"):
+            c[t["status"]] += 1
+        if RESUME_RE.search((t.get("handoff_note") or "") + (t.get("trigger_summary") or "")):
+            c["resumes"] += 1
+        if t["agent_id"] == curator_agent and t.get("kind") == "autopilot":
+            c["curator_runs"] += 1
+            continue  # the loop must not inflate its own usage metrics
+        r = scans.get(t["id"])
+        if not r:
+            continue
+        c["unreadable_runs"] += not r["ok"]
+        c["mmx_runs"] += bool(r["mmx"]) and t["status"] == "completed"
+        for k in ("memory_search", "memory_get", "memory_note", "harness_edit"):
+            c[k] += r[k]
+        c["asks"] += r["ask"]
+    issues = issues_touched_since(since, datetime.now(timezone.utc))
+    with ThreadPoolExecutor(8) as ex:
+        tls = dict(zip([i["id"] for i in issues], ex.map(timeline, [i["id"] for i in issues])))
+    review_cards, corrected = defaultdict(set), defaultdict(set)
+    for i in issues:
+        assignee = i.get("assignee_id") if i.get("assignee_type") == "agent" else None
+        for kind, _at, b, extra in card_events(tls[i["id"]], since, until, assignee):
+            if not b:
+                continue
+            c = rows[b]
+            if kind == "in_review":
+                review_cards[b].add(i["id"])
+            elif kind == "done":
+                c["done_cards"] += 1
+                c["days_in_review_sum"] += round(extra, 3)
+            elif kind == "reopen":
+                c["reopens"] += 1
+                corrected[b].add(i["id"])
+            elif kind == "owner_correction":
+                c["owner_correction_comments"] += 1
+                corrected[b].add(i["id"])
+            elif kind in ("sent_back", "request_changes"):
+                c[kind] += 1
+    for b, cards in review_cards.items():
+        rows[b]["cards_in_review"] += len(cards)
+        with ThreadPoolExecutor(8) as ex:
+            for u in ex.map(usage_tokens, list(cards)):
+                rows[b].update(u)
+    for b, cards in corrected.items():
+        rows[b]["corrected_cards"] += len(cards)
+    for b, n in prs_opened(day, {slug(v): k for k, v in names.items()}).items():
+        rows[b]["prs_opened"] += n
+    team = moct_records("active", ["convention", "rule"], ["team"])
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    base = {"schema": SCHEMA, "date": day, "harness_commit": harness_commit, "measured_at": now}
+    out = []
+    tot = Counter()
+    for aid in sorted(rows, key=lambda a: names.get(a, a)):
+        c = rows[aid]
+        tot.update(c)
+        out.append({**base, "agent_id": aid, "agent": names.get(aid, aid[:8]),
+                    **{k: c.get(k, 0) for k in COUNT_KEYS}})
+    out.append({**base, "agent_id": None, "agent": WORKSPACE_ROW, **{k: tot.get(k, 0) for k in COUNT_KEYS},
+                "active_team_rules": None if isinstance(team, dict) else len(team),
+                "active_team_rules_as_of": now})
+    return out
+
+
+def write_jsonl(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def snapshot(a):
+    rows = snapshot_day(a.date, a.harness_commit, a.curator_agent)
+    if a.out:
+        path = os.path.join(a.out, f"{a.date}.jsonl")
+        write_jsonl(path, rows)
+        print(f"mmx-scan: wrote {len(rows)} rows to {path}", file=sys.stderr)
+    else:
+        for r in rows:
+            print(json.dumps(r, sort_keys=True, ensure_ascii=False))
+
+
+# --- incumbent export -------------------------------------------------------
+
+def redact(text):
+    return SECRET_RE.sub("[REDACTED]", text or "")
+
+
+def _write(root, rel, text):
+    p = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        f.write(redact(text).rstrip("\n") + "\n")
+
+
+def export(a):
+    """Write the portable harness (L1, L3, L4 + autopilot prompts) as plain files.
+
+    Deterministic output, so an unchanged harness produces no git diff. Agent
+    env, args and MCP config are never exported; secret-shaped strings are
+    redacted. The tree is rebuilt from scratch so deletions show up as diffs.
+    """
+    root = a.out
+    for sub in ("skills", "agents", "workspace", "autopilots"):
+        shutil.rmtree(os.path.join(root, sub), ignore_errors=True)
+    ws, _ = cli(["workspace", "get", "--output", "json"])
+    _write(root, "workspace/context.md", ws.get("context") or "")
+    skills, _ = cli(["skill", "list", "--output", "json"])
+    for s in sorted(skills, key=lambda x: x["name"]):
+        d, _ = cli(["skill", "get", s["id"], "--with-content", "--output", "json"])
+        base = f"skills/{slug(d['name'])}"
+        _write(root, f"{base}/SKILL.md", d.get("content") or "")
+        for f in d.get("files") or []:
+            rel = os.path.normpath(f.get("path") or "")
+            if rel and not rel.startswith("..") and not os.path.isabs(rel) and f.get("content") is not None:
+                _write(root, f"{base}/{rel}", f["content"])
+        _write(root, f"{base}/meta.json", json.dumps(
+            {"id": d["id"], "name": d["name"], "description": d.get("description"),
+             "updated_at": d.get("updated_at")}, indent=1, sort_keys=True))
+    skill_names = {s["id"]: s["name"] for s in skills}
+    for ag in sorted(agents_full(), key=lambda x: x["name"]):
+        base = f"agents/{slug(ag['name'])}"
+        _write(root, f"{base}/instructions.md", ag.get("instructions") or "")
+        meta = {k: ag.get(k) for k in ("id", "name", "description", "model", "role", "subtype",
+                                       "implements_role_id", "runtime_mode", "thinking_level",
+                                       "max_concurrent_tasks", "use_tiers", "tier_ids", "updated_at")}
+        meta["skills"] = sorted(skill_names.get(x.get("id") if isinstance(x, dict) else x,
+                                                (x.get("name") if isinstance(x, dict) else x))
+                                for x in ag.get("skills") or [])
+        _write(root, f"{base}/meta.json", json.dumps(meta, indent=1, sort_keys=True))
+    aps, _ = cli(["autopilot", "list", "--output", "json"], allow_fail=True)
+    aps = aps if isinstance(aps, list) else (aps or {}).get("autopilots", [])
+    for ap in sorted(aps, key=lambda x: x.get("title") or ""):
+        d, _ = cli(["autopilot", "get", ap["id"], "--output", "json"], allow_fail=True)
+        if not d:
+            continue
+        p = d.get("autopilot", d)
+        base = f"autopilots/{slug(p.get('title'))}"
+        _write(root, f"{base}/prompt.md", p.get("description") or "")
+        _write(root, f"{base}/meta.json", json.dumps(
+            {"id": p.get("id"), "title": p.get("title"), "assignee_id": p.get("assignee_id"),
+             "status": p.get("status"), "execution_mode": p.get("execution_mode"),
+             "triggers": [{k: t.get(k) for k in ("kind", "cron_expression", "timezone", "enabled")}
+                          for t in d.get("triggers") or []]}, indent=1, sort_keys=True))
+    print(f"mmx-scan: exported harness to {root}", file=sys.stderr)
+
+
+def agents_full():
+    lst, _ = cli(["agent", "list", "--output", "json"])
+    with ThreadPoolExecutor(8) as ex:
+        return [d for d, _ in ex.map(lambda a: cli(["agent", "get", a["id"], "--output", "json"]), lst)]
+
+
+# --- nightly: export + snapshot + commit ------------------------------------
+
+def git(repo, *args, check=True):
+    p = subprocess.run(["git", "-C", repo] + list(args), capture_output=True, text=True)
+    if check and p.returncode != 0:
+        sys.exit(f"mmx-scan: git {' '.join(args)} failed: {p.stderr.strip()}")
+    return p.stdout.strip()
+
+
+def commit_if_changed(repo, path, msg):
+    path = os.path.relpath(os.path.abspath(path), os.path.abspath(repo))
+    git(repo, "add", "-A", "--", path)
+    if subprocess.run(["git", "-C", repo, "diff", "--cached", "--quiet", "--", path]).returncode == 0:
+        return False
+    git(repo, "commit", "-q", "-m", msg, "--", path)
+    return True
+
+
+PROTECTED_BRANCHES = {"integration", "master", "main", "stable"}
+
+
+def guard_destination(repo, push):
+    """Data never lands on a code branch or in a public repo (M-608 review, Owner decision)."""
+    cur = git(repo, "symbolic-ref", "--short", "-q", "HEAD", check=False)
+    for name, what in ((cur, "checkout branch"), (push, "--push target")):
+        if name and name in PROTECTED_BRANCHES:
+            sys.exit(f"mmx-scan: refusing: {what} is `{name}`; MMX data goes to a data branch (e.g. mmx-harness)")
+    if push:
+        url = git(repo, "remote", "get-url", "origin")
+        p = subprocess.run(["gh", "repo", "view", url, "--json", "isPrivate", "-q", ".isPrivate"],
+                           capture_output=True, text=True)
+        if p.stdout.strip() != "true":
+            sys.exit(f"mmx-scan: refusing to push: origin {url} is not a private repo "
+                     f"(the export holds agent instructions and Workspace Context)")
+
+
+def nightly(a):
+    """Export the incumbent, commit it, then snapshot each missing day against that commit."""
+    guard_destination(a.repo, a.push)
+    repo, base = a.repo, os.path.join(a.repo, a.dir)
+    inc, met = os.path.join(base, "incumbent"), os.path.join(base, "metrics")
+    today = datetime.now(timezone.utc).date()
+    a.out = inc
+    export(a)
+    changed = commit_if_changed(repo, inc, f"mmx-harness: incumbent {today.isoformat()}")
+    sha = git(repo, "log", "-1", "--format=%H", "--", os.path.relpath(inc, repo)) or git(repo, "rev-parse", "HEAD")
+    days = []
+    start = datetime.fromisoformat(a.backfill_from).date() if a.backfill_from else today - timedelta(days=1)
+    d = start
+    while d < today:
+        if a.force or not os.path.exists(os.path.join(met, f"{d.isoformat()}.jsonl")):
+            days.append(d.isoformat())
+        d += timedelta(days=1)
+    for day in days[-a.max_days:]:
+        write_jsonl(os.path.join(met, f"{day}.jsonl"), snapshot_day(day, sha, a.curator_agent))
+    if days:
+        commit_if_changed(repo, met, f"mmx-harness: metrics {', '.join(days[-a.max_days:])} (harness {sha[:10]})")
+    if a.push:
+        git(repo, "push", "-q", "origin", f"HEAD:{a.push}")
+    print(json.dumps({"incumbent_changed": changed, "harness_commit": sha, "snapshot_days": days[-a.max_days:],
+                      "head": git(repo, "rev-parse", "HEAD"), "pushed": a.push or None}))
+
+
+# --- compare: the acceptance rule as a calculation ---------------------------
+
+METRICS = {
+    # name: (numerator keys, denominator keys, lower_is_better)
+    "correction_rate": (("corrected_cards",), ("cards_in_review",), True),
+    "request_changes_per_pr": (("request_changes",), ("prs_opened",), True),
+    "tokens_per_card": (("tokens_input", "tokens_output", "tokens_cache_write"), ("cards_in_review",), True),
+    "days_in_review": (("days_in_review_sum",), ("done_cards",), True),
+    "failed_run_rate": (("failed", "blocked"), ("runs",), True),
+    "resume_rate": (("resumes",), ("runs",), True),
+    "asks_per_run": (("asks",), ("completed",), True),
+    "mmx_share": (("mmx_runs",), ("completed",), False),
+    "memory_calls_per_run": (("memory_search", "memory_get", "memory_note"), ("completed",), False),
+    "harness_edit_per_run": (("harness_edit",), ("completed",), False),
+}
+
+
+def load_metrics(d):
+    rows = []
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".jsonl"):
+            with open(os.path.join(d, f)) as fh:
+                rows += [json.loads(line) for line in fh if line.strip()]
+    return rows
+
+
+def pooled(rows, metric):
+    num, den, _ = METRICS[metric]
+    n = sum(r.get(k, 0) or 0 for r in rows for k in num)
+    dd = sum(r.get(k, 0) or 0 for r in rows for k in den)
+    return (n / dd) if dd else None
+
+
+def evaluate(rows, metric, canary, start, before_days=14, after_end=None, iters=2000, seed=7):
+    """Effect of an edit started on `start` and its noise band δ.
+
+    canary = list of agent names/ids, or [] for an L0/global edit (before/after on all
+    agents). With canaries the effect is difference-in-differences against the
+    other agents. δ = 95th percentile of |effect| under placebo splits of the
+    `before_days` baseline (day-level bootstrap), so an effect is real only if
+    it exceeds what baseline noise alone produces.
+    """
+    import random
+    agent_rows = [r for r in rows if r["agent"] != WORKSPACE_ROW]
+    s = datetime.fromisoformat(start).date()
+    b0 = (s - timedelta(days=before_days)).isoformat()
+    before = [r for r in agent_rows if b0 <= r["date"] < start]
+    after = [r for r in agent_rows if r["date"] >= start and (not after_end or r["date"] <= after_end)]
+    is_c = (lambda r: r["agent"] in canary or r["agent_id"] in canary) if canary else (lambda r: True)
+
+    def stat(bef, aft):
+        if not canary:
+            x, y = pooled(bef, metric), pooled(aft, metric)
+            return None if x is None or y is None else y - x
+        parts = [pooled([r for r in g if is_c(r) == want], metric) for g in (bef, aft) for want in (True, False)]
+        if None in parts:
+            return None
+        cb, kb, ca, ka = parts
+        return (ca - cb) - (ka - kb)
+
+    effect = stat(before, after)
+    days_b = sorted({r["date"] for r in before})
+    by_day = defaultdict(list)
+    for r in before:
+        by_day[r["date"]].append(r)
+    n_after = len({r["date"] for r in after})
+    rnd = random.Random(seed)
+    placebo = []
+    if days_b and n_after:
+        for _ in range(iters):
+            p1 = [x for d in rnd.choices(days_b, k=len(days_b)) for x in by_day[d]]
+            p2 = [x for d in rnd.choices(days_b, k=n_after) for x in by_day[d]]
+            v = stat(p1, p2)
+            if v is not None:
+                placebo.append(abs(v))
+    placebo.sort()
+    delta = placebo[int(0.95 * (len(placebo) - 1))] if placebo else None
+
+    def arm(rs, want):
+        sel = [r for r in rs if not canary or is_c(r) == want]
+        return {"days": len({r["date"] for r in sel}), "cards": sum(r.get("cards_in_review", 0) for r in sel),
+                "value": pooled(sel, metric)}
+    arms = {"canary_before": arm(before, True), "canary_after": arm(after, True)}
+    if canary:
+        arms.update({"control_before": arm(before, False), "control_after": arm(after, False)})
+    return {"metric": metric, "effect": effect, "delta": delta, "arms": arms,
+            "baseline_days": len(days_b), "lower_is_better": METRICS[metric][2]}
+
+
+def compare(a):
+    rows = load_metrics(a.metrics)
+    canary = [x.strip() for x in a.canary.split(",") if x.strip()] if a.canary else []
+    target = evaluate(rows, a.target, canary, a.start, a.baseline_days, a.end)
+    guards = [evaluate(rows, g, canary, a.start, a.baseline_days, a.end) for g in a.guards.split(",") if g]
+    reasons = []
+    for k, v in target["arms"].items():
+        if k.endswith("after") and (v["days"] < 7 or v["cards"] < 10):
+            reasons.append(f"{k}: {v['days']} days / {v['cards']} cards (< 7 days or < 10 cards)")
+    if target["baseline_days"] < 14:
+        reasons.append(f"baseline has {target['baseline_days']} days (< 14)")
+
+    def better(e):
+        if e["effect"] is None or e["delta"] is None:
+            return None
+        gain = -e["effect"] if e["lower_is_better"] else e["effect"]
+        return gain > e["delta"], gain < -e["delta"]
+    t = better(target)
+    if reasons or t is None:
+        verdict = "insufficient-data"
+    elif not t[0]:
+        verdict = "revert"
+        reasons.append(f"target gain within or below δ ({target['effect']} vs δ {target['delta']})")
+    else:
+        verdict = "adopt"
+    for g in guards:
+        gb = better(g)
+        if gb and gb[1]:
+            verdict = "revert" if verdict != "insufficient-data" else verdict
+            reasons.append(f"guard {g['metric']} worse by more than δ ({g['effect']} vs δ {g['delta']})")
+    out = {"edit_start": a.start, "canary": canary or "all (before/after)", "target": target,
+           "guards": guards, "suggested_verdict": verdict, "reasons": reasons,
+           "note": "Suggestion only. Claude Architect decides and also checks tokens_added is paid for."}
+    print(json.dumps(out, indent=1))
+
+
+# --- chart: weekly loop view -------------------------------------------------
+
+def sim_verdicts(sim_dir):
+    """(decided_at, verdict) for every sim/attempts/*.verdict.json (plan rev 16 SIM record)."""
+    adir = os.path.join(sim_dir, "attempts")
+    out = []
+    for f in sorted(os.listdir(adir)) if os.path.isdir(adir) else []:
+        if f.endswith(".verdict.json"):
+            with open(os.path.join(adir, f)) as fh:
+                v = json.load(fh)
+            out.append((v.get("decided_at") or "1970-01-01", str(v.get("verdict") or "").lower()))
+    return out
+
+
+def week_of(day):
+    d = datetime.fromisoformat(day[:10]).date()
+    return (d - timedelta(days=d.weekday())).isoformat()
+
+
+def chart(a):
+    rows = [r for r in load_metrics(a.metrics) if r["agent"] != WORKSPACE_ROW]
+    weeks = defaultdict(list)
+    for r in rows:
+        weeks[week_of(r["date"])].append(r)
+    ks = sorted(weeks)[-a.weeks:]
+    corr = [pooled(weeks[w], "correction_rate") for w in ks]
+    tok = [pooled(weeks[w], "tokens_per_card") for w in ks]
+    edits = Counter()
+    sim_dir = a.sim or os.path.join(a.metrics, os.pardir, os.pardir, "sim")
+    for at, v in sim_verdicts(sim_dir):
+        if v in ("kept", "rejected", "inconclusive"):  # rejected/inconclusive edits are reverted
+            edits[(week_of(at), "adopted" if v == "kept" else "reverted")] += 1
+    fmt = lambda xs, f: "[" + ", ".join(f(x) if x is not None else "0" for x in xs) + "]"
+    lab = "[" + ", ".join(f'"{w[5:]}"' for w in ks) + "]"
+    lines = ["### MMX loop: is it improving?", "",
+             "```mermaid", "xychart-beta", '  title "Owner-correction rate per card reaching in_review"',
+             f"  x-axis {lab}", '  y-axis "corrected / delivered"',
+             f"  line {fmt(corr, lambda x: f'{x:.3f}')}", "```", "",
+             "```mermaid", "xychart-beta", '  title "Tokens per card reaching in_review (k, excl. cache reads)"',
+             f"  x-axis {lab}", '  y-axis "k tokens"',
+             f"  bar {fmt(tok, lambda x: f'{x / 1000:.0f}')}", "```", "",
+             "| Week | delivered cards | corrected | correction rate | k tokens/card | edits adopted | reverted |",
+             "|---|---|---|---|---|---|---|"]
+    for w, c, t in zip(ks, corr, tok):
+        rs = weeks[w]
+        lines.append(f"| {w} | {sum(r['cards_in_review'] for r in rs)} | {sum(r['corrected_cards'] for r in rs)} | "
+                     f"{'-' if c is None else f'{c:.2f}'} | {'-' if t is None else f'{t / 1000:.0f}'} | "
+                     f"{edits[(w, 'adopted')]} | {edits[(w, 'reverted')]} |")
+    lines += ["", "Improving = correction rate falls while tokens per card does not rise."]
+    print("\n".join(lines))
+
+# ---------------------------------------------------------------------------
+# M-612: SIM ledger — one JSON file per problem, attempt and verdict (M-571 §§3,4,7).
+# Files are immutable: each is written once and never rewritten. A verdict is a
+# separate `A-<round>-<n>.verdict.json` file, written once the gate judges it.
+# `INDEX.json` is generated by `sim index` and never edited by hand.
+# The data lives in Knowledge_Documents (Owner, M-608): sim/problems/,
+# sim/attempts/, sim/INDEX.json. moct is public.
+# ---------------------------------------------------------------------------
+
+SIM_SCHEMA = 1
+SIM_COMPONENTS = ("owner_corrections_per_card", "tokens_per_card", "days_in_review")
+# Mapping from the gate's abstract components to snapshot derived metrics.
+GATE_METRICS = {"owner_corrections_per_card": "correction_rate",
+                "tokens_per_card": "tokens_per_card",
+                "days_in_review": "days_in_review"}
+SIM_PROBLEM_RE = re.compile(r"^P-(\d+)\.json$")
+SIM_ATTEMPT_RE = re.compile(r"^A-(\d+)-(\d+)\.json$")
+
+
+def sim_root(a):
+    """The sim/ dir: --sim DIR, else <data checkout>/<sim dir>; never the cwd by accident."""
+    if getattr(a, "sim", None):
+        return a.sim
+    repo = getattr(a, "repo", None)
+    if repo:
+        return os.path.join(repo, getattr(a, "sim_dir", "sim"))
+    sys.exit("mmx-scan sim: need --sim DIR (or --repo for data-side commands)")
+
+
+def _sim_read(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def _sim_write_new(path, obj):
+    """Write one immutable SIM file; refuse to overwrite (concurrent writers conflict loudly)."""
+    if os.path.exists(path):
+        sys.exit(f"mmx-scan sim: {path} already exists; SIM files are immutable and written once")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=1, sort_keys=True, ensure_ascii=False)
+        f.write("\n")
+    print(f"mmx-scan: wrote {path}", file=sys.stderr)
+
+
+def sim_next_id(problems_dir, attempts_dir, kind, rnd=None):
+    """Next free P-<n> or A-<round>-<n> id by scanning existing files (no counter file)."""
+    if kind == "problem":
+        seen = {int(m.group(1)) for f in os.listdir(problems_dir) if os.path.isdir(problems_dir)
+                and (m := SIM_PROBLEM_RE.match(f))} if os.path.isdir(problems_dir) else set()
+        return f"P-{max(seen, default=0) + 1}"
+    seen = {int(m.group(2)) for f in os.listdir(attempts_dir) if os.path.isdir(attempts_dir)
+            and (m := SIM_ATTEMPT_RE.match(f)) and int(m.group(1)) == rnd} \
+        if os.path.isdir(attempts_dir) else set()
+    return f"A-{rnd}-{max(seen, default=0) + 1}"
+
+
+def sim_problem(a):
+    """Record one SIM problem: `sim new-problem --sim DIR --name .. --root-cause .. [--round N]`.
+
+    The file is written once. `attempt_ids` holds the attempts known at creation
+    (empty for seeded problems); the live problem→attempts link is derived by
+    scanning attempt files (`problem_id`), so later attempts never rewrite it."""
+    root = sim_root(a)
+    pdir, adir = os.path.join(root, "problems"), os.path.join(root, "attempts")
+    pid = sim_next_id(pdir, adir, "problem")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _sim_write_new(os.path.join(pdir, f"{pid}.json"),
+                   {"schema": SIM_SCHEMA, "id": pid, "name": a.name, "root_cause": a.root_cause,
+                    "opened_round": a.round, "status": "open", "attempt_ids": [], "created_at": now})
+
+
+def sim_close_problem(a):
+    """Close a problem without rewriting it: writes an immutable `P-<n>.closed.json`
+    marker (`reason`, `round`). The index reports the problem as closed."""
+    root = sim_root(a)
+    pdir = os.path.join(root, "problems")
+    if not os.path.exists(os.path.join(pdir, f"{a.problem}.json")):
+        sys.exit(f"mmx-scan sim: unknown problem {a.problem}")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _sim_write_new(os.path.join(pdir, f"{a.problem}.closed.json"),
+                   {"schema": SIM_SCHEMA, "problem_id": a.problem, "status": "closed",
+                    "reason": a.reason, "round": a.round, "closed_at": now})
+
+
+def sim_attempts_by_problem(adir):
+    """Authoritative problem→attempts link, derived from attempt files (problem files
+    are immutable and never gain later attempt ids)."""
+    out = defaultdict(list)
+    if not os.path.isdir(adir):
+        return out
+    for f in sorted(os.listdir(adir)):
+        if not SIM_ATTEMPT_RE.match(f) or f.endswith(".verdict.json"):
+            continue
+        t = _sim_read(os.path.join(adir, f))
+        out[t.get("problem_id")].append(t["id"])
+    return out
+
+
+def sim_problem_status(pdir, pid, prob):
+    if os.path.exists(os.path.join(pdir, f"{pid}.closed.json")):
+        return "closed"
+    return prob.get("status", "open")
+
+
+def sim_attempt(a):
+    """Record one harness-edit attempt: `sim new-attempt --sim DIR --round N --problem P-n
+    --layer L4 --component mmx --what .. --rationale .. --predicted-metric .. --predicted-delta .. [...]`.
+
+    Adoption time is recorded here (all-agent rollout, M-571 §7). Refuses a second
+    live attempt on the same component (at most one live edit per component)."""
+    root = sim_root(a)
+    pdir, adir = os.path.join(root, "problems"), os.path.join(root, "attempts")
+    ppath = os.path.join(pdir, f"{a.problem}.json")
+    if not os.path.exists(ppath):
+        sys.exit(f"mmx-scan sim: unknown problem {a.problem} (no {ppath})")
+    for f in sorted(os.listdir(adir)) if os.path.isdir(adir) else []:
+        if not SIM_ATTEMPT_RE.match(f) or f.endswith(".verdict.json"):
+            continue
+        prev = _sim_read(os.path.join(adir, f))
+        if prev.get("component") == a.component and not os.path.exists(
+                sim_verdict_path(adir, prev["id"])):
+            sys.exit(f"mmx-scan sim: component {a.component} already has live attempt {prev['id']}; "
+                     "judge it before adopting another")
+    aid = sim_next_id(pdir, adir, "attempt", a.round)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    preds = [p for p in (a.predicted_metric or "").split(",") if p] or None
+    _sim_write_new(os.path.join(adir, f"{aid}.json"),
+                   {"schema": SIM_SCHEMA, "id": aid, "round": a.round, "problem_id": a.problem,
+                    "layer": a.layer, "component": a.component, "what": a.what,
+                    "rationale": a.rationale,
+                    "predicted": {"metric": (preds[0] if preds else None), "delta": a.predicted_delta},
+                    "observed": None, "adopted_at": now, "harness_commit": a.harness_commit,
+                    "provenance": {"agent": a.agent, "executor": a.executor, "model": a.model,
+                                  "tier": a.tier},
+                    "card": a.card})
+
+
+def sim_verdict_path(adir, attempt_id):
+    return os.path.join(adir, f"{attempt_id}.verdict.json")
+
+
+def sim_index_data(root):
+    """One row per problem and attempt (with its verdict when judged). Pure: reused by tests.
+
+    The problem→attempts link is derived from attempt files (`problem_id`); the
+    `attempt_ids` array inside a problem file is the creation-time snapshot only
+    (problem files are immutable). Close markers (`P-<n>.closed.json`) override status."""
+    pdir, adir = os.path.join(root, "problems"), os.path.join(root, "attempts")
+    by_prob = sim_attempts_by_problem(adir)
+    problems, attempts = [], []
+    if os.path.isdir(pdir):
+        for f in sorted(os.listdir(pdir)):
+            m = SIM_PROBLEM_RE.match(f)
+            if not m:
+                continue
+            p = _sim_read(os.path.join(pdir, f))
+            aids = sorted(set(by_prob.get(p["id"], [])) | set(p.get("attempt_ids", [])))
+            problems.append({"id": p["id"], "name": p.get("name"),
+                             "status": sim_problem_status(pdir, p["id"], p),
+                             "opened_round": p.get("opened_round"), "attempts": len(aids),
+                             "attempt_ids": aids})
+    if os.path.isdir(adir):
+        for f in sorted(os.listdir(adir)):
+            m = SIM_ATTEMPT_RE.match(f)
+            if not m or f.endswith(".verdict.json"):
+                continue
+            t = _sim_read(os.path.join(adir, f))
+            aid = t["id"]
+            row = {"id": aid, "round": t.get("round"), "problem_id": t.get("problem_id"),
+                   "layer": t.get("layer"), "component": t.get("component"),
+                   "card": t.get("card"), "verdict": None}
+            vpath = sim_verdict_path(adir, aid)
+            if os.path.exists(vpath):
+                v = _sim_read(vpath)
+                row["verdict"] = v.get("verdict")
+                row["composite_gain"] = v.get("composite_gain")
+                row["decided_at"] = v.get("decided_at")
+            attempts.append(row)
+    live = [t["component"] for t in attempts if not t["verdict"]]
+    return {"schema": SIM_SCHEMA, "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "problems": problems, "attempts": attempts, "live_components": sorted(set(live)),
+            "open_problems": sum(1 for p in problems if p["status"] == "open")}
+
+
+def sim_index(a):
+    """Regenerate INDEX.json from the files (the only writer; never hand-edited)."""
+    root = sim_root(a)
+    data = sim_index_data(root)
+    path = os.path.join(root, "INDEX.json")
+    os.makedirs(root, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True, ensure_ascii=False)
+        f.write("\n")
+    bad = sim_check(root)
+    print(json.dumps({"index": path, "problems": len(data["problems"]),
+                      "attempts": len(data["attempts"]), "open_problems": data["open_problems"],
+                      "issues": bad}, indent=1))
+    if bad:
+        sys.exit(1)
+
+
+def sim_check(root):
+    """Ledger integrity: every attempt links a known problem, verdict files match an
+    attempt. Returns a list of issues."""
+    pdir, adir = os.path.join(root, "problems"), os.path.join(root, "attempts")
+    probs = {f[:-5] for f in os.listdir(pdir) if SIM_PROBLEM_RE.match(f)} \
+        if os.path.isdir(pdir) else set()
+    afiles = os.listdir(adir) if os.path.isdir(adir) else []
+    bad = []
+    for f in sorted(afiles):
+        if f.endswith(".verdict.json"):
+            if f[:-13] + ".json" not in afiles:
+                bad.append(f"orphan verdict {f}")
+            continue
+        if not SIM_ATTEMPT_RE.match(f):
+            continue
+        t = _sim_read(os.path.join(adir, f))
+        if t.get("problem_id") not in probs:
+            bad.append(f"{f}: unknown problem {t.get('problem_id')}")
+    return bad
+
+
+def sim_read(a):
+    """Proposer input: the index plus every open problem with all its attempts, in full
+    (M-571 §3). Closed problems come through the index only, so the record can grow."""
+    root = sim_root(a)
+    idx = _sim_read(os.path.join(root, "INDEX.json")) if os.path.exists(
+        os.path.join(root, "INDEX.json")) else sim_index_data(root)
+    pdir, adir = os.path.join(root, "problems"), os.path.join(root, "attempts")
+    by_prob = {p["id"]: p.get("attempt_ids", []) for p in idx.get("problems", [])}
+    if "problems" not in idx and os.path.isdir(pdir):  # no index yet: every problem is open
+        by_prob = {f[:-5]: [] for f in os.listdir(pdir) if SIM_PROBLEM_RE.match(f)}
+    open_ids = [p["id"] for p in idx.get("problems", []) if p["status"] == "open"] \
+        if "problems" in idx else sorted(by_prob)
+    out = {"index": idx, "open_problems": []}
+    for pid in open_ids:
+        p = _sim_read(os.path.join(pdir, f"{pid}.json"))
+        entry = {"problem": p, "attempts": []}
+        for aid in by_prob.get(pid, []):
+            t = _sim_read(os.path.join(adir, f"{aid}.json"))
+            vpath = sim_verdict_path(adir, aid)
+            entry["attempts"].append(
+                {"attempt": t, "verdict": _sim_read(vpath) if os.path.exists(vpath) else None})
+        out["open_problems"].append(entry)
+    print(json.dumps(out, indent=1, ensure_ascii=False))
+
+
+# --- composite gate: after window vs before window (M-571 §7) ------------------
+# Rollout is all-agent, so there is no canary: each component is scored as a
+# z-score against the 14 days before adoption, and the three are weighted equally.
+# Non-compensatory pass rule (from RRSI): the composite must improve beyond its
+# bootstrap noise band AND no single component may regress beyond its own band.
+
+
+def gate_z(before_vals, after_val):
+    """z-score of the after value against the before window (lower-is-better kept
+    as signed z; the caller flips the sign into a gain). None when undefined."""
+    xs = [x for x in before_vals if x is not None]
+    if len(xs) < 2 or after_val is None:
+        return None
+    sd = statistics.pstdev(xs)
+    if sd == 0:
+        return 0.0 if after_val == xs[0] else (math.inf if after_val > xs[0] else -math.inf)
+    return (after_val - statistics.fmean(xs)) / sd
+
+
+def gate_bootstrap_band(before_vals, iters=2000, seed=7):
+    """Noise band: 95th percentile of |z| of resampled before-days against the rest
+    of the before window. Inside the band = noise, not signal."""
+    import random
+    xs = [x for x in before_vals if x is not None]
+    if len(xs) < 3:
+        return None
+    rnd = random.Random(seed)
+    zs = []
+    for _ in range(iters):
+        pick = rnd.randrange(len(xs))
+        rest = xs[:pick] + xs[pick + 1:]
+        z = gate_z(rest, xs[pick])
+        if z is not None and math.isfinite(z):
+            zs.append(abs(z))
+    if not zs:
+        return None
+    zs.sort()
+    return zs[int(0.95 * (len(zs) - 1))]
+
+
+def gate_series(rows, metric, start, end):
+    """Daily pooled values of `metric` for the before window (14 days pre-start)
+    and the after window (start..end). Days with no denominator are skipped."""
+    s = datetime.fromisoformat(start).date()
+    b0 = (s - timedelta(days=14)).isoformat()
+    per_day = defaultdict(list)
+    for r in rows:
+        if r["agent"] == WORKSPACE_ROW:
+            continue
+        per_day[r["date"]].append(r)
+    def val(day_rows):
+        return pooled(day_rows, metric)
+    before = [val(per_day[d]) for d in sorted(per_day) if b0 <= d < start]
+    after = ([val(per_day[d]) for d in sorted(per_day) if start <= d <= end]
+             if end else [val(per_day[d]) for d in sorted(per_day) if d >= start])
+    return [x for x in before if x is not None], ([x for x in after if x is not None])
+
+
+def gate_judge(rows, start, end=None, components=SIM_COMPONENTS, iters=2000, seed=7,
+               min_cards=10, max_days=14):
+    """Judge one adopted edit. Pure function over snapshot rows (reused by tests)."""
+    per_agent = defaultdict(list)
+    for r in rows:
+        if r["agent"] != WORKSPACE_ROW:
+            per_agent[r["agent"]].append(r)
+    after_days = {r["date"] for r in rows
+                  if r["agent"] != WORKSPACE_ROW and r["date"] >= start
+                  and (not end or r["date"] <= end)}
+    after_cards = sum(r.get("cards_in_review", 0) or 0 for r in rows
+                      if r["agent"] != WORKSPACE_ROW and r["date"] >= start
+                      and (not end or r["date"] <= end))
+    comp_rows, wobble, details = {}, {}, {}
+    for comp in components:
+        metric = GATE_METRICS[comp]
+        before, after = gate_series(rows, metric, start, end)
+        after_val = statistics.fmean(after) if after else None
+        z = gate_z(before, after_val)
+        band = gate_bootstrap_band(before, iters, seed)
+        gain = None if z is None else -z  # all three components are lower-is-better
+        comp_rows[comp] = {"metric": metric, "before_days": len(before),
+                           "after_days": len(after_days), "before_mean": statistics.fmean(before)
+                           if before else None, "after_mean": after_val, "z": z, "band": band,
+                           "gain": gain}
+        wobble[comp] = band
+        details[comp] = {"before": before, "after_mean": after_val}
+    gains = [comp_rows[c]["gain"] for c in components]
+    composite = statistics.fmean(gains) if all(g is not None and math.isfinite(g) for g in gains) \
+        else None
+    comp_band = statistics.fmean([w for w in wobble.values() if w is not None]) \
+        if any(w is not None for w in wobble.values()) else None
+    per_agent_gain = {}
+    for agent, rs in sorted(per_agent.items()):
+        gs = []
+        for comp in components:
+            before, after = gate_series(rs, GATE_METRICS[comp], start, end)
+            after_val = statistics.fmean(after) if after else None
+            z = gate_z(before, after_val)
+            gs.append(None if z is None else -z)
+        per_agent_gain[agent] = statistics.fmean(gs) \
+            if all(g is not None and math.isfinite(g) for g in gs) else None
+    reasons = []
+    if len(after_days) > max_days:
+        reasons.append(f"after window {len(after_days)} days exceeds the {max_days}-day cap")
+    if after_cards < min_cards:
+        reasons.append(f"after window has {after_cards} cards (< {min_cards})")
+    for comp in components:
+        if comp_rows[comp]["before_days"] < 14:
+            reasons.append(f"{comp}: before window has {comp_rows[comp]['before_days']} days (< 14)")
+    early_regress = [c for c in components
+                     if comp_rows[c]["gain"] is not None and comp_rows[c]["band"] is not None
+                     and comp_rows[c]["gain"] < -comp_rows[c]["band"]]
+    if reasons or composite is None or comp_band is None:
+        verdict = "inconclusive"
+    elif early_regress:
+        verdict = "rejected"
+        reasons.append("regressed beyond its band: " + ", ".join(early_regress))
+    elif composite > comp_band:
+        verdict = "kept"
+    else:
+        verdict = "inconclusive"
+        reasons.append(f"composite {composite:.3f} inside noise band ±{comp_band:.3f}")
+    # Non-compensatory check, reported even when the verdict is already decided.
+    if verdict == "kept":
+        for c in components:
+            if comp_rows[c]["gain"] is not None and comp_rows[c]["band"] is not None \
+                    and comp_rows[c]["gain"] < -comp_rows[c]["band"]:
+                verdict = "rejected"
+                reasons.append(f"guard {c} worse beyond its band "
+                               f"({comp_rows[c]['gain']:.3f} < -{comp_rows[c]['band']:.3f})")
+    return {"verdict": verdict, "composite_gain": composite, "composite_band": comp_band,
+            "components": comp_rows, "per_agent_gain": per_agent_gain,
+            "after_days": len(after_days), "after_cards": after_cards, "reasons": reasons}
+
+
+def gate(a):
+    """Score one live attempt: `gate --sim DIR --metrics DIR --attempt A-<r>-<n> [--end DAY]`.
+    Prints the judgement; `--write` also stores the verdict file (immutable, once)."""
+    root = sim_root(a)
+    adir = os.path.join(root, "attempts")
+    tpath = os.path.join(adir, f"{a.attempt}.json")
+    if not os.path.exists(tpath):
+        sys.exit(f"mmx-scan gate: unknown attempt {a.attempt} (no {tpath})")
+    t = _sim_read(tpath)
+    vpath = sim_verdict_path(adir, a.attempt)
+    if os.path.exists(vpath) and not a.write:
+        j = _sim_read(vpath)
+        print(json.dumps({"attempt": a.attempt, "already_judged": j}, indent=1))
+        return
+    rows = load_metrics(a.metrics)
+    start = a.start or t.get("adopted_at", "")[:10]
+    judged = gate_judge(rows, start, a.end)
+    out = {"attempt": a.attempt, "component": t.get("component"), "round": t.get("round"),
+           "adopted": (t.get("adopted_at", "")[:10]), "start": start, "end": a.end, **judged}
+    if a.write:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _sim_write_new(vpath, {"schema": SIM_SCHEMA, "attempt_id": a.attempt,
+                               "problem_id": t.get("problem_id"),
+                               "verdict": judged["verdict"],
+                               "composite_gain": judged["composite_gain"],
+                               "composite_band": judged["composite_band"],
+                               "components": judged["components"],
+                               "per_agent_gain": judged["per_agent_gain"],
+                               "after": {"days": judged["after_days"], "cards": judged["after_cards"]},
+                               "reasons": judged["reasons"], "decided_at": now,
+                               "decided_by": a.decided_by})
+    print(json.dumps(out, indent=1))
+
+
+# --- rounds: 10 runs, then +1 day, +1 day, then every 3 days (M-571 §4) ---------
+# Each round arms the next as an issue wakeup on the curator card (`rounds arm`
+# prints the exact command). No new cron. The sequence restarts when an agent's
+# model or executor changes (metrics are no longer comparable with the old baseline).
+
+ROUND_GAPS = (1, 1, 3)  # days after round 2, 3, 4+ respectively
+
+
+def rounds_schedule(n_runs, first_round_date=None, now=None):
+    """Pure schedule. Round 1 after 10 runs; rounds 2, 3 one day apart; then every
+    3 days. Returns a list of ISO dates. `first_round_date` anchors round 1
+    (default: today); before 10 runs the list is empty."""
+    if n_runs < 10:
+        return []
+    base = datetime.fromisoformat(first_round_date).date() if first_round_date \
+        else (now or datetime.now(timezone.utc)).date()
+    days = [base]
+    gap_idx = 0
+    return days  # rounds 2+ are armed one at a time by `rounds arm`, not precomputed
+
+
+def rounds_next(last_round_date, round_no, reset=False):
+    """Next round date after round `round_no` held on `last_round_date` (ISO day).
+    Round 2 and 3 come one day later, round 4+ every 3 days. A model/executor
+    change resets the sequence (`reset=True` → next round is +1 day)."""
+    last = datetime.fromisoformat(last_round_date).date()
+    if reset or round_no < 3:
+        gap = 1
+    else:
+        gap = 3
+    return (last + timedelta(days=gap)).isoformat()
+
+
+def rounds_arm(a):
+    """Print (and with --issue, create) the wakeup arming the next round on the curator card.
+    The Architect runs the round when the wakeup fires, then arms the next one."""
+    nxt = rounds_next(a.last_round_date, a.round_no, a.reset)
+    argv = ["issue", "wakeup", "create", a.issue or "<card>", "--kind", "at",
+            "--at", f"{nxt}T01:00:00Z",
+            "--instruction",
+            f"MMX round {a.round_no + 1}: run mmx-scan sim read, propose at most 3 "
+            f"edits (one live edit per component), then arm round {a.round_no + 2} "
+            "with mmx-scan rounds arm"]
+    if a.issue:
+        p = subprocess.run([CLI] + argv, capture_output=True, text=True)
+        if p.returncode != 0:
+            sys.exit(f"mmx-scan rounds arm: wakeup failed: {p.stderr.strip()}")
+        print(p.stdout.strip() or json.dumps({"next_round": nxt}))
+    else:
+        print(" ".join(shlex.quote(t) for t in [CLI] + argv))
+    print(json.dumps({"round": a.round_no + 1, "date": nxt, "reset": a.reset}), file=sys.stderr)
+
+
+def rounds_next_cli(a):
+    """Print the next round date. Without a round held yet, readiness gates on 10 runs."""
+    if not a.last_round_date:
+        ready = rounds_schedule(a.runs, a.first_round_date)
+        print(json.dumps({"round": 1 if ready else None, "date": ready[0].isoformat() if ready else None,
+                          "ready": bool(ready), "runs": a.runs}))
+        return
+    print(json.dumps({"round": a.round_no + 1, "date": rounds_next(a.last_round_date, a.round_no, a.reset),
+                      "reset": a.reset}))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="mode", required=True)
+    b = sub.add_parser("baseline")
+    b.add_argument("--days", type=float, default=7)
+    b.add_argument("--curator-agent", default=CURATOR_AGENT)
+    b.add_argument("--markdown", action="store_true")
+    s = sub.add_parser("signals")
+    s.add_argument("--hours", type=float, default=24)
+    s.add_argument("--exclude-title", default="MMX curator",
+                   help="skip cards whose title starts with this (the curator's own triage cards)")
+    s.add_argument("--markdown", action="store_true")
+    yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    n = sub.add_parser("snapshot", help="per-agent metric counts for one UTC day (JSON lines)")
+    n.add_argument("--date", default=yday, help="UTC day YYYY-MM-DD (default: yesterday)")
+    n.add_argument("--out", help="metrics dir; writes <dir>/<date>.jsonl (default: stdout)")
+    n.add_argument("--harness-commit", help="incumbent export commit the day ran on")
+    n.add_argument("--curator-agent", default=CURATOR_AGENT)
+    e = sub.add_parser("export", help="write skills, agent/Role instructions, Workspace Context, autopilot prompts")
+    e.add_argument("--out", required=True, help="incumbent dir (rebuilt from scratch)")
+    g = sub.add_parser("nightly", help="export + commit, then snapshot missing days against that commit")
+    g.add_argument("--repo", required=True, help="git checkout of the data branch")
+    g.add_argument("--dir", default="mmx-harness", help="folder inside the repo")
+    g.add_argument("--backfill-from", help="first UTC day to snapshot if its file is missing")
+    g.add_argument("--max-days", type=int, default=7)
+    g.add_argument("--force", action="store_true", help="re-snapshot days that already have a file")
+    g.add_argument("--push", metavar="BRANCH", help="push HEAD to origin/BRANCH after committing")
+    g.add_argument("--curator-agent", default=CURATOR_AGENT)
+    c = sub.add_parser("compare", help="acceptance rule: effect vs bootstrap noise band δ")
+    c.add_argument("--metrics", required=True, help="metrics dir with <date>.jsonl files")
+    c.add_argument("--target", required=True, choices=sorted(METRICS))
+    c.add_argument("--guards", default="tokens_per_card,failed_run_rate,asks_per_run")
+    c.add_argument("--canary", default="", help="comma list of agent names/ids; empty = all agents before/after (L0)")
+    c.add_argument("--start", required=True, help="first UTC day the edit was live")
+    c.add_argument("--end", help="last UTC day of the after window")
+    c.add_argument("--baseline-days", type=int, default=14)
+    h = sub.add_parser("chart", help="weekly loop chart (mermaid) for the Monday triage card")
+    h.add_argument("--metrics", required=True)
+    h.add_argument("--weeks", type=int, default=8)
+    h.add_argument("--sim", help="SIM dir with attempts/*.verdict.json (default: <metrics>/../../sim)")
+    m = sub.add_parser("sim", help="SIM ledger: problems, attempts, verdicts, index, proposer read")
+    m.add_argument("op", choices=["new-problem", "new-attempt", "index", "read"],
+                   help="new-problem: one P-n.json; new-attempt: one A-<round>-<n>.json; "
+                   "index: regenerate INDEX.json; read: proposer input (index + open problems in full)")
+    m.add_argument("--sim", help="sim dir (problems/, attempts/, INDEX.json)")
+    m.add_argument("--repo", help="data checkout; sim dir is <repo>/<sim-dir>")
+    m.add_argument("--sim-dir", default="sim", help="folder inside --repo (default: sim)")
+    m.add_argument("--name", help="new-problem: short problem name")
+    m.add_argument("--root-cause", help="new-problem: root cause")
+    m.add_argument("--round", type=int, help="new-problem: opening round; new-attempt: round number")
+    m.add_argument("--problem", help="new-attempt: problem id (P-n)")
+    m.add_argument("--layer", help="new-attempt: harness layer L0-L5")
+    m.add_argument("--component", help="new-attempt: component (one live edit max)")
+    m.add_argument("--what", help="new-attempt: what changed")
+    m.add_argument("--rationale", help="new-attempt: why this helps")
+    m.add_argument("--predicted-metric", default="", help="new-attempt: predicted metric (comma list)")
+    m.add_argument("--predicted-delta", type=float, default=0.0, help="new-attempt: predicted delta")
+    m.add_argument("--harness-commit", help="new-attempt: incumbent commit it changed")
+    m.add_argument("--agent", help="new-attempt: proposing agent")
+    m.add_argument("--executor", help="new-attempt: executor harness")
+    m.add_argument("--model", help="new-attempt: model")
+    m.add_argument("--tier", help="new-attempt: tier")
+    m.add_argument("--card", help="new-attempt: tracking card (e.g. M-612)")
+    t = sub.add_parser("gate", help="composite gate: judge one live attempt after vs before window")
+    t.add_argument("--sim", help="sim dir")
+    t.add_argument("--repo", help="data checkout; sim dir is <repo>/<sim-dir>")
+    t.add_argument("--sim-dir", default="sim", help="folder inside --repo (default: sim)")
+    t.add_argument("--metrics", required=True, help="metrics dir with <date>.jsonl files")
+    t.add_argument("--attempt", required=True, help="attempt id (A-<round>-<n>)")
+    t.add_argument("--end", help="last UTC day of the after window (default: all days since adoption)")
+    t.add_argument("--start", help="first UTC day of the after window (default: adoption date; "
+                   "tests shorten the window with this)")
+    t.add_argument("--write", action="store_true", help="also store the verdict file (immutable, once)")
+    t.add_argument("--decided-by", default="claude-architect", help="verdict author for --write")
+    r = sub.add_parser("rounds", help="round scheduler: 10 runs, +1 day, +1 day, then every 3 days")
+    r.add_argument("op", choices=["next", "arm"], help="next: print the next round date; arm: arm it as a wakeup")
+    r.add_argument("--last-round-date", help="ISO day of the last round held")
+    r.add_argument("--round-no", type=int, default=1, help="number of the last round held")
+    r.add_argument("--runs", type=int, default=10, help="completed runs so far (round 1 needs 10)")
+    r.add_argument("--first-round-date", help="next: anchor date for round 1 (default: today)")
+    r.add_argument("--reset", action="store_true", help="model/executor changed: restart the 1/1/3 sequence")
+    r.add_argument("--issue", help="arm: curator card id to wake (without it, print the command)")
+    a = ap.parse_args()
+    if a.mode == "sim":
+        {"new-problem": sim_problem, "new-attempt": sim_attempt,
+         "index": sim_index, "read": sim_read}[a.op](a)
+    elif a.mode == "gate":
+        gate(a)
+    elif a.mode == "rounds":
+        if a.op == "arm" and not a.last_round_date:
+            ap.error("rounds arm needs --last-round-date")
+        (rounds_arm if a.op == "arm" else rounds_next_cli)(a)
+    else:
+        {"baseline": baseline, "signals": signals, "snapshot": snapshot, "export": export,
+         "nightly": nightly, "compare": compare, "chart": chart}[a.mode](a)
+
+
+if __name__ == "__main__":
+    main()
