@@ -108,26 +108,14 @@ Seed problems: P1 no loop after a correction (M-604), P2 friction writing to
 memory (M-605), P3 cards reach `in_review` on the artifact alone (rule
 `mem_ca39eeae`).
 
-## Harness-edit records and the acceptance rule
+## Edit records and acceptance
 
-One card per harness edit, `multica issue metadata set <card> --key K --value V`
-for `kind=harness-edit` plus: `component`, `layer`, `hypothesis`,
-`target_metric` (a derived metric name), `guard_metrics` (comma list),
-`baseline` (value + window), `canary_agents` (names, or `all` for L0),
-`window` (start..end UTC days), `result` (effect and δ from `compare`),
-`verdict` (`proposed|canary|adopted|reverted`), `tokens_added`.
-`chart` counts `adopted` vs `reverted` from these cards. The verdict is also a
-MOCT `decision`: `MMX verdict: <component>: adopted|reverted …`.
-
-Adopt only if all hold, otherwise revert (revert the incumbent commit's
-change through `multica skill update` etc.) and record it as falsified:
-1. canary on 1–2 agents (L0 / global edits: all agents, before/after);
-2. each arm ≥ 7 days and ≥ 10 delivered cards in the after window, ≥ 14 baseline days;
-3. target gain > δ, where δ = 95th percentile of |effect| under placebo
-   splits of the 14 baseline days (day-level bootstrap; difference-in-differences
-   vs the other agents when there is a canary);
-4. no guard metric (`tokens_per_card`, `failed_run_rate`, `asks_per_run`) worse by more than δ;
-5. `tokens_added` is paid for by the gain (Architect judgement).
+Superseded by the SIM record and `gate` above (M-571 plan rev 16): edits are
+`sim/attempts/A-<round>-<n>.json`, verdicts `A-<round>-<n>.verdict.json`
+(`kept|rejected|inconclusive`). The M-608 `harness-edit` card convention is
+retired. `chart` counts `kept` as adopted and `rejected`/`inconclusive` as
+reverted, by verdict week (`--sim`, default `<metrics>/../../sim`).
+`compare` stays for ad-hoc single-metric or canary analysis; it is not the gate.
 
 ## Requirements
 
