@@ -256,12 +256,14 @@ with redirect_stdout(buf):
 toks = _shlex.split(buf.getvalue().strip().splitlines()[0])
 ok = (toks[toks.index("--instruction") + 1].startswith("MMX round 2:")
       and toks[toks.index("--at") + 1] == "2026-11-29T01:00:00Z"
+      and toks[toks.index("--agent-id") + 1] == mod.ROUND_AGENT
       and "--expires-in" not in toks and "--on-timeout" not in toks
       and "--expires-at" not in toks)  # an `at` wakeup ends when it fires: no deadline flags
 fail += not ok
 print(("ok  " if ok else "FAIL"), "rounds arm: instruction survives argv round-trip, no deadline flags")
 # Index rebuild: derived linkage survives a fresh regeneration; live edit guard fires.
-tmp = tempfile.mkdtemp(prefix="mmx-sim-test-")
+# Scratch dir inside the repo, never system /tmp (workspace RULE #1); removed at the end.
+tmp = tempfile.mkdtemp(prefix="mmx-sim-test-", dir=HERE)
 simd = os.path.join(tmp, "sim")
 os.makedirs(os.path.join(simd, "problems"))
 
