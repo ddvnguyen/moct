@@ -1365,6 +1365,7 @@ def gate(a):
 # model or executor changes (metrics are no longer comparable with the old baseline).
 
 ROUND_GAPS = (1, 1, 3)  # days after round 2, 3, 4+ respectively
+ROUND_AGENT = "bd7b7aae-88e9-4260-a7b5-301993757e59"  # Claude Architect runs the rounds
 
 
 def rounds_schedule(n_runs, first_round_date=None, now=None):
@@ -1376,7 +1377,6 @@ def rounds_schedule(n_runs, first_round_date=None, now=None):
     base = datetime.fromisoformat(first_round_date).date() if first_round_date \
         else (now or datetime.now(timezone.utc)).date()
     days = [base]
-    gap_idx = 0
     return days  # rounds 2+ are armed one at a time by `rounds arm`, not precomputed
 
 
@@ -1397,6 +1397,7 @@ def rounds_arm(a):
     The Architect runs the round when the wakeup fires, then arms the next one."""
     nxt = rounds_next(a.last_round_date, a.round_no, a.reset)
     argv = ["issue", "wakeup", "create", a.issue or "<card>", "--kind", "at",
+            "--agent-id", ROUND_AGENT,
             "--at", f"{nxt}T01:00:00Z",
             "--instruction",
             f"MMX round {a.round_no + 1}: run mmx-scan sim read, propose at most 3 "
