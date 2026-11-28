@@ -439,8 +439,6 @@ COUNT_KEYS = (
     "mmx_runs", "memory_search", "memory_get", "memory_note", "harness_edit", "asks",
     "unreadable_runs",
 )
-HE_KEYS = ("component", "layer", "hypothesis", "target_metric", "guard_metrics", "baseline",
-           "canary_agents", "window", "result", "verdict", "tokens_added")
 # Secret-shaped strings are redacted before anything is written to disk.
 SECRET_RE = re.compile(
     r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|"
@@ -893,17 +891,16 @@ def compare(a):
 
 # --- chart: weekly loop view -------------------------------------------------
 
-def harness_edit_cards():
-    out, off = [], 0
-    while True:
-        page, _ = cli(["issue", "list", "--metadata", "kind=harness-edit", "--limit", "100",
-                       "--offset", str(off), "--output", "json",
-                       "--fields", "id,identifier,status,metadata,created_at"], allow_fail=True)
-        batch = (page.get("issues", []) if isinstance(page, dict) else page) or []
-        out += batch
-        if not (isinstance(page, dict) and page.get("has_more")) or not batch:
-            return out
-        off += len(batch)
+def sim_verdicts(sim_dir):
+    """(decided_at, verdict) for every sim/attempts/*.verdict.json (plan rev 16 SIM record)."""
+    adir = os.path.join(sim_dir, "attempts")
+    out = []
+    for f in sorted(os.listdir(adir)) if os.path.isdir(adir) else []:
+        if f.endswith(".verdict.json"):
+            with open(os.path.join(adir, f)) as fh:
+                v = json.load(fh)
+            out.append((v.get("decided_at") or "1970-01-01", str(v.get("verdict") or "").lower()))
+    return out
 
 
 def week_of(day):
@@ -920,10 +917,10 @@ def chart(a):
     corr = [pooled(weeks[w], "correction_rate") for w in ks]
     tok = [pooled(weeks[w], "tokens_per_card") for w in ks]
     edits = Counter()
-    for c in harness_edit_cards():
-        v = str((c.get("metadata") or {}).get("verdict") or "").lower()
-        if v in ("adopted", "reverted", "falsified"):
-            edits[(week_of(c.get("created_at") or "1970-01-01"), "adopted" if v == "adopted" else "reverted")] += 1
+    sim_dir = a.sim or os.path.join(a.metrics, os.pardir, os.pardir, "sim")
+    for at, v in sim_verdicts(sim_dir):
+        if v in ("kept", "rejected", "inconclusive"):  # rejected/inconclusive edits are reverted
+            edits[(week_of(at), "adopted" if v == "kept" else "reverted")] += 1
     fmt = lambda xs, f: "[" + ", ".join(f(x) if x is not None else "0" for x in xs) + "]"
     lab = "[" + ", ".join(f'"{w[5:]}"' for w in ks) + "]"
     lines = ["### MMX loop: is it improving?", "",
@@ -1462,6 +1459,7 @@ def main():
     h = sub.add_parser("chart", help="weekly loop chart (mermaid) for the Monday triage card")
     h.add_argument("--metrics", required=True)
     h.add_argument("--weeks", type=int, default=8)
+    h.add_argument("--sim", help="SIM dir with attempts/*.verdict.json (default: <metrics>/../../sim)")
     m = sub.add_parser("sim", help="SIM ledger: problems, attempts, verdicts, index, proposer read")
     m.add_argument("op", choices=["new-problem", "new-attempt", "index", "read"],
                    help="new-problem: one P-n.json; new-attempt: one A-<round>-<n>.json; "

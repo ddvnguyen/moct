@@ -5,6 +5,7 @@ Run: python3 -I tools/mmx-scan/mmx-scan.test.py
 """
 import importlib.machinery
 import importlib.util
+import json
 import os
 import sys
 
@@ -315,5 +316,17 @@ except SystemExit:
 fail += not ok
 print(("ok  " if ok else "FAIL"), "sim: at most one live edit per component")
 shutil.rmtree(tmp, ignore_errors=True)
+
+with tempfile.TemporaryDirectory(dir=HERE) as d:
+    os.makedirs(os.path.join(d, "attempts"))
+    for n, v in (("A-1-1", "kept"), ("A-1-2", "rejected"), ("A-1-3", "inconclusive")):
+        with open(os.path.join(d, "attempts", f"{n}.verdict.json"), "w") as fh:
+            json.dump({"verdict": v, "decided_at": "2026-11-30T01:00:00+00:00"}, fh)
+    with open(os.path.join(d, "attempts", "A-1-4.json"), "w") as fh:
+        json.dump({"component": "x"}, fh)
+    got = sorted(v for _at, v in mod.sim_verdicts(d))
+ok = got == ["inconclusive", "kept", "rejected"]
+fail += not ok
+print(("ok  " if ok else "FAIL"), "chart reads SIM verdict files only", got)
 
 sys.exit(1 if fail else 0)
